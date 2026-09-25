@@ -1,9 +1,12 @@
 #include "KaraokePlayer.h"
 #include "Logging.h"
 #include "MainWindow.h"
+#include "SongSettings.h"
 
 #include <QApplication>
+#include <QDir>
 #include <QMessageBox>
+#include <QStandardPaths>
 
 int main(int argc, char* argv[])
 {
@@ -25,7 +28,10 @@ int main(int argc, char* argv[])
     }
 
     KaraokePlayer player;
-    MainWindow window(&player);
+    const QString settingsPath = QDir(QStandardPaths::writableLocation(
+        QStandardPaths::AppDataLocation)).filePath(QStringLiteral("song-settings.json"));
+    SongSettingsStore settingsStore(settingsPath);
+    MainWindow window(&player, &settingsStore);
     window.resize(900, 520);
     window.showFullScreen();
     window.setFocus(Qt::OtherFocusReason);

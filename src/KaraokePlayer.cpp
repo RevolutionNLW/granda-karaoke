@@ -11,9 +11,15 @@
 
 #include <gst/gst.h>
 
+#include <algorithm>
+#include <cmath>
+
 namespace {
 
 constexpr int kTickIntervalMs = 20;
+constexpr int kStateWaitSeconds = 5;
+constexpr qint64 kTempoRetryWindowMs = 1000;
+constexpr qint64 kTempoSeekWatchdogMs = 2000;
 
 constexpr qint64 kMaxCdgBytes = 64 * 1024 * 1024;
 
@@ -82,15 +88,8 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
         qCInfo(lcPlayer) << "Loaded coreelements:" << gst_plugin_get_filename(plugin);
         gst_object_unref(plugin);
     }
-    for (const char* name : {"pitch", "scaletempo"}) {
-        GstElementFactory* factory = gst_element_factory_find(name);
-        if (factory)
-            gst_object_unref(factory);
-        else
-            qCWarning(lcPlayer) << "Optional GStreamer element missing:" << name;
-    }
-
-    for (const char* name : {"playbin", "autoaudiosink"}) {
+    for (const char* name : {"playbin", "autoaudiosink", "pitch", "scaletempo",
+                             "audioconvert", "audioresample", "capsfilter"}) {
         GstElementFactory* factory = gst_element_factory_find(name);
         if (!factory) {
             qCCritical(lcPlayer) << "Required GStreamer element missing:" << name;
@@ -117,8 +116,11 @@ bool KaraokePlayer::ensurePipeline()
     gst_object_ref_sink(m_pipeline);
     g_object_set(m_pipeline, "flags", kPlayFlagAudio | kPlayFlagSoftVolume, nullptr);
 
-    // Key and tempo adjustment will later be inserted here as a custom
-    // audio-sink bin (pitch/scaletempo ! audioconvert ! sink).
+    if (!installAudioFilter()) {
+        destroyPipeline();
+        return false;
+    }
+
     if (!m_audioSinkName.isEmpty()) {
         GstElement* sink = gst_element_factory_make(m_audioSinkName.toUtf8().constData(), nullptr);
         if (!sink) {
@@ -133,6 +135,73 @@ bool KaraokePlayer::ensurePipeline()
     return true;
 }
 
+bool KaraokePlayer::installAudioFilter()
+{
+    GstElement* filter = gst_bin_new("karaoke-audio-filter");
+    GstElement* convertIn = gst_element_factory_make("audioconvert", nullptr);
+    GstElement* resampleIn = gst_element_factory_make("audioresample", nullptr);
+    GstElement* capsFilter = gst_element_factory_make("capsfilter", nullptr);
+    GstElement* scaleTempo = gst_element_factory_make("scaletempo", nullptr);
+    GstElement* pitch = gst_element_factory_make("pitch", "karaoke-pitch");
+    GstElement* convertOut = gst_element_factory_make("audioconvert", nullptr);
+    GstElement* resampleOut = gst_element_factory_make("audioresample", nullptr);
+    if (!filter || !convertIn || !resampleIn || !capsFilter || !scaleTempo || !pitch
+        || !convertOut || !resampleOut) {
+        qCCritical(lcPlayer) << "Could not create the key/tempo audio filter";
+        for (GstElement* element : {convertIn, resampleIn, capsFilter, scaleTempo,
+                                    pitch, convertOut, resampleOut}) {
+            if (element)
+                gst_object_unref(element);
+        }
+        if (filter)
+            gst_object_unref(filter);
+        return false;
+    }
+
+    GstCaps* caps = gst_caps_new_simple("audio/x-raw",
+        "format", G_TYPE_STRING, "F32LE",
+        "layout", G_TYPE_STRING, "interleaved", nullptr);
+    g_object_set(capsFilter, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+    g_object_set(pitch, "pitch", 1.0, "tempo", 1.0, "rate", 1.0, nullptr);
+
+    gst_bin_add_many(GST_BIN(filter), convertIn, resampleIn, capsFilter, scaleTempo,
+                     pitch, convertOut, resampleOut, nullptr);
+    if (!gst_element_link_many(convertIn, resampleIn, capsFilter, scaleTempo, pitch,
+                               convertOut, resampleOut, nullptr)) {
+        qCCritical(lcPlayer) << "Could not link the key/tempo audio filter";
+        gst_object_unref(filter);
+        return false;
+    }
+
+    GstPad* sinkPad = gst_element_get_static_pad(convertIn, "sink");
+    GstPad* srcPad = gst_element_get_static_pad(resampleOut, "src");
+    GstPad* sinkGhost = sinkPad ? gst_ghost_pad_new("sink", sinkPad) : nullptr;
+    GstPad* srcGhost = srcPad ? gst_ghost_pad_new("src", srcPad) : nullptr;
+    if (sinkPad)
+        gst_object_unref(sinkPad);
+    if (srcPad)
+        gst_object_unref(srcPad);
+    if (!sinkGhost || !srcGhost
+        || !gst_element_add_pad(filter, sinkGhost)
+        || !gst_element_add_pad(filter, srcGhost)) {
+        qCCritical(lcPlayer) << "Could not expose the key/tempo audio filter pads";
+        if (sinkGhost && !GST_OBJECT_PARENT(sinkGhost))
+            gst_object_unref(sinkGhost);
+        if (srcGhost && !GST_OBJECT_PARENT(srcGhost))
+            gst_object_unref(srcGhost);
+        gst_object_unref(filter);
+        return false;
+    }
+
+    gst_object_ref_sink(filter);
+    g_object_set(m_pipeline, "audio-filter", filter, nullptr);
+    gst_object_unref(filter);
+    m_pitchElement = pitch;
+    applyKey();
+    return true;
+}
+
 void KaraokePlayer::destroyPipeline()
 {
     m_timer.stop();
@@ -141,6 +210,8 @@ void KaraokePlayer::destroyPipeline()
     gst_element_set_state(m_pipeline, GST_STATE_NULL);
     gst_object_unref(m_pipeline);
     m_pipeline = nullptr;
+    m_pitchElement = nullptr;
+    resetActiveTempo();
 }
 
 bool KaraokePlayer::setPipelineState(int gstState)
@@ -168,6 +239,7 @@ bool KaraokePlayer::load(const SongPair& pair)
         return false;
     };
 
+    const bool replacingSong = hasSong();
     QFile cdgFile(pair.cdgPath);
     if (!cdgFile.open(QIODevice::ReadOnly)) {
         qCWarning(lcCdg) << "Cannot open" << pair.cdgPath << ":" << cdgFile.errorString();
@@ -218,6 +290,14 @@ bool KaraokePlayer::load(const SongPair& pair)
     if (!ensurePipeline())
         return loadFailed(QStringLiteral("The audio system could not play music."));
 
+    if (replacingSong) {
+        m_keySemitones = 0;
+        m_tempoPercent = 100;
+        emit settingsChanged(m_keySemitones, m_tempoPercent);
+    }
+    applyKey();
+    resetActiveTempo();
+
     const QByteArray uri = QUrl::fromLocalFile(pair.mp3Path).toEncoded();
     g_object_set(m_pipeline, "uri", uri.constData(), nullptr);
 
@@ -251,20 +331,216 @@ void KaraokePlayer::play()
         if (m_state == State::Error)
             return;
     }
+    const bool resuming = m_state == State::Paused;
     m_errorReported = false;
     m_lastError.clear();
-    if (m_state != State::Paused) {
+    if (!resuming) {
         if (m_state == State::Stopped || m_state == State::Finished || m_state == State::Error)
             discardPendingMessages();
         // Every other state is already positioned at the beginning.
         m_positionMs = 0;
         m_decoder.reset();
         emitFrameIfChanged();
+        if (!prepareForStart())
+            return;
     }
-    qCInfo(lcPlayer) << (m_state == State::Paused ? "Resuming at" : "Playing from") << m_positionMs << "ms";
+    qCInfo(lcPlayer) << (resuming ? "Resuming at" : "Playing from") << m_positionMs << "ms";
     if (!setPipelineState(GST_STATE_PLAYING))
         return;
     setState(State::Playing);
+}
+
+void KaraokePlayer::setKeySemitones(int semitones)
+{
+    const int value = std::clamp(semitones, kMinKey, kMaxKey);
+    if (m_keySemitones == value)
+        return;
+    m_keySemitones = value;
+    applyKey();
+    emit settingsChanged(m_keySemitones, m_tempoPercent);
+}
+
+void KaraokePlayer::setTempoPercent(int percent)
+{
+    const int value = std::clamp(percent, kMinTempo, kMaxTempo);
+    if (m_tempoPercent == value)
+        return;
+    m_tempoPercent = value;
+    emit settingsChanged(m_keySemitones, m_tempoPercent);
+    if (m_state == State::Playing || m_state == State::Paused) {
+        m_tempoRetryTimer.invalidate();
+        m_tempoRetryWarningLogged = false;
+        requestLiveTempoSeek();
+    }
+}
+
+void KaraokePlayer::applyKey()
+{
+    if (!m_pitchElement)
+        return;
+    const double ratio = std::pow(2.0, static_cast<double>(m_keySemitones) / 12.0);
+    g_object_set(m_pitchElement, "pitch", ratio, nullptr);
+}
+
+void KaraokePlayer::resetActiveTempo()
+{
+    m_appliedTempoPercent = 100;
+    m_seekingTempoPercent = 100;
+    m_tempoSeekInFlight = false;
+    m_tempoRetryPending = false;
+    m_tempoRetryWarningLogged = false;
+    m_tempoRetryTimer.invalidate();
+    m_tempoSeekTimer.invalidate();
+    m_lastGoodPositionMs = 0;
+    m_hasLastGoodPosition = false;
+}
+
+bool KaraokePlayer::prepareForStart()
+{
+    applyKey();
+    const GstStateChangeReturn stateResult = gst_element_set_state(m_pipeline, GST_STATE_PAUSED);
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        tick();
+        if (!m_errorReported)
+            fail(QStringLiteral("The song \"%1\" could not be played.").arg(m_song.displayName()));
+        return false;
+    }
+
+    GstState current = GST_STATE_NULL;
+    const GstStateChangeReturn waitResult = gst_element_get_state(
+        m_pipeline, &current, nullptr, kStateWaitSeconds * GST_SECOND);
+    tick();
+    if (m_errorReported)
+        return false;
+    if (waitResult == GST_STATE_CHANGE_FAILURE || current != GST_STATE_PAUSED) {
+        qCWarning(lcPlayer) << "Timed out waiting for audio pre-roll";
+        fail(QStringLiteral("The song \"%1\" could not be played.").arg(m_song.displayName()));
+        return false;
+    }
+
+    resetActiveTempo();
+    if (m_tempoPercent != 100 && !beginTempoSeek(0, true)) {
+        if (!m_errorReported)
+            fail(QStringLiteral("The song \"%1\" could not be played.").arg(m_song.displayName()));
+        return false;
+    }
+    return true;
+}
+
+bool KaraokePlayer::beginTempoSeek(qint64 positionMs, bool waitForCompletion)
+{
+    const int requestedTempo = m_tempoPercent;
+    if (!performTempoSeek(positionMs, requestedTempo)) {
+        if (waitForCompletion) {
+            const double rate = static_cast<double>(requestedTempo) / 100.0;
+            qCWarning(lcPlayer) << "Tempo seek was rejected at" << positionMs << "ms; rate" << rate;
+        }
+        return false;
+    }
+    m_seekingTempoPercent = requestedTempo;
+    m_tempoSeekInFlight = true;
+    m_tempoRetryPending = false;
+    m_tempoSeekTimer.start();
+    return !waitForCompletion || waitForTempoSeek();
+}
+
+bool KaraokePlayer::performTempoSeek(qint64 positionMs, int tempoPercent)
+{
+    const double rate = static_cast<double>(tempoPercent) / 100.0;
+    return gst_element_seek(m_pipeline, rate, GST_FORMAT_TIME,
+        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+        GST_SEEK_TYPE_SET, positionMs * GST_MSECOND,
+        GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+}
+
+bool KaraokePlayer::acceptTempoSeekCompletion()
+{
+    return true;
+}
+
+bool KaraokePlayer::waitForTempoSeek()
+{
+    // A flushing seek while PAUSED re-prerolls. Waiting on the state (rather
+    // than popping the bus) leaves every message for tick() to handle normally.
+    const GstStateChangeReturn result = gst_element_get_state(
+        m_pipeline, nullptr, nullptr, kStateWaitSeconds * GST_SECOND);
+    tick();
+    if (m_errorReported)
+        return false;
+    if (result != GST_STATE_CHANGE_SUCCESS) {
+        qCWarning(lcPlayer) << "Timed out waiting for the tempo change";
+        m_tempoSeekInFlight = false;
+        m_tempoSeekTimer.invalidate();
+        return false;
+    }
+    completeTempoSeek();
+    return true;
+}
+
+void KaraokePlayer::requestLiveTempoSeek()
+{
+    if (m_tempoSeekInFlight)
+        return; // completeTempoSeek() applies the latest requested value.
+    if (m_tempoPercent == m_appliedTempoPercent) {
+        m_tempoRetryPending = false;
+        return;
+    }
+
+    qint64 position = 0;
+    if (queryAudioPosition(position) && (position > 0 || m_state == State::Paused)) {
+        m_lastGoodPositionMs = position;
+        m_hasLastGoodPosition = true;
+    } else if (m_hasLastGoodPosition && m_lastGoodPositionMs > 0) {
+        position = m_lastGoodPositionMs;
+    } else {
+        m_tempoRetryPending = true;
+        return;
+    }
+    if (beginTempoSeek(position, false)) {
+        m_tempoRetryTimer.invalidate();
+        m_tempoRetryWarningLogged = false;
+        return;
+    }
+
+    if (!m_tempoRetryTimer.isValid())
+        m_tempoRetryTimer.start();
+    if (m_tempoRetryTimer.elapsed() < kTempoRetryWindowMs) {
+        m_tempoRetryPending = true;
+    } else {
+        m_tempoRetryPending = false;
+        if (!m_tempoRetryWarningLogged) {
+            qCWarning(lcPlayer) << "Tempo change could not be applied after retrying for"
+                                << kTempoRetryWindowMs << "ms; it will be used on the next start";
+            m_tempoRetryWarningLogged = true;
+        }
+    }
+}
+
+void KaraokePlayer::serviceLiveTempoSeek()
+{
+    if (m_tempoSeekInFlight && m_tempoSeekTimer.isValid()
+        && m_tempoSeekTimer.elapsed() >= kTempoSeekWatchdogMs) {
+        qCWarning(lcPlayer) << "Tempo seek did not complete within" << kTempoSeekWatchdogMs
+                            << "ms; retrying the latest tempo";
+        m_tempoSeekInFlight = false;
+        m_tempoSeekTimer.invalidate();
+        m_tempoRetryPending = m_tempoPercent != m_appliedTempoPercent;
+        m_tempoRetryTimer.invalidate();
+        m_tempoRetryWarningLogged = false;
+    }
+    if (m_tempoRetryPending && !m_tempoSeekInFlight)
+        requestLiveTempoSeek();
+}
+
+void KaraokePlayer::completeTempoSeek()
+{
+    if (!m_tempoSeekInFlight)
+        return;
+    m_tempoSeekInFlight = false;
+    m_tempoSeekTimer.invalidate();
+    m_appliedTempoPercent = m_seekingTempoPercent;
+    if (m_tempoPercent != m_appliedTempoPercent)
+        requestLiveTempoSeek();
 }
 
 void KaraokePlayer::pause()
@@ -288,6 +564,7 @@ void KaraokePlayer::stop()
     discardPendingMessages();
     reportSkippedTotal();
     resetToBeginning();
+    resetActiveTempo();
     setState(State::Stopped);
 }
 
@@ -303,8 +580,10 @@ void KaraokePlayer::tick()
     }
     gst_object_unref(bus);
 
-    if (m_state == State::Playing || m_state == State::Paused)
+    if (m_state == State::Playing || m_state == State::Paused) {
         syncToAudioPosition();
+        serviceLiveTempoSeek();
+    }
 }
 
 bool KaraokePlayer::queryAudioPosition(qint64& positionMs) const
@@ -321,6 +600,9 @@ void KaraokePlayer::syncToAudioPosition()
     qint64 ms = 0;
     if (!queryAudioPosition(ms) || ms < 0)
         return;  // Still starting; keep the current lyrics.
+
+    m_lastGoodPositionMs = ms;
+    m_hasLastGoodPosition = true;
 
     if (m_durationMs <= 0) {
         gint64 duration = 0;
@@ -470,7 +752,13 @@ void KaraokePlayer::handleMessage(GstMessage* message)
         gst_element_set_state(m_pipeline, GST_STATE_READY);
         reportSkippedTotal();
         resetToBeginning();
+        resetActiveTempo();
         setState(State::Finished);
+        break;
+    case GST_MESSAGE_ASYNC_DONE:
+        if (GST_MESSAGE_SRC(message) == GST_OBJECT(m_pipeline)
+            && m_tempoSeekInFlight && acceptTempoSeekCompletion())
+            completeTempoSeek();
         break;
     case GST_MESSAGE_STATE_CHANGED:
         if (GST_MESSAGE_SRC(message) == GST_OBJECT(m_pipeline)) {
@@ -503,6 +791,7 @@ void KaraokePlayer::fail(const QString& userMessage)
         gst_element_set_state(m_pipeline, GST_STATE_READY);
         discardPendingMessages();
     }
+    resetActiveTempo();
     reportSkippedTotal();
     resetToBeginning();
     m_lastError = userMessage;

@@ -34,6 +34,8 @@ add_library(fks_core STATIC
     src/Logging.h
     src/SongPair.cpp
     src/SongPair.h
+    src/SongSettings.cpp
+    src/SongSettings.h
     src/KaraokePlayer.cpp
     src/KaraokePlayer.h
     src/LyricsView.cpp

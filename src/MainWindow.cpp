@@ -38,6 +38,30 @@ QPushButton* makeButton(const QString& text, QWidget* parent)
     return button;
 }
 
+QPushButton* makeSettingButton(const QString& text, QWidget* parent, int minimumWidth = 100)
+{
+    auto* button = new QPushButton(text, parent);
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setMinimumSize(minimumWidth, 64);
+    QFont font = button->font();
+    font.setPointSize(24);
+    font.setBold(true);
+    button->setFont(font);
+    return button;
+}
+
+QLabel* makeSettingLabel(const QString& text, QWidget* parent)
+{
+    auto* label = new QLabel(text, parent);
+    label->setAlignment(Qt::AlignCenter);
+    label->setMinimumWidth(110);
+    QFont font = label->font();
+    font.setPointSize(26);
+    font.setBold(true);
+    label->setFont(font);
+    return label;
+}
+
 bool isEnterKey(const QKeyEvent* event)
 {
     return event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter;
@@ -45,10 +69,13 @@ bool isEnterKey(const QKeyEvent* event)
 
 } // namespace
 
-MainWindow::MainWindow(KaraokePlayer* player, QWidget* parent)
+MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore, QWidget* parent)
     : QWidget(parent)
     , m_player(player)
+    , m_settingsStore(settingsStore)
 {
+    Q_ASSERT(m_player);
+    Q_ASSERT(m_settingsStore);
     setWindowTitle(QStringLiteral("Frankie's Karaoke Studio"));
 
     setFocusPolicy(Qt::StrongFocus);
@@ -87,6 +114,38 @@ MainWindow::MainWindow(KaraokePlayer* player, QWidget* parent)
     m_pauseButton = makeButton(QStringLiteral("Pause"), m_controls);
     m_stopButton = makeButton(QStringLiteral("Stop"), m_controls);
 
+    auto* keyTitle = makeSettingLabel(QStringLiteral("KEY"), m_controls);
+    keyTitle->setMinimumWidth(150);
+    m_keyDownButton = makeSettingButton(QStringLiteral("\u2212"), m_controls);
+    m_keyValueLabel = makeSettingLabel(QStringLiteral("0"), m_controls);
+    m_keyUpButton = makeSettingButton(QStringLiteral("+"), m_controls);
+    m_keyResetButton = makeSettingButton(QStringLiteral("Reset"), m_controls, 150);
+    auto* keyRow = new QHBoxLayout;
+    keyRow->setSpacing(12);
+    keyRow->addStretch();
+    keyRow->addWidget(keyTitle);
+    keyRow->addWidget(m_keyDownButton);
+    keyRow->addWidget(m_keyValueLabel);
+    keyRow->addWidget(m_keyUpButton);
+    keyRow->addWidget(m_keyResetButton);
+    keyRow->addStretch();
+
+    auto* tempoTitle = makeSettingLabel(QStringLiteral("TEMPO"), m_controls);
+    tempoTitle->setMinimumWidth(150);
+    m_tempoDownButton = makeSettingButton(QStringLiteral("\u2212"), m_controls);
+    m_tempoValueLabel = makeSettingLabel(QStringLiteral("100%"), m_controls);
+    m_tempoUpButton = makeSettingButton(QStringLiteral("+"), m_controls);
+    m_tempoResetButton = makeSettingButton(QStringLiteral("Reset"), m_controls, 150);
+    auto* tempoRow = new QHBoxLayout;
+    tempoRow->setSpacing(12);
+    tempoRow->addStretch();
+    tempoRow->addWidget(tempoTitle);
+    tempoRow->addWidget(m_tempoDownButton);
+    tempoRow->addWidget(m_tempoValueLabel);
+    tempoRow->addWidget(m_tempoUpButton);
+    tempoRow->addWidget(m_tempoResetButton);
+    tempoRow->addStretch();
+
     m_exitButton = new QPushButton(QStringLiteral("Exit"), m_controls);
     m_exitButton->setFocusPolicy(Qt::NoFocus);
     m_exitButton->setMinimumSize(90, 44);
@@ -102,13 +161,15 @@ MainWindow::MainWindow(KaraokePlayer* player, QWidget* parent)
     buttons->addWidget(m_stopButton);
 
     auto* layout = new QVBoxLayout(m_controls);
-    layout->setContentsMargins(32, 32, 32, 32);
-    layout->setSpacing(20);
+    layout->setContentsMargins(24, 16, 24, 16);
+    layout->setSpacing(10);
     layout->addLayout(exitRow);
     layout->addStretch();
     layout->addWidget(m_songLabel);
     layout->addWidget(m_statusLabel);
     layout->addLayout(buttons);
+    layout->addLayout(keyRow);
+    layout->addLayout(tempoRow);
     layout->addWidget(m_hintLabel);
     layout->addStretch();
 
@@ -117,10 +178,25 @@ MainWindow::MainWindow(KaraokePlayer* player, QWidget* parent)
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
     connect(m_pauseButton, &QPushButton::clicked, this, &MainWindow::onPause);
     connect(m_stopButton, &QPushButton::clicked, this, &MainWindow::onStop);
+    connect(m_keyDownButton, &QPushButton::clicked, this, [this] { changeKey(-kKeyStep); });
+    connect(m_keyUpButton, &QPushButton::clicked, this, [this] { changeKey(kKeyStep); });
+    connect(m_keyResetButton, &QPushButton::clicked, this, [this] {
+        m_player->setKeySemitones(0);
+        persistCurrentSettings();
+        updateControls();
+    });
+    connect(m_tempoDownButton, &QPushButton::clicked, this, [this] { changeTempo(-kTempoStep); });
+    connect(m_tempoUpButton, &QPushButton::clicked, this, [this] { changeTempo(kTempoStep); });
+    connect(m_tempoResetButton, &QPushButton::clicked, this, [this] {
+        m_player->setTempoPercent(100);
+        persistCurrentSettings();
+        updateControls();
+    });
 
     connect(m_player, &KaraokePlayer::stateChanged, this, &MainWindow::onStateChanged);
     connect(m_player, &KaraokePlayer::errorOccurred, this, &MainWindow::onError);
     connect(m_player, &KaraokePlayer::positionChanged, this, &MainWindow::updateControls);
+    connect(m_player, &KaraokePlayer::settingsChanged, this, &MainWindow::updateControls);
     connect(m_player, &KaraokePlayer::frameChanged, m_lyrics, &LyricsView::setFrame);
     connect(m_lyrics, &LyricsView::controlsRequested, this, &MainWindow::hideLyrics);
 
@@ -196,7 +272,20 @@ bool MainWindow::openSong(const QString& path)
         updateControls();
         return false;
     }
-    return m_player->load(result.pair);  // load() reports its own errors.
+    if (!m_player->load(result.pair))
+        return false; // load() reports its own errors.
+
+    m_songIdentity = songIdentity(result.pair);
+    m_identityWarningLogged = false;
+    if (m_songIdentity.isEmpty()) {
+        qCWarning(lcUi) << "Song settings cannot be saved because its files could not be fingerprinted";
+        m_identityWarningLogged = true;
+    }
+    const SongSettings settings = m_settingsStore->settingsFor(m_songIdentity).clamped();
+    m_player->setKeySemitones(settings.keySemitones);
+    m_player->setTempoPercent(settings.tempoPercent);
+    updateControls();
+    return true;
 }
 
 void MainWindow::onPlay()
@@ -215,6 +304,35 @@ void MainWindow::onStop()
 {
     m_player->stop();
     hideLyrics();
+}
+
+void MainWindow::changeKey(int delta)
+{
+    m_player->setKeySemitones(m_player->keySemitones() + delta);
+    persistCurrentSettings();
+    updateControls();
+}
+
+void MainWindow::changeTempo(int delta)
+{
+    m_player->setTempoPercent(m_player->tempoPercent() + delta);
+    persistCurrentSettings();
+    updateControls();
+}
+
+void MainWindow::persistCurrentSettings()
+{
+    if (!m_player->hasSong())
+        return;
+    if (m_songIdentity.isEmpty()) {
+        if (!m_identityWarningLogged) {
+            qCWarning(lcUi) << "Song settings cannot be saved because its identity is unavailable";
+            m_identityWarningLogged = true;
+        }
+        return;
+    }
+    m_settingsStore->store(m_songIdentity,
+        SongSettings{m_player->keySemitones(), m_player->tempoPercent()}, m_player->song());
 }
 
 void MainWindow::showLyrics()
@@ -332,4 +450,15 @@ void MainWindow::updateControls()
     m_playButton->setEnabled(hasSong && state != State::Playing);
     m_pauseButton->setEnabled(state == State::Playing);
     m_stopButton->setEnabled(state == State::Playing || state == State::Paused);
+
+    const int key = hasSong ? m_player->keySemitones() : 0;
+    const int tempo = hasSong ? m_player->tempoPercent() : 100;
+    m_keyValueLabel->setText(key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key));
+    m_tempoValueLabel->setText(QStringLiteral("%1%").arg(tempo));
+    m_keyDownButton->setEnabled(hasSong && key > kMinKey);
+    m_keyUpButton->setEnabled(hasSong && key < kMaxKey);
+    m_keyResetButton->setEnabled(hasSong);
+    m_tempoDownButton->setEnabled(hasSong && tempo > kMinTempo);
+    m_tempoUpButton->setEnabled(hasSong && tempo < kMaxTempo);
+    m_tempoResetButton->setEnabled(hasSong);
 }

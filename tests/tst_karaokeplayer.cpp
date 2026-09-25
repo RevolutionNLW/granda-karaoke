@@ -29,6 +29,31 @@ protected:
     }
 };
 
+class TempoSeekPlayer : public KaraokePlayer {
+public:
+    TempoSeekPlayer() : KaraokePlayer(nullptr, "fakesink") {}
+
+    int rejectedSeeksRemaining = 0;
+    int seekCalls = 0;
+    bool swallowCompletions = false;
+
+protected:
+    bool performTempoSeek(qint64 positionMs, int tempoPercent) override
+    {
+        ++seekCalls;
+        if (rejectedSeeksRemaining > 0) {
+            --rejectedSeeksRemaining;
+            return false;
+        }
+        return KaraokePlayer::performTempoSeek(positionMs, tempoPercent);
+    }
+
+    bool acceptTempoSeekCompletion() override
+    {
+        return !swallowCompletions;
+    }
+};
+
 constexpr int kSongMs = 3000;
 constexpr int kMarkerMs = 1000;
 constexpr int kShortSongMs = 1500;
@@ -42,6 +67,27 @@ void verifyLyricsMatchAudio(const KaraokePlayer& player)
     QCOMPARE(player.decoder().packetsApplied(), expected);
 }
 
+// Song time advanced per wall-clock millisecond while playing, measured
+// against a real timer so a busy machine cannot make a fixed sleep overshoot.
+// The lyrics are checked against the audio position at every step.
+void measureSongRate(KaraokePlayer& player, int windowMs, double& rate)
+{
+    player.tick();
+    const qint64 start = player.positionMs();
+    QElapsedTimer wall;
+    wall.start();
+    while (wall.elapsed() < windowMs) {
+        QTest::qWait(30);
+        player.tick();
+        verifyLyricsMatchAudio(player);
+    }
+    rate = double(player.positionMs() - start) / double(wall.elapsed());
+}
+
+#define VERIFY_RATE(rate, low, high) \
+    QVERIFY2((rate) > (low) && (rate) < (high), \
+             qPrintable(QStringLiteral("song/wall rate %1 not in (%2, %3)").arg(rate).arg(low).arg(high)))
+
 } // namespace
 
 class TestKaraokePlayer : public QObject {
@@ -50,7 +96,16 @@ class TestKaraokePlayer : public QObject {
 private slots:
     void initTestCase();
     void loadEntersReady();
+    void settingsDefaultsClampAndResetForNewSong();
     void lyricsFollowAudioClock();
+    void liveKeyChangeDoesNotRestart();
+    void tempoTracksSongTimeAndCoalescesLiveChanges();
+    void rejectedLiveTempoSeekRetries();
+    void stalledLiveTempoSeekDoesNotLatch();
+    void settingsSurvivePauseResumeAndStopRestart();
+    void tempoChangeAtPausedBeginning();
+    void nonDefaultTempoReachesFinished();
+    void nonDefaultSettingsSurviveErrorRetry();
     void backwardPositionRewindsLyrics();
     void queuedEosDoesNotFinishRestart();
     void deletedMp3IsReportedOncePerAttempt();
@@ -131,6 +186,33 @@ void TestKaraokePlayer::loadEntersReady()
     QCOMPARE(player.decoder().packetCount(), std::size_t(kSongMs * 300 / 1000));
 }
 
+void TestKaraokePlayer::settingsDefaultsClampAndResetForNewSong()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QCOMPARE(player.keySemitones(), 0);
+    QCOMPARE(player.tempoPercent(), 100);
+    player.setKeySemitones(100);
+    player.setTempoPercent(1);
+    QCOMPARE(player.keySemitones(), kMaxKey);
+    QCOMPARE(player.tempoPercent(), kMinTempo);
+
+    // Values chosen while Empty are the desired values for the first song.
+    QVERIFY(player.load(m_song));
+    QCOMPARE(player.keySemitones(), kMaxKey);
+    QCOMPARE(player.tempoPercent(), kMinTempo);
+
+    player.setKeySemitones(-100);
+    player.setTempoPercent(1000);
+    QCOMPARE(player.keySemitones(), kMinKey);
+    QCOMPARE(player.tempoPercent(), kMaxTempo);
+
+    // A replacement never inherits the previous song's settings. The UI
+    // explicitly applies that song's stored values after load returns.
+    QVERIFY(player.load(m_shortSong));
+    QCOMPARE(player.keySemitones(), 0);
+    QCOMPARE(player.tempoPercent(), 100);
+}
+
 void TestKaraokePlayer::lyricsFollowAudioClock()
 {
     KaraokePlayer player(nullptr, "fakesink");
@@ -164,6 +246,213 @@ void TestKaraokePlayer::lyricsFollowAudioClock()
     QVERIFY(sawAfterMarker);
     // Position tracks real time (allowing for start-up and scheduling).
     QVERIFY2(last > 1200 && last < 2300, qPrintable(QString::number(last)));
+    player.stop();
+}
+
+void TestKaraokePlayer::liveKeyChangeDoesNotRestart()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QVERIFY(player.load(m_song));
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 450, 2500);
+    const qint64 before = player.positionMs();
+    const std::size_t packetsBefore = player.decoder().packetsApplied();
+    QSignalSpy states(&player, &KaraokePlayer::stateChanged);
+
+    player.setKeySemitones(2);
+    QCOMPARE(player.keySemitones(), 2);
+    QCOMPARE(player.state(), State::Playing);
+    QCOMPARE(states.count(), 0);
+    QTest::qWait(350);
+    player.tick();
+    QVERIFY(player.positionMs() > before + 150);
+    QVERIFY(player.decoder().packetsApplied() >= packetsBefore);
+    verifyLyricsMatchAudio(player);
+    QCOMPARE(states.count(), 0);
+
+    player.setKeySemitones(0);
+    QCOMPARE(player.state(), State::Playing);
+    QCOMPARE(states.count(), 0);
+    player.stop();
+}
+
+void TestKaraokePlayer::tempoTracksSongTimeAndCoalescesLiveChanges()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QVERIFY(player.load(m_song));
+    player.setTempoPercent(80); // Ready: must apply before the first PLAYING sample.
+    player.play();
+    QCOMPARE(player.state(), State::Playing);
+
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 100, 2500);
+    double slowRate = 0;
+    measureSongRate(player, 800, slowRate);
+    VERIFY_RATE(slowRate, 0.65, 0.92);
+
+    QSignalSpy states(&player, &KaraokePlayer::stateChanged);
+    const qint64 beforeChange = player.positionMs();
+    const std::size_t packetsBefore = player.decoder().packetsApplied();
+    player.setTempoPercent(82);
+    player.setTempoPercent(84);
+    player.setTempoPercent(120); // Last click wins while the first seek is in flight.
+    QCOMPARE(player.tempoPercent(), 120);
+    QCOMPARE(player.state(), State::Playing);
+
+    QTest::qWait(200);
+    player.tick();
+    QVERIFY(player.positionMs() >= beforeChange);
+    QVERIFY(player.decoder().packetsApplied() >= packetsBefore);
+    double fastRate = 0;
+    measureSongRate(player, 700, fastRate);
+    VERIFY_RATE(fastRate, 1.08, 1.35);
+    QCOMPARE(states.count(), 0);
+    player.stop();
+}
+
+void TestKaraokePlayer::rejectedLiveTempoSeekRetries()
+{
+    TempoSeekPlayer player;
+    QVERIFY(player.load(m_song));
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 200, 2500);
+
+    player.rejectedSeeksRemaining = 4;
+    player.setTempoPercent(80);
+    QTRY_VERIFY_WITH_TIMEOUT(player.seekCalls >= 5, 2000);
+    double rate = 0;
+    measureSongRate(player, 700, rate);
+    VERIFY_RATE(rate, 0.65, 0.92);
+    player.stop();
+}
+
+void TestKaraokePlayer::stalledLiveTempoSeekDoesNotLatch()
+{
+    const SongPair longSong = makePair("Watchdog Song", 6000, 1000);
+    TempoSeekPlayer player;
+    QVERIFY(player.load(longSong));
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 200, 2500);
+
+    player.swallowCompletions = true;
+    player.setTempoPercent(80);
+    QTRY_VERIFY_WITH_TIMEOUT(player.seekCalls >= 1, 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(player.seekCalls >= 2, 3500); // Watchdog retried the stuck seek.
+
+    player.swallowCompletions = false;
+    const int callsBeforeLaterClick = player.seekCalls;
+    player.setTempoPercent(120);
+    QTRY_VERIFY_WITH_TIMEOUT(player.seekCalls > callsBeforeLaterClick, 3500);
+    double rate = 0;
+    measureSongRate(player, 700, rate);
+    VERIFY_RATE(rate, 1.08, 1.35);
+    player.stop();
+}
+
+void TestKaraokePlayer::settingsSurvivePauseResumeAndStopRestart()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QVERIFY(player.load(m_song));
+    player.setKeySemitones(3);
+    player.setTempoPercent(80);
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 350, 2500);
+    player.pause();
+    const qint64 pausedAt = player.positionMs();
+    player.setKeySemitones(-2);
+    player.setTempoPercent(90);
+    QTest::qWait(250);
+    player.tick();
+    QCOMPARE(player.state(), State::Paused);
+    QCOMPARE(player.positionMs(), pausedAt);
+    QCOMPARE(player.keySemitones(), -2);
+    QCOMPARE(player.tempoPercent(), 90);
+
+    player.play();
+    QCOMPARE(player.state(), State::Playing);
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > pausedAt + 50, 2000);
+    double resumedRate = 0;
+    measureSongRate(player, 600, resumedRate);
+    VERIFY_RATE(resumedRate, 0.75, 0.97);  // 90%, never back at 100%
+
+    player.stop();
+    QCOMPARE(player.positionMs(), 0);
+    QCOMPARE(player.keySemitones(), -2);
+    QCOMPARE(player.tempoPercent(), 90);
+    player.play();
+    QCOMPARE(player.state(), State::Playing);
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 50, 2000);
+    QVERIFY(player.positionMs() < 1000);  // Restarted from the beginning.
+    double restartedRate = 0;
+    measureSongRate(player, 600, restartedRate);
+    VERIFY_RATE(restartedRate, 0.75, 0.97);
+    player.stop();
+}
+
+void TestKaraokePlayer::tempoChangeAtPausedBeginning()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QVERIFY(player.load(m_song));
+    player.play();
+    player.pause();
+    QCOMPARE(player.state(), State::Paused);
+    player.setTempoPercent(80);
+    QCOMPARE(player.state(), State::Paused);
+    QTest::qWait(150);
+    player.tick();
+    const qint64 pausedAt = player.positionMs();
+
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > pausedAt + 50, 2000);
+    double rate = 0;
+    measureSongRate(player, 700, rate);
+    VERIFY_RATE(rate, 0.65, 0.92);
+    player.stop();
+}
+
+void TestKaraokePlayer::nonDefaultTempoReachesFinished()
+{
+    KaraokePlayer player(nullptr, "fakesink");
+    QVERIFY(player.load(m_shortSong));
+    player.setTempoPercent(120);
+    player.setKeySemitones(-1);
+    player.play();
+    QTRY_COMPARE_WITH_TIMEOUT(player.state(), State::Finished, 4500);
+    QCOMPARE(player.positionMs(), 0);
+    QCOMPARE(player.decoder().packetsApplied(), 0u);
+    QCOMPARE(player.tempoPercent(), 120);
+    QCOMPARE(player.keySemitones(), -1);
+
+    player.play();
+    QCOMPARE(player.state(), State::Playing);
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 50, 2000);
+    QVERIFY(player.positionMs() < 700);  // Restarted from the beginning.
+    double rate = 0;
+    measureSongRate(player, 500, rate);
+    VERIFY_RATE(rate, 1.05, 1.35);
+    player.stop();
+}
+
+void TestKaraokePlayer::nonDefaultSettingsSurviveErrorRetry()
+{
+    BusTestPlayer player;
+    QVERIFY(player.load(m_song));
+    player.setKeySemitones(2);
+    player.setTempoPercent(80);
+    player.play();
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 150, 2000);
+    QVERIFY(player.postError());
+    player.tick();
+    QCOMPARE(player.state(), State::Error);
+    QCOMPARE(player.keySemitones(), 2);
+    QCOMPARE(player.tempoPercent(), 80);
+
+    player.play();
+    QCOMPARE(player.state(), State::Playing);
+    QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > 50, 2000);
+    QVERIFY(player.positionMs() < 1000);  // Restarted from the beginning.
+    double rate = 0;
+    measureSongRate(player, 600, rate);
+    VERIFY_RATE(rate, 0.65, 0.92);
     player.stop();
 }
 
@@ -590,6 +879,10 @@ void TestKaraokePlayer::externalMediaSmokeTest()
     player.play();
     const auto startRevision = player.decoder().revision();
     for (int i = 0; i < 30; ++i) {
+        if (i == 10) {
+            player.setKeySemitones(2);
+            player.setTempoPercent(90);
+        }
         QTest::qWait(100);
         player.tick();
         QCOMPARE(player.state(), State::Playing);

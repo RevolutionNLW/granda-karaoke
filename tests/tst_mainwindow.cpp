@@ -6,9 +6,11 @@
 #include "LyricsView.h"
 #include "MainWindow.h"
 #include "BusTestPlayer.h"
+#include "SongSettings.h"
 #include "TestMedia.h"
 
 #include <QPushButton>
+#include <QLabel>
 #include <QMessageBox>
 #include <QFileDialog>
 #include <QStackedWidget>
@@ -26,6 +28,10 @@ private slots:
     void init();
     void cleanup();
     void openShowsReadySong();
+    void controlsFitDefaultSize();
+    void settingsControlsDefaultsAndFocus();
+    void keyAndTempoButtonsClampAndReset();
+    void perSongSettingsPersistAcrossWindows();
     void playShowsLyricsPage();
     void escapeReturnsToControlsWithoutTouchingAudio();
     void keysNeverClickButtons();
@@ -52,11 +58,14 @@ private slots:
 
 private:
     void startPlaying();
+    void createWindow(bool clearSettings);
 
     QTemporaryDir m_dir;
     QString m_songPath;
     QString m_shortSongPath;
+    QString m_settingsPath;
     std::unique_ptr<BusTestPlayer> m_player;
+    std::unique_ptr<SongSettingsStore> m_store;
     std::unique_ptr<MainWindow> m_window;
 };
 
@@ -70,12 +79,21 @@ void TestMainWindow::initTestCase()
     QVERIFY(testmedia::writeCdg(m_dir.filePath("Long Song.cdg"), testmedia::markerCdg(4000, 300)));
     QVERIFY(testmedia::writeMp3(m_dir.filePath("Short Song.mp3"), 1200));
     QVERIFY(testmedia::writeCdg(m_shortSongPath, testmedia::markerCdg(1200, 300)));
+    m_settingsPath = m_dir.filePath("song-settings.json");
 }
 
 void TestMainWindow::init()
 {
+    createWindow(true);
+}
+
+void TestMainWindow::createWindow(bool clearSettings)
+{
     m_player = std::make_unique<BusTestPlayer>();
-    m_window = std::make_unique<MainWindow>(m_player.get());
+    if (clearSettings)
+        QFile::remove(m_settingsPath);
+    m_store = std::make_unique<SongSettingsStore>(m_settingsPath);
+    m_window = std::make_unique<MainWindow>(m_player.get(), m_store.get());
     m_window->setShowErrorDialogs(false);
     m_window->showFullScreen();
     m_window->setFocus();
@@ -86,6 +104,7 @@ void TestMainWindow::cleanup()
 {
     m_window.reset();
     m_player.reset();
+    m_store.reset();
 }
 
 void TestMainWindow::startPlaying()
@@ -104,6 +123,114 @@ void TestMainWindow::openShowsReadySong()
     QVERIFY(!m_window->pauseButton()->isEnabled());
     QVERIFY(m_window->statusText().contains("Ready"));
     QVERIFY(!m_window->lyricsView()->isVisible());
+}
+
+void TestMainWindow::controlsFitDefaultSize()
+{
+    const QSize minimum = m_window->minimumSizeHint();
+    QVERIFY2(minimum.width() <= 900,
+             qPrintable(QStringLiteral("minimum width is %1").arg(minimum.width())));
+    QVERIFY2(minimum.height() <= 520,
+             qPrintable(QStringLiteral("minimum height is %1").arg(minimum.height())));
+    m_window->showNormal();
+    m_window->resize(900, 520);
+    QCoreApplication::processEvents();
+    QCOMPARE(m_window->size(), QSize(900, 520));
+}
+
+void TestMainWindow::settingsControlsDefaultsAndFocus()
+{
+    QCOMPARE(m_window->keyValueLabel()->text(), QStringLiteral("0"));
+    QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("100%"));
+    const QList<QPushButton*> buttons{
+        m_window->keyDownButton(), m_window->keyUpButton(), m_window->keyResetButton(),
+        m_window->tempoDownButton(), m_window->tempoUpButton(), m_window->tempoResetButton(),
+    };
+    for (QPushButton* button : buttons) {
+        QCOMPARE(button->focusPolicy(), Qt::NoFocus);
+        QVERIFY(!button->isEnabled());
+    }
+
+    QVERIFY(m_window->openSong(m_songPath));
+    QCOMPARE(m_window->keyValueLabel()->text(), QStringLiteral("0"));
+    QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("100%"));
+    for (QPushButton* button : buttons)
+        QVERIFY(button->isEnabled());
+}
+
+void TestMainWindow::keyAndTempoButtonsClampAndReset()
+{
+    QVERIFY(m_window->openSong(m_songPath));
+    for (int key = 0; key < kMaxKey; ++key)
+        QTest::mouseClick(m_window->keyUpButton(), Qt::LeftButton);
+    QCOMPARE(m_player->keySemitones(), kMaxKey);
+    QCOMPARE(m_window->keyValueLabel()->text(), QStringLiteral("+6"));
+    QVERIFY(!m_window->keyUpButton()->isEnabled());
+    QVERIFY(m_window->keyDownButton()->isEnabled());
+
+    for (int key = kMaxKey; key > kMinKey; --key)
+        QTest::mouseClick(m_window->keyDownButton(), Qt::LeftButton);
+    QCOMPARE(m_player->keySemitones(), kMinKey);
+    QCOMPARE(m_window->keyValueLabel()->text(), QStringLiteral("-6"));
+    QVERIFY(!m_window->keyDownButton()->isEnabled());
+    QTest::mouseClick(m_window->keyResetButton(), Qt::LeftButton);
+    QCOMPARE(m_player->keySemitones(), 0);
+    QCOMPARE(m_window->keyValueLabel()->text(), QStringLiteral("0"));
+
+    for (int tempo = 100; tempo < kMaxTempo; tempo += kTempoStep)
+        QTest::mouseClick(m_window->tempoUpButton(), Qt::LeftButton);
+    QCOMPARE(m_player->tempoPercent(), kMaxTempo);
+    QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("130%"));
+    QVERIFY(!m_window->tempoUpButton()->isEnabled());
+    for (int tempo = kMaxTempo; tempo > kMinTempo; tempo -= kTempoStep)
+        QTest::mouseClick(m_window->tempoDownButton(), Qt::LeftButton);
+    QCOMPARE(m_player->tempoPercent(), kMinTempo);
+    QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("70%"));
+    QVERIFY(!m_window->tempoDownButton()->isEnabled());
+    QTest::mouseClick(m_window->tempoResetButton(), Qt::LeftButton);
+    QCOMPARE(m_player->tempoPercent(), 100);
+    QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("100%"));
+}
+
+void TestMainWindow::perSongSettingsPersistAcrossWindows()
+{
+    QVERIFY(m_window->openSong(m_songPath));
+    QTest::mouseClick(m_window->keyDownButton(), Qt::LeftButton);
+    QTest::mouseClick(m_window->keyDownButton(), Qt::LeftButton);
+    for (int i = 0; i < 3; ++i)
+        QTest::mouseClick(m_window->tempoDownButton(), Qt::LeftButton);
+    QCOMPARE(m_player->keySemitones(), -2);
+    QCOMPARE(m_player->tempoPercent(), 94);
+
+    QVERIFY(m_window->openSong(m_shortSongPath));
+    QCOMPARE(m_player->keySemitones(), 0);
+    QCOMPARE(m_player->tempoPercent(), 100);
+    QTest::mouseClick(m_window->keyUpButton(), Qt::LeftButton);
+    QTest::mouseClick(m_window->tempoUpButton(), Qt::LeftButton);
+    QCOMPARE(m_player->keySemitones(), 1);
+    QCOMPARE(m_player->tempoPercent(), 102);
+
+    QVERIFY(m_window->openSong(m_songPath));
+    QCOMPARE(m_player->keySemitones(), -2);
+    QCOMPARE(m_player->tempoPercent(), 94);
+
+    m_window.reset();
+    m_player.reset();
+    m_store.reset();
+    createWindow(false);
+    QVERIFY(m_window->openSong(m_songPath));
+    QCOMPARE(m_player->keySemitones(), -2);
+    QCOMPARE(m_player->tempoPercent(), 94);
+
+    QTest::mouseClick(m_window->keyResetButton(), Qt::LeftButton);
+    QTest::mouseClick(m_window->tempoResetButton(), Qt::LeftButton);
+    m_window.reset();
+    m_player.reset();
+    m_store.reset();
+    createWindow(false);
+    QVERIFY(m_window->openSong(m_songPath));
+    QCOMPARE(m_player->keySemitones(), 0);
+    QCOMPARE(m_player->tempoPercent(), 100);
 }
 
 void TestMainWindow::playShowsLyricsPage()
@@ -144,7 +271,10 @@ void TestMainWindow::keysNeverClickButtons()
 {
     std::vector<std::unique_ptr<QSignalSpy>> clicks;
     for (auto* button : {m_window->openButton(), m_window->playButton(),
-                        m_window->pauseButton(), m_window->stopButton(), m_window->exitButton()}) {
+                        m_window->pauseButton(), m_window->stopButton(), m_window->exitButton(),
+                        m_window->keyDownButton(), m_window->keyUpButton(),
+                        m_window->keyResetButton(), m_window->tempoDownButton(),
+                        m_window->tempoUpButton(), m_window->tempoResetButton()}) {
         QCOMPARE(button->focusPolicy(), Qt::NoFocus);
         clicks.push_back(std::make_unique<QSignalSpy>(button, &QPushButton::clicked));
     }
@@ -310,11 +440,15 @@ void TestMainWindow::failedOpenKeepsPlaying()
         QVERIFY(testmedia::writeFile(m_dir.filePath(base + ".cdg"), QByteArray(24000, '\x5a')));
     startPlaying();
     QTRY_VERIFY_WITH_TIMEOUT(m_player->positionMs() > 100, 3000);
+    m_player->setKeySemitones(-2);
+    m_player->setTempoPercent(94);
     const qint64 before = m_player->positionMs();
     QSignalSpy states(m_player.get(), &KaraokePlayer::stateChanged);
     QVERIFY(!m_window->openSong(path));
     QCOMPARE(m_player->state(), State::Playing);
     QCOMPARE(m_player->song().mp3Path, m_songPath);
+    QCOMPARE(m_player->keySemitones(), -2);
+    QCOMPARE(m_player->tempoPercent(), 94);
     QCOMPARE(m_player->positionMs(), before);
     QCOMPARE(states.count(), 0);
     QVERIFY(!m_window->lyricsVisible());
