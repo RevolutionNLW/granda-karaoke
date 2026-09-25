@@ -1,0 +1,8 @@
+# Build output
+/build/
+/build-*/
+CMakeLists.txt.user*
+.qtcreator/project.json.user
+
+# macOS
+.DS_Store

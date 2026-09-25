@@ -1,0 +1,74 @@
+cmake_minimum_required(VERSION 3.22)
+
+project(FrankiesKaraokeStudio VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_AUTOMOC ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+include(cmake/GStreamer.cmake)
+
+# Development runs link against the SDK in place. Packaging/deployment of the
+# GStreamer runtime is a later milestone.
+if(GSTREAMER_LIBRARY_DIR)
+    set(CMAKE_BUILD_RPATH "${GSTREAMER_LIBRARY_DIR}")
+endif()
+
+# CDG decoding: plain C++ with no Qt or GStreamer dependency, so it can be
+# tested in isolation.
+add_library(fks_cdg STATIC
+    src/cdg/CdgDecoder.cpp
+    src/cdg/CdgDecoder.h
+)
+target_include_directories(fks_cdg PUBLIC src)
+
+# Application core shared by the executable and the tests.
+add_library(fks_core STATIC
+    src/Logging.cpp
+    src/Logging.h
+    src/SongPair.cpp
+    src/SongPair.h
+    src/KaraokePlayer.cpp
+    src/KaraokePlayer.h
+    src/LyricsView.cpp
+    src/LyricsView.h
+    src/platform/DisplaySleepBlocker.cpp
+    src/platform/DisplaySleepBlocker.h
+    src/MainWindow.cpp
+    src/MainWindow.h
+)
+target_include_directories(fks_core PUBLIC src)
+target_link_libraries(fks_core PUBLIC fks_cdg Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
+
+if(APPLE)
+    target_link_libraries(fks_core PRIVATE "-framework IOKit" "-framework CoreFoundation")
+endif()
+
+add_executable(FrankiesKaraokeStudio MACOSX_BUNDLE WIN32 src/main.cpp)
+target_link_libraries(FrankiesKaraokeStudio PRIVATE fks_core)
+target_compile_definitions(FrankiesKaraokeStudio PRIVATE FKS_VERSION="${PROJECT_VERSION}")
+set_target_properties(FrankiesKaraokeStudio PROPERTIES
+    MACOSX_BUNDLE_BUNDLE_NAME "Frankie's Karaoke Studio"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.granda.FrankiesKaraokeStudio"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+)
+
+foreach(_target fks_cdg fks_core FrankiesKaraokeStudio)
+    if(MSVC)
+        target_compile_options(${_target} PRIVATE /W4)
+    else()
+        target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()
+
+option(FKS_BUILD_TESTS "Build automated tests" ON)
+if(FKS_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
