@@ -29,6 +29,7 @@ LibraryController::LibraryController(const QString& databasePath,
     connect(m_scanner, &LibraryScanner::progress,
             this, &LibraryController::onProgress);
     connect(m_scanner, &LibraryScanner::libraryReady, this, [this] {
+        invalidateBrowseCache();
         m_ready = true;
         emit libraryReady();
         emit stateChanged();
@@ -117,6 +118,29 @@ QList<CatalogueSearchRow> LibraryController::search(const QString& text, int lim
     return m_catalogue.searchActive(text, limit, error);
 }
 
+QList<CatalogueSearchRow> LibraryController::browse(QString* error) const
+{
+    if (!isAvailable()) {
+        if (error)
+            *error = m_openError;
+        return {};
+    }
+    if (error)
+        error->clear();
+    if (!m_browseCacheValid) {
+        QString browseError;
+        const QList<CatalogueSearchRow> rows = m_catalogue.browseActive(&browseError);
+        if (!browseError.isEmpty()) {
+            if (error)
+                *error = browseError;
+            return {};
+        }
+        m_browseRows = rows;
+        m_browseCacheValid = true;
+    }
+    return m_browseRows;
+}
+
 PlaybackPaths LibraryController::playbackPathsFor(qint64 songId, QString* error) const
 {
     if (!isAvailable()) {
@@ -127,6 +151,126 @@ PlaybackPaths LibraryController::playbackPathsFor(qint64 songId, QString* error)
     return m_catalogue.activePlaybackPathsFor(songId, error);
 }
 
+PlaybackPaths LibraryController::playbackPathsForAny(qint64 songId, QString* error) const
+{
+    if (!isAvailable()) {
+        if (error)
+            *error = m_openError;
+        return {};
+    }
+    return m_catalogue.playbackPathsFor(songId, error);
+}
+
+std::optional<SongRef> LibraryController::songRef(qint64 songId, QString* error) const
+{
+    if (!isAvailable()) {
+        if (error)
+            *error = m_openError;
+        return std::nullopt;
+    }
+    return m_catalogue.songRef(songId, error);
+}
+
+qint64 LibraryController::findSongByMp3Path(const QString& rootPath,
+                                            const QString& relPath,
+                                            QString* error) const
+{
+    if (!isAvailable()) {
+        if (error)
+            *error = m_openError;
+        return 0;
+    }
+    return m_catalogue.findSongByMp3Path(rootPath, relPath, error);
+}
+
+PlaylistSongResolution LibraryController::resolvePlaylistSong(
+    const PlaylistEntry& entry, QString* error) const
+{
+    if (!isAvailable()) {
+        if (error)
+            *error = m_openError;
+        return {};
+    }
+    if (error)
+        error->clear();
+
+    // A relative path is the durable identity. Catalogue song IDs are only a
+    // cache because a recovered/rebuilt catalogue may reuse them for another song.
+    if (!entry.mp3RelPath.isEmpty()) {
+        QString lookupError;
+        const qint64 exact = m_catalogue.findSongByMp3Path(
+            entry.rootPath, entry.mp3RelPath, &lookupError);
+        if (!lookupError.isEmpty()) {
+            if (error)
+                *error = lookupError;
+            return {};
+        }
+        if (exact != 0)
+            return {exact, exact != entry.songId};
+
+        // A disconnected root has no present-file match, but the old ID may
+        // still safely identify it when its stored source path is identical.
+        const auto storedIdSong = m_catalogue.songRef(entry.songId, &lookupError);
+        if (!lookupError.isEmpty()) {
+            if (error)
+                *error = lookupError;
+            return {};
+        }
+        if (storedIdSong
+            && Catalogue::playlistSnapshotPathsMatch(
+                entry.rootPath, entry.mp3RelPath,
+                storedIdSong->rootPath, storedIdSong->mp3RelPath))
+            return {entry.songId, false};
+
+        // The media root may have moved (for example, a new Windows drive
+        // letter). Accept a relative-path match only when it identifies one
+        // current song in the active root.
+        const qint64 moved = m_catalogue.findUniqueActiveSongByMp3Path(
+            entry.mp3RelPath, &lookupError);
+        if (!lookupError.isEmpty()) {
+            if (error)
+                *error = lookupError;
+            return {};
+        }
+        if (moved == 0)
+            return {};
+        const auto candidate = m_catalogue.songRef(moved, &lookupError);
+        if (!lookupError.isEmpty()) {
+            if (error)
+                *error = lookupError;
+            return {};
+        }
+        bool metadataMatches = false;
+        if (candidate && !entry.discId.trimmed().isEmpty() && entry.track > 0) {
+            metadataMatches = candidate->discId.trimmed().compare(
+                                  entry.discId.trimmed(), Qt::CaseInsensitive) == 0
+                && candidate->track == entry.track;
+        } else if (candidate && !entry.title.trimmed().isEmpty()
+                   && !candidate->title.trimmed().isEmpty()) {
+            metadataMatches = candidate->title.trimmed().compare(
+                                  entry.title.trimmed(), Qt::CaseInsensitive) == 0;
+        }
+        return metadataMatches
+            ? PlaylistSongResolution{moved, moved != entry.songId}
+            : PlaylistSongResolution{};
+    }
+
+    // Legacy snapshots without a path have no durable identity to verify.
+    return m_catalogue.songRef(entry.songId, error)
+        ? PlaylistSongResolution{entry.songId, false}
+        : PlaylistSongResolution{};
+}
+
+QStringList LibraryController::libraryRoots() const
+{
+    QStringList result;
+    if (!isAvailable())
+        return result;
+    for (const CatalogueRoot& root : m_catalogue.roots())
+        result.append(root.path);
+    return result;
+}
+
 bool LibraryController::chooseRoot(const QString& path, QString* error)
 {
     if (!isAvailable()) {
@@ -134,10 +278,21 @@ bool LibraryController::chooseRoot(const QString& path, QString* error)
             *error = m_openError;
         return false;
     }
+    for (const QString& protectedPath : std::as_const(m_protectedStoragePaths)) {
+        if (Catalogue::pathIsInsideOrEqual(protectedPath, path)) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Application storage must not be inside library root: %1").arg(path);
+            }
+            return false;
+        }
+    }
     qint64 rootId = 0;
     if (!m_catalogue.addRoot(path, &rootId, error)
         || !m_catalogue.setActiveRoot(rootId, error))
         return false;
+    invalidateBrowseCache();
+    emit catalogueChanged();
     m_rootWasConnected = true;
     emit stateChanged();
     startScan(m_catalogue.activeRoot().path);
@@ -209,6 +364,7 @@ void LibraryController::onProgress(const QString& phase, qint64 done, qint64 tot
 
 void LibraryController::onFinished(const QVariantMap& summary)
 {
+    invalidateBrowseCache();
     m_scanning = false;
     m_scanningRoot.clear();
     emit scanFinished(summary);
@@ -216,11 +372,19 @@ void LibraryController::onFinished(const QVariantMap& summary)
     startPendingScan();
 }
 
+void LibraryController::invalidateBrowseCache()
+{
+    m_browseRows.clear();
+    m_browseCacheValid = false;
+}
+
 void LibraryController::onFailed(const QString& message)
 {
     qCWarning(lcLibraryController).noquote() << "Library scan failed:" << message;
+    invalidateBrowseCache();
     m_scanning = false;
     m_scanningRoot.clear();
+    emit catalogueChanged();
     emit stateChanged();
     startPendingScan();
 }

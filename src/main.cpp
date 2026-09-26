@@ -3,6 +3,7 @@
 #include "Logging.h"
 #include "MainWindow.h"
 #include "SongSettings.h"
+#include "playlist/PlaylistStore.h"
 
 #include <QApplication>
 #include <QDir>
@@ -29,13 +30,22 @@ int main(int argc, char* argv[])
     }
 
     KaraokePlayer player;
-    const QString settingsPath = QDir(QStandardPaths::writableLocation(
-        QStandardPaths::AppDataLocation)).filePath(QStringLiteral("song-settings.json"));
+    const QString appDataPath = QStandardPaths::writableLocation(
+        QStandardPaths::AppDataLocation);
+    QDir().mkpath(appDataPath);
+    const QString settingsPath = QDir(appDataPath).filePath(
+        QStringLiteral("song-settings.json"));
     SongSettingsStore settingsStore(settingsPath);
     const QString cataloguePath = QDir(QStandardPaths::writableLocation(
         QStandardPaths::AppLocalDataLocation)).filePath(QStringLiteral("library.sqlite"));
     LibraryController libraryController(cataloguePath);
-    MainWindow window(&player, &settingsStore, &libraryController);
+    const QString playlistsPath = QDir(appDataPath).filePath(
+        QStringLiteral("playlists.sqlite"));
+    libraryController.setProtectedStoragePaths({playlistsPath, settingsPath});
+    PlaylistStore playlistStore(playlistsPath);
+    if (!playlistStore.open(&error, libraryController.libraryRoots()))
+        qCWarning(lcApp).noquote() << "Playlists are unavailable:" << error;
+    MainWindow window(&player, &settingsStore, &libraryController, &playlistStore);
     window.resize(900, 520);
     window.showFullScreen();
     window.setFocus(Qt::OtherFocusReason);

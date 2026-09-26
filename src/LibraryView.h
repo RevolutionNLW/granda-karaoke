@@ -6,10 +6,10 @@
 #include <utility>
 
 class LibraryController;
+class LibraryResultsModel;
 class QLabel;
 class QLineEdit;
-class QListWidget;
-class QListWidgetItem;
+class QListView;
 class QPushButton;
 class QStackedWidget;
 
@@ -26,20 +26,23 @@ public:
     void setFolderChooser(FolderChooser chooser) { m_folderChooser = std::move(chooser); }
 
     QLineEdit* searchBox() const { return m_searchBox; }
-    QListWidget* resultsList() const { return m_results; }
+    QListView* resultsList() const { return m_results; }
     QPushButton* backButton() const { return m_backButton; }
     QPushButton* chooseFolderButton() const { return m_chooseFolderButton; }
     QPushButton* changeFolderButton() const { return m_changeFolderButton; }
     QPushButton* singButton() const { return m_singButton; }
+    QPushButton* addToPlaylistButton() const { return m_addToPlaylistButton; }
     QLabel* statusLabel() const { return m_statusLabel; }
     QLabel* hintLabel() const { return m_hintLabel; }
     QLabel* messageLabel() const { return m_messageLabel; }
     int songResultCount() const;
     qint64 selectedSongId() const;
+    void setPlaylistAvailable(bool available);
 
 signals:
     void backRequested();
     void singRequested(qint64 songId);
+    void addRequested(qint64 songId);
 
 public slots:
     void refreshSearch();
@@ -54,8 +57,7 @@ private slots:
 
 private:
     void moveSelection(int delta);
-    void addResult(qint64 songId, const QString& title, const QString& artist,
-                   const QString& discAndTrack);
+    void updateSelectionActions();
 
     LibraryController* m_controller;
     QPushButton* m_backButton;
@@ -67,10 +69,13 @@ private:
     QPushButton* m_chooseFolderButton;
     QLineEdit* m_searchBox;
     QLabel* m_hintLabel;
-    QListWidget* m_results;
+    QListView* m_results;
+    LibraryResultsModel* m_resultsModel;
     QLabel* m_messageLabel;
     QPushButton* m_changeFolderButton;
     QPushButton* m_singButton;
+    QPushButton* m_addToPlaylistButton;
     class QTimer* m_debounce;
     FolderChooser m_folderChooser;
+    bool m_playlistAvailable = false;
 };

@@ -4,7 +4,10 @@
 #include "LibraryController.h"
 #include "LibraryView.h"
 #include "LyricsView.h"
+#include "PlaylistView.h"
 #include "SongPair.h"
+#include "playlist/PlaylistPlayback.h"
+#include "playlist/PlaylistStore.h"
 
 #include <QApplication>
 #include <QCloseEvent>
@@ -33,7 +36,7 @@ QPushButton* makeButton(const QString& text, QWidget* parent)
 {
     auto* button = new QPushButton(text, parent);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumSize(140, 80);
+    button->setMinimumSize(115, 80);
     QFont font = button->font();
     font.setPointSize(22);
     font.setBold(true);
@@ -73,11 +76,14 @@ bool isEnterKey(const QKeyEvent* event)
 } // namespace
 
 MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
-                       LibraryController* libraryController, QWidget* parent)
+                       LibraryController* libraryController,
+                       PlaylistStore* playlistStore, QWidget* parent)
     : QWidget(parent)
     , m_player(player)
     , m_settingsStore(settingsStore)
     , m_libraryController(libraryController)
+    , m_playlistStore(playlistStore)
+    , m_playlistPlayback(new PlaylistPlayback(playlistStore, this))
 {
     Q_ASSERT(m_player);
     Q_ASSERT(m_settingsStore);
@@ -90,8 +96,15 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     m_pages->addWidget(m_controls);
     m_pages->addWidget(m_lyrics);
     if (m_libraryController) {
-        m_library = new LibraryView(m_libraryController, m_pages);
-        m_pages->addWidget(m_library);
+        m_libraryPage = new QWidget(m_pages);
+        m_library = new LibraryView(m_libraryController, m_libraryPage);
+        m_playlistView = new PlaylistView(m_playlistStore, m_libraryController,
+                                           m_playlistPlayback, m_libraryPage);
+        auto* libraryLayout = new QHBoxLayout(m_libraryPage);
+        libraryLayout->setContentsMargins(0, 0, 0, 0);
+        libraryLayout->addWidget(m_library, 3);
+        libraryLayout->addWidget(m_playlistView, 2);
+        m_pages->addWidget(m_libraryPage);
     }
     auto* windowLayout = new QVBoxLayout(this);
     windowLayout->setContentsMargins(0, 0, 0, 0);
@@ -119,6 +132,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     m_hintLabel->setFont(hintFont);
 
     m_findButton = makeButton(QStringLiteral("Find a Song"), m_controls);
+    m_playlistsButton = makeButton(QStringLiteral("Playlists"), m_controls);
     m_openButton = makeButton(QStringLiteral("Open Song"), m_controls);
     m_playButton = makeButton(QStringLiteral("Play"), m_controls);
     m_pauseButton = makeButton(QStringLiteral("Pause"), m_controls);
@@ -166,6 +180,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     auto* buttons = new QHBoxLayout;
     buttons->setSpacing(10);
     buttons->addWidget(m_findButton);
+    buttons->addWidget(m_playlistsButton);
     buttons->addWidget(m_openButton);
     buttons->addWidget(m_playButton);
     buttons->addWidget(m_pauseButton);
@@ -186,6 +201,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
 
     connect(m_exitButton, &QPushButton::clicked, this, &QWidget::close);
     connect(m_findButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
+    connect(m_playlistsButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
     connect(m_openButton, &QPushButton::clicked, this, &MainWindow::chooseSong);
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
     connect(m_pauseButton, &QPushButton::clicked, this, &MainWindow::onPause);
@@ -206,6 +222,8 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     });
 
     connect(m_player, &KaraokePlayer::stateChanged, this, &MainWindow::onStateChanged);
+    connect(m_player, &KaraokePlayer::stateChanged,
+            m_playlistPlayback, &PlaylistPlayback::onPlayerStateChanged);
     connect(m_player, &KaraokePlayer::errorOccurred, this, &MainWindow::onError);
     connect(m_player, &KaraokePlayer::positionChanged, this, &MainWindow::updateControls);
     connect(m_player, &KaraokePlayer::settingsChanged, this, &MainWindow::updateControls);
@@ -214,6 +232,17 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     if (m_library) {
         connect(m_library, &LibraryView::backRequested, this, &MainWindow::hideLyrics);
         connect(m_library, &LibraryView::singRequested, this, &MainWindow::singLibrarySong);
+        connect(m_library, &LibraryView::addRequested,
+                m_playlistView, &PlaylistView::addSong);
+        connect(m_playlistView, &PlaylistView::displayedPlaylistChanged,
+                m_library, &LibraryView::setPlaylistAvailable);
+        connect(m_playlistView, &PlaylistView::playRequested,
+                this, &MainWindow::playPlaylistItem);
+        connect(m_playlistView, &PlaylistView::backRequested,
+                this, &MainWindow::hideLyrics);
+        connect(m_playlistPlayback, &PlaylistPlayback::autoplayRequested,
+                this, [this](PlaylistEntry entry) { playPlaylistItem(entry, true); });
+        m_library->setPlaylistAvailable(m_playlistView->displayedPlaylistId() != 0);
     }
 
     m_lyrics->setFrame(m_player->currentFrame());
@@ -230,7 +259,7 @@ bool MainWindow::lyricsVisible() const
 
 bool MainWindow::libraryVisible() const
 {
-    return m_library && m_pages->currentWidget() == m_library;
+    return m_libraryPage && m_pages->currentWidget() == m_libraryPage;
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event)
@@ -253,6 +282,7 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    m_playlistPlayback->cancelPendingAutoplay();
     m_player->stop();
     event->accept();
 }
@@ -272,12 +302,15 @@ void MainWindow::showLibrary()
 {
     if (!m_library)
         return;
-    m_pages->setCurrentWidget(m_library);
+    m_pages->setCurrentWidget(m_libraryPage);
     m_library->activate();
+    if (m_playlistView)
+        m_playlistView->activate();
 }
 
 void MainWindow::singLibrarySong(qint64 songId)
 {
+    m_playlistPlayback->cancelPendingAutoplay();
     if (!m_libraryController)
         return;
     if (!m_libraryController->isRootConnected()) {
@@ -294,11 +327,61 @@ void MainWindow::singLibrarySong(qint64 songId)
         m_libraryController->requestRefreshScan();
         return;
     }
-    openSong(paths.mp3Path);
+    if (loadSong(paths.mp3Path))
+        m_playlistPlayback->clear();
+}
+
+void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
+{
+    if (!autoplay)
+        m_playlistPlayback->cancelPendingAutoplay();
+    const auto unavailable = [this] {
+        const QString message = QStringLiteral("This song can't be found right now.");
+        if (m_playlistView)
+            m_playlistView->showMessage(message);
+        m_errorText = message;
+        updateControls();
+    };
+    if (!m_libraryController || !m_playlistStore) {
+        unavailable();
+        return;
+    }
+    QString error;
+    const PlaylistSongResolution resolution =
+        m_libraryController->resolvePlaylistSong(entry, &error);
+    if (!resolution) {
+        unavailable();
+        return;
+    }
+    if (resolution.updateStoredSongId
+        && !m_playlistStore->updateSongId(entry.itemId, resolution.songId, &error)) {
+        qCWarning(lcUi).noquote()
+            << "Could not cache resolved playlist song ID; continuing playback:" << error;
+    }
+    const PlaybackPaths paths = m_libraryController->playbackPathsForAny(
+        resolution.songId, &error);
+    if (!paths.playable() || !QFileInfo::exists(paths.mp3Path)
+        || !QFileInfo::exists(paths.graphicsPath)) {
+        unavailable();
+        return;
+    }
+    if (!loadSong(paths.mp3Path)) {
+        if (autoplay)
+            unavailable();
+        return;
+    }
+    if (m_player->state() == KaraokePlayer::State::Error
+        || m_player->state() == KaraokePlayer::State::Empty) {
+        m_playlistPlayback->clear();
+        return;
+    }
+    m_playlistPlayback->startedFromPlaylist(entry.playlistId, entry.itemId);
+    m_player->play();
 }
 
 void MainWindow::chooseSong()
 {
+    m_playlistPlayback->cancelPendingAutoplay();
     QSettings settings;
     QString startDir = settings.value(QStringLiteral("lastSongFolder")).toString();
     if (startDir.isEmpty() || !QFileInfo(startDir).isDir())
@@ -317,6 +400,14 @@ void MainWindow::chooseSong()
 
 bool MainWindow::openSong(const QString& path)
 {
+    if (!loadSong(path))
+        return false;
+    m_playlistPlayback->clear();
+    return true;
+}
+
+bool MainWindow::loadSong(const QString& path)
+{
     qCInfo(lcUi) << "Opening" << path;
     hideLyrics();
     m_errorText.clear();
@@ -328,8 +419,18 @@ bool MainWindow::openSong(const QString& path)
         updateControls();
         return false;
     }
-    if (!m_player->load(result.pair))
+    const SongPair previousSong = m_player->song();
+    const bool hadPreviousSong = m_player->hasSong();
+    if (!m_player->load(result.pair)) {
+        const bool previousSongKept = hadPreviousSong && m_player->hasSong()
+            && m_player->song().mp3Path == previousSong.mp3Path
+            && m_player->song().cdgPath == previousSong.cdgPath;
+        if (!previousSongKept
+            && (m_player->state() == KaraokePlayer::State::Error
+                || m_player->state() == KaraokePlayer::State::Empty))
+            m_playlistPlayback->clear();
         return false; // load() reports its own errors.
+    }
 
     m_songIdentity = songIdentity(result.pair);
     m_identityWarningLogged = false;
@@ -346,6 +447,7 @@ bool MainWindow::openSong(const QString& path)
 
 void MainWindow::onPlay()
 {
+    m_playlistPlayback->cancelPendingAutoplay();
     m_errorText.clear();
     m_player->play();
     updateControls();
@@ -358,6 +460,7 @@ void MainWindow::onPause()
 
 void MainWindow::onStop()
 {
+    m_playlistPlayback->cancelPendingAutoplay();
     m_player->stop();
     hideLyrics();
 }

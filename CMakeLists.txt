@@ -49,6 +49,16 @@ add_library(fks_library STATIC
 target_include_directories(fks_library PUBLIC src)
 target_link_libraries(fks_library PUBLIC Qt6::Core Qt6::Sql)
 
+# User-owned playlists live separately from the rebuildable song catalogue.
+# This target has no widgets or media-playback dependency.
+add_library(fks_playlist STATIC
+    src/playlist/PlaylistStore.cpp
+    src/playlist/PlaylistStore.h
+    src/playlist/PlaylistTypes.h
+)
+target_include_directories(fks_playlist PUBLIC src)
+target_link_libraries(fks_playlist PUBLIC Qt6::Core Qt6::Sql PRIVATE fks_library)
+
 add_executable(fks-catalogue tools/fks-catalogue.cpp)
 target_link_libraries(fks-catalogue PRIVATE fks_library)
 
@@ -56,8 +66,12 @@ target_link_libraries(fks-catalogue PRIVATE fks_library)
 add_library(fks_core STATIC
     src/LibraryController.cpp
     src/LibraryController.h
+    src/LibraryResultsModel.cpp
+    src/LibraryResultsModel.h
     src/LibraryView.cpp
     src/LibraryView.h
+    src/PlaylistView.cpp
+    src/PlaylistView.h
     src/Logging.cpp
     src/Logging.h
     src/SongPair.cpp
@@ -68,13 +82,15 @@ add_library(fks_core STATIC
     src/KaraokePlayer.h
     src/LyricsView.cpp
     src/LyricsView.h
+    src/playlist/PlaylistPlayback.cpp
+    src/playlist/PlaylistPlayback.h
     src/platform/DisplaySleepBlocker.cpp
     src/platform/DisplaySleepBlocker.h
     src/MainWindow.cpp
     src/MainWindow.h
 )
 target_include_directories(fks_core PUBLIC src)
-target_link_libraries(fks_core PUBLIC fks_cdg fks_library Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
+target_link_libraries(fks_core PUBLIC fks_cdg fks_library fks_playlist Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
 
 if(APPLE)
     target_link_libraries(fks_core PRIVATE "-framework IOKit" "-framework CoreFoundation")
@@ -89,7 +105,7 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
-foreach(_target fks_cdg fks_library fks-catalogue fks_core FrankiesKaraokeStudio)
+foreach(_target fks_cdg fks_library fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
     if(MSVC)
         target_compile_options(${_target} PRIVATE /W4)
     else()

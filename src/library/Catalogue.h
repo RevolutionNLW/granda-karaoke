@@ -1,9 +1,13 @@
 #pragma once
 
+#include "playlist/PlaylistTypes.h"
+
 #include <QList>
 #include <QSqlDatabase>
 #include <QString>
 #include <QVariantMap>
+
+#include <optional>
 
 struct CatalogueRoot {
     qint64 id = 0;
@@ -32,7 +36,7 @@ struct PlaybackPaths {
 
 class Catalogue {
 public:
-    static constexpr int SchemaVersion = 3;
+    static constexpr int SchemaVersion = 4;
 
     explicit Catalogue(QString databasePath, QString cacheDirectory = {});
     ~Catalogue();
@@ -54,8 +58,14 @@ public:
                                      QString* error = nullptr) const;
     QList<CatalogueSearchRow> searchActive(const QString& text, int limit = 100,
                                            QString* error = nullptr) const;
+    QList<CatalogueSearchRow> browseActive(QString* error = nullptr) const;
     PlaybackPaths playbackPathsFor(qint64 songId, QString* error = nullptr) const;
     PlaybackPaths activePlaybackPathsFor(qint64 songId, QString* error = nullptr) const;
+    std::optional<SongRef> songRef(qint64 songId, QString* error = nullptr) const;
+    qint64 findSongByMp3Path(const QString& rootPath, const QString& relPath,
+                             QString* error = nullptr) const;
+    qint64 findUniqueActiveSongByMp3Path(const QString& relPath,
+                                         QString* error = nullptr) const;
     qint64 activeSongCount(QString* error = nullptr) const;
     QVariantMap stats(QString* error = nullptr) const;
     QList<QVariantMap> sample(int count, const QString& confidence = {},
@@ -67,14 +77,24 @@ public:
                               QString* error = nullptr);
 
     static QString canonicalPath(const QString& path);
+    // Playlist snapshots use the catalogue's exact stored spelling: cleaned
+    // paths with '/' separators. Case-only differences are not relinked.
+    static QString normalizedPlaylistRelativePath(const QString& path);
+    static bool playlistSnapshotPathsMatch(const QString& firstRoot,
+                                           const QString& firstRelativePath,
+                                           const QString& secondRoot,
+                                           const QString& secondRelativePath);
     static bool pathIsInsideOrEqual(const QString& candidate, const QString& root);
     static bool storageIsSafe(const QString& databasePath, const QString& cacheDirectory,
                               const QStringList& libraryRoots, QString* error = nullptr);
 
 private:
+    friend class CatalogueResolverTestAccess;
     friend class CatalogueTools;
     friend class LibraryScanner;
     friend class MetadataResolver;
+
+    static QString playlistSongLookupSql();
 
     bool ensureSchema(QString* error);
     bool execute(const QString& sql, QString* error = nullptr) const;

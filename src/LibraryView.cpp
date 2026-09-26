@@ -1,6 +1,7 @@
 #include "LibraryView.h"
 
 #include "LibraryController.h"
+#include "LibraryResultsModel.h"
 
 #include <QFileDialog>
 #include <QFontMetrics>
@@ -8,7 +9,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListWidget>
+#include <QListView>
 #include <QPainter>
 #include <QPushButton>
 #include <QStackedWidget>
@@ -17,11 +18,6 @@
 #include <QVBoxLayout>
 
 namespace {
-
-constexpr int SongIdRole = Qt::UserRole + 1;
-constexpr int ArtistRole = Qt::UserRole + 2;
-constexpr int DiscRole = Qt::UserRole + 3;
-constexpr int MoreRole = Qt::UserRole + 4;
 
 QPushButton* makeLibraryButton(const QString& text, QWidget* parent, bool mainButton)
 {
@@ -64,7 +60,7 @@ public:
                              row.height());
         const QRect rightRect(mainRect.right() + 12, row.top(), rightWidth, row.height());
 
-        if (index.data(MoreRole).toBool()) {
+        if (index.data(LibraryResultsModel::MoreRole).toBool()) {
             QFont font = option.font;
             font.setPointSize(18);
             painter->setFont(font);
@@ -90,7 +86,8 @@ public:
         painter->setFont(artistFont);
         painter->setPen(secondary);
         const QString artist = QFontMetrics(artistFont).elidedText(
-            index.data(ArtistRole).toString(), Qt::ElideRight, mainRect.width());
+            index.data(LibraryResultsModel::ArtistRole).toString(),
+            Qt::ElideRight, mainRect.width());
         painter->drawText(QRect(mainRect.left(), mainRect.top() + 39, mainRect.width(), 28),
                           Qt::AlignLeft | Qt::AlignVCenter, artist);
 
@@ -98,7 +95,7 @@ public:
         discFont.setPointSize(13);
         painter->setFont(discFont);
         painter->drawText(rightRect, Qt::AlignRight | Qt::AlignVCenter,
-                          index.data(DiscRole).toString());
+                          index.data(LibraryResultsModel::DiscRole).toString());
         painter->restore();
     }
 };
@@ -152,18 +149,25 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_searchBox->setFont(searchFont);
     m_searchBox->installEventFilter(this);
 
-    m_hintLabel = new QLabel(QStringLiteral("Type part of a song name or a singer's name"),
+    m_hintLabel = new QLabel(QStringLiteral("Type to search, or scroll to browse"),
                              m_searchPage);
     m_hintLabel->setAlignment(Qt::AlignCenter);
     QFont hintFont = m_hintLabel->font();
     hintFont.setPointSize(20);
     m_hintLabel->setFont(hintFont);
 
-    m_results = new QListWidget(m_searchPage);
+    m_results = new QListView(m_searchPage);
+    m_resultsModel = new LibraryResultsModel(m_results);
+    m_results->setModel(m_resultsModel);
     m_results->setObjectName(QStringLiteral("libraryResults"));
     m_results->setFocusPolicy(Qt::NoFocus);
     m_results->setSelectionMode(QAbstractItemView::SingleSelection);
     m_results->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_results->setUniformItemSizes(true);
+    m_results->setDragEnabled(true);
+    m_results->setAcceptDrops(false);
+    m_results->setDragDropMode(QAbstractItemView::DragOnly);
+    m_results->setDefaultDropAction(Qt::CopyAction);
     m_results->setItemDelegate(new SongResultDelegate(m_results));
 
     m_messageLabel = new QLabel(m_searchPage);
@@ -176,18 +180,22 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
 
     m_changeFolderButton = makeLibraryButton(QStringLiteral("Change Folder"),
                                              m_searchPage, false);
+    m_addToPlaylistButton = makeLibraryButton(QStringLiteral("Add to Playlist"),
+                                              m_searchPage, false);
+    m_addToPlaylistButton->setEnabled(false);
     m_singButton = makeLibraryButton(QStringLiteral("Sing This Song"), m_searchPage, true);
     m_singButton->setMinimumWidth(240);
     m_singButton->setEnabled(false);
     auto* actions = new QHBoxLayout;
     actions->addWidget(m_changeFolderButton);
     actions->addStretch();
+    actions->addWidget(m_addToPlaylistButton);
     actions->addWidget(m_singButton);
 
     auto* searchLayout = new QVBoxLayout(m_searchPage);
     searchLayout->setSpacing(10);
     searchLayout->addWidget(m_searchBox);
-    searchLayout->addWidget(m_hintLabel, 1);
+    searchLayout->addWidget(m_hintLabel);
     searchLayout->addWidget(m_results, 1);
     searchLayout->addWidget(m_messageLabel);
     searchLayout->addLayout(actions);
@@ -202,25 +210,37 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_debounce->setSingleShot(true);
     m_debounce->setInterval(250);
     connect(m_debounce, &QTimer::timeout, this, &LibraryView::refreshSearch);
-    connect(m_searchBox, &QLineEdit::textChanged, this, [this] {
+    connect(m_searchBox, &QLineEdit::textChanged, this, [this](const QString& text) {
         m_messageLabel->clear();
-        m_debounce->start();
+        if (text.trimmed().isEmpty()) {
+            m_debounce->stop();
+            refreshSearch();
+        } else {
+            m_debounce->start();
+        }
     });
-    connect(m_results, &QListWidget::currentItemChanged, this,
-            [this](QListWidgetItem* current) {
-                m_singButton->setEnabled(current && current->data(SongIdRole).toLongLong() != 0);
-            });
-    connect(m_results, &QListWidget::itemDoubleClicked, this,
-            [this](QListWidgetItem*) { singSelected(); });
+    connect(m_results->selectionModel(), &QItemSelectionModel::currentChanged,
+            this, [this] { updateSelectionActions(); });
+    connect(m_results, &QListView::doubleClicked, this,
+            [this](const QModelIndex&) { singSelected(); });
     connect(m_backButton, &QPushButton::clicked, this, &LibraryView::backRequested);
     connect(m_chooseFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
     connect(m_changeFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
     connect(m_singButton, &QPushButton::clicked, this, &LibraryView::singSelected);
+    connect(m_addToPlaylistButton, &QPushButton::clicked, this, [this] {
+        const qint64 songId = selectedSongId();
+        if (songId != 0 && m_playlistAvailable)
+            emit addRequested(songId);
+    });
     if (m_controller) {
         connect(m_controller, &LibraryController::stateChanged,
                 this, &LibraryView::updateState);
+        connect(m_controller, &LibraryController::catalogueChanged,
+                this, &LibraryView::refreshSearch);
         connect(m_controller, &LibraryController::libraryReady,
                 this, &LibraryView::refreshSearch);
+        connect(m_controller, &LibraryController::scanFinished,
+                this, [this](const QVariantMap&) { refreshSearch(); });
     }
     updateState();
 }
@@ -231,6 +251,8 @@ void LibraryView::activate()
     if (m_controller)
         m_controller->recheckRoot();
     updateState();
+    if (m_controller && m_controller->hasActiveRoot())
+        refreshSearch();
     m_searchBox->setFocus(Qt::OtherFocusReason);
 }
 
@@ -242,18 +264,18 @@ void LibraryView::showMessage(const QString& message)
 
 int LibraryView::songResultCount() const
 {
-    int count = 0;
-    for (int row = 0; row < m_results->count(); ++row) {
-        if (m_results->item(row)->data(SongIdRole).toLongLong() != 0)
-            ++count;
-    }
-    return count;
+    return m_resultsModel->songCount();
 }
 
 qint64 LibraryView::selectedSongId() const
 {
-    const QListWidgetItem* item = m_results->currentItem();
-    return item ? item->data(SongIdRole).toLongLong() : 0;
+    return m_results->currentIndex().data(LibraryResultsModel::SongIdRole).toLongLong();
+}
+
+void LibraryView::setPlaylistAvailable(bool available)
+{
+    m_playlistAvailable = available;
+    m_addToPlaylistButton->setEnabled(available && selectedSongId() != 0);
 }
 
 void LibraryView::updateState()
@@ -295,53 +317,33 @@ void LibraryView::chooseFolder()
 void LibraryView::refreshSearch()
 {
     const qint64 keepSongId = selectedSongId();
-    m_results->clear();
-    m_singButton->setEnabled(false);
     const QString text = m_searchBox->text().trimmed();
-    if (text.isEmpty()) {
-        m_results->hide();
-        m_hintLabel->show();
+    m_results->show();
+    m_hintLabel->setVisible(text.isEmpty());
+    if (!m_controller || !m_controller->hasActiveRoot()) {
+        m_resultsModel->setRows({});
+        updateSelectionActions();
         return;
     }
-    m_hintLabel->hide();
-    m_results->show();
-    if (!m_controller || !m_controller->hasActiveRoot())
-        return;
 
     QString error;
-    const QList<CatalogueSearchRow> rows = m_controller->search(text, 201, &error);
+    QList<CatalogueSearchRow> rows = text.isEmpty()
+        ? m_controller->browse(&error)
+        : m_controller->search(text, 201, &error);
     if (!error.isEmpty()) {
+        m_resultsModel->setRows({});
+        updateSelectionActions();
         showMessage(QStringLiteral("The song library could not be searched."));
         return;
     }
-    const int shown = qMin(200, rows.size());
-    for (int i = 0; i < shown; ++i) {
-        const CatalogueSearchRow& row = rows.at(i);
-        QString disc = row.discId;
-        if (row.track > 0) {
-            if (!disc.isEmpty())
-                disc += QStringLiteral("  ");
-            disc += QStringLiteral("Track %1").arg(row.track);
-        }
-        addResult(row.songId, row.displayTitle, row.displayArtist, disc);
-        if (row.songId == keepSongId)
-            m_results->setCurrentRow(i);
-    }
-    if (rows.size() > 200) {
-        auto* more = new QListWidgetItem(QStringLiteral("More songs match - type more words"),
-                                         m_results);
-        more->setData(MoreRole, true);
-        more->setFlags(Qt::NoItemFlags);
-    }
-}
-
-void LibraryView::addResult(qint64 songId, const QString& title, const QString& artist,
-                            const QString& discAndTrack)
-{
-    auto* item = new QListWidgetItem(title, m_results);
-    item->setData(SongIdRole, songId);
-    item->setData(ArtistRole, artist);
-    item->setData(DiscRole, discAndTrack);
+    const bool showMore = !text.isEmpty() && rows.size() > 200;
+    if (showMore)
+        rows.resize(200);
+    m_resultsModel->setRows(rows, showMore);
+    const int keepRow = m_resultsModel->rowForSongId(keepSongId);
+    m_results->setCurrentIndex(keepRow >= 0 ? m_resultsModel->index(keepRow, 0)
+                                            : QModelIndex());
+    updateSelectionActions();
 }
 
 bool LibraryView::eventFilter(QObject* watched, QEvent* event)
@@ -373,22 +375,30 @@ void LibraryView::moveSelection(int delta)
     const int songs = songResultCount();
     if (songs == 0)
         return;
-    int row = m_results->currentRow();
+    int row = m_results->currentIndex().row();
     if (row < 0)
         row = delta > 0 ? 0 : songs - 1;
     else
         row = qBound(0, row + delta, songs - 1);
-    m_results->setCurrentRow(row);
-    m_results->scrollToItem(m_results->item(row));
+    const QModelIndex index = m_resultsModel->index(row, 0);
+    m_results->setCurrentIndex(index);
+    m_results->scrollTo(index);
 }
 
 void LibraryView::singSelected()
 {
     if (songResultCount() == 0)
         return;
-    if (m_results->currentRow() < 0)
-        m_results->setCurrentRow(0);
+    if (!m_results->currentIndex().isValid())
+        m_results->setCurrentIndex(m_resultsModel->index(0, 0));
     const qint64 songId = selectedSongId();
     if (songId != 0)
         emit singRequested(songId);
+}
+
+void LibraryView::updateSelectionActions()
+{
+    const bool song = selectedSongId() != 0;
+    m_singButton->setEnabled(song);
+    m_addToPlaylistButton->setEnabled(song && m_playlistAvailable);
 }

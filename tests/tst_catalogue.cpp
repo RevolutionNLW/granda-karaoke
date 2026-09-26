@@ -199,6 +199,7 @@ private slots:
     void scanQueriesAndReadOnly();
     void incrementalAndMissing();
     void guardsAndNewerSchema();
+    void migratesSchemaV3ToV4AndPreservesData();
     void cancelAndResume();
     void pauseResumeAndCancelWhilePaused();
     void activeRootFiltersSearchAndPlayback();
@@ -326,6 +327,80 @@ void TestCatalogue::guardsAndNewerSchema()
     const QStringList quarantined = QDir(temporary.path()).entryList(
         {QStringLiteral("corrupt.sqlite.corrupt-*")}, QDir::Files);
     QCOMPARE(quarantined.size(), 1);
+}
+
+void TestCatalogue::migratesSchemaV3ToV4AndPreservesData()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("library"));
+    const QString db = temporary.filePath(QStringLiteral("app/catalogue.sqlite"));
+    const QString first = root + QStringLiteral(
+        "/MV001-01 - Migration Singer - Migration First");
+    const QString second = root + QStringLiteral(
+        "/MV001-02 - Migration Singer - Migration Second");
+    writeFile(first + QStringLiteral(".mp3"), QByteArray("audio-one"));
+    writeFile(first + QStringLiteral(".cdg"), QByteArray("graphics-one"));
+    writeFile(second + QStringLiteral(".mp3"), QByteArray("audio-two"));
+    writeFile(second + QStringLiteral(".cdg"), QByteArray("graphics-two"));
+    QCOMPARE(runScan(db, root).value(QStringLiteral("status")).toString(),
+             QStringLiteral("completed"));
+
+    const QString connection = QStringLiteral("schema-v3-migration-")
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), connection);
+        database.setDatabaseName(db);
+        QVERIFY(database.open());
+        QSqlQuery query(database);
+        QVERIFY(query.exec(QStringLiteral("DROP INDEX idx_sources_mp3_file")));
+        QVERIFY(query.exec(QStringLiteral("PRAGMA user_version=3")));
+        QVERIFY(query.exec(QStringLiteral(
+            "SELECT count(*) FROM library_roots")) && query.next());
+        QCOMPARE(query.value(0).toLongLong(), 1LL);
+        QVERIFY(query.exec(QStringLiteral("SELECT count(*) FROM songs")) && query.next());
+        QCOMPARE(query.value(0).toLongLong(), 2LL);
+        QVERIFY(query.exec(QStringLiteral("SELECT count(*) FROM sources")) && query.next());
+        QCOMPARE(query.value(0).toLongLong(), 2LL);
+        QVERIFY(query.exec(QStringLiteral("SELECT count(*) FROM files")) && query.next());
+        QCOMPARE(query.value(0).toLongLong(), 4LL);
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(connection);
+
+    Catalogue catalogue(db);
+    QString error;
+    QVERIFY2(catalogue.open(&error, {root}), qPrintable(error));
+    const QList<CatalogueSearchRow> firstRows = catalogue.search(
+        QStringLiteral("Migration First"), 10, false, &error);
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(firstRows.size(), 1);
+    QCOMPARE(firstRows.first().displayArtist, QStringLiteral("Migration Singer"));
+    QCOMPARE(catalogue.search(QStringLiteral("Migration Second"), 10, false,
+                              &error).size(), 1);
+    QCOMPARE(catalogue.stats(&error).value(QStringLiteral("songs")).toLongLong(), 2LL);
+    catalogue.close();
+
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), connection);
+        database.setDatabaseName(db);
+        QVERIFY(database.open());
+        QSqlQuery query(database);
+        QVERIFY(query.exec(QStringLiteral("PRAGMA user_version")) && query.next());
+        QCOMPARE(query.value(0).toInt(), 4);
+        QVERIFY(query.exec(QStringLiteral(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' "
+            "AND name='idx_sources_mp3_file'")) && query.next());
+        QCOMPARE(query.value(0).toInt(), 1);
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(connection);
+
+    const QVariantMap rescanned = runScan(db, root);
+    QCOMPARE(rescanned.value(QStringLiteral("status")).toString(),
+             QStringLiteral("completed"));
 }
 
 void TestCatalogue::cancelAndResume()

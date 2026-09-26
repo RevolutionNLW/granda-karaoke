@@ -9,6 +9,10 @@
 class LyricsView;
 class LibraryController;
 class LibraryView;
+class PlaylistPlayback;
+class PlaylistStore;
+class PlaylistView;
+struct PlaylistEntry;
 class QStackedWidget;
 class QLabel;
 class QPushButton;
@@ -20,6 +24,7 @@ class MainWindow : public QWidget {
 public:
     explicit MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
                         LibraryController* libraryController = nullptr,
+                        PlaylistStore* playlistStore = nullptr,
                         QWidget* parent = nullptr);
     ~MainWindow() override;
 
@@ -34,6 +39,7 @@ public:
     QPushButton* exitButton() const { return m_exitButton; }
     QPushButton* openButton() const { return m_openButton; }
     QPushButton* findButton() const { return m_findButton; }
+    QPushButton* playlistsButton() const { return m_playlistsButton; }
     QPushButton* playButton() const { return m_playButton; }
     QPushButton* pauseButton() const { return m_pauseButton; }
     QPushButton* stopButton() const { return m_stopButton; }
@@ -48,6 +54,8 @@ public:
     QString statusText() const;
     QString songText() const;
     LibraryView* libraryView() const { return m_library; }
+    PlaylistView* playlistView() const { return m_playlistView; }
+    PlaylistPlayback* playlistPlayback() const { return m_playlistPlayback; }
 
     // When false, problems are shown only in the status line (used by tests).
     void setShowErrorDialogs(bool show) { m_showErrorDialogs = show; }
@@ -58,9 +66,11 @@ protected:
     void changeEvent(QEvent* event) override;
 
 private:
+    bool loadSong(const QString& path);
     void chooseSong();
     void showLibrary();
     void singLibrarySong(qint64 songId);
+    void playPlaylistItem(PlaylistEntry entry, bool autoplay);
     void onPlay();
     void onPause();
     void onStop();
@@ -77,16 +87,21 @@ private:
     KaraokePlayer* m_player;
     ISongSettingsStore* m_settingsStore;
     LibraryController* m_libraryController;
+    PlaylistStore* m_playlistStore;
+    PlaylistPlayback* m_playlistPlayback;
     DisplaySleepBlocker m_displaySleepBlocker;
     QStackedWidget* m_pages;
     QWidget* m_controls;
     LyricsView* m_lyrics;
     LibraryView* m_library = nullptr;
+    PlaylistView* m_playlistView = nullptr;
+    QWidget* m_libraryPage = nullptr;
     QLabel* m_songLabel;
     QLabel* m_statusLabel;
     QLabel* m_hintLabel;
     QPushButton* m_openButton;
     QPushButton* m_findButton;
+    QPushButton* m_playlistsButton;
     QPushButton* m_playButton;
     QPushButton* m_pauseButton;
     QPushButton* m_stopButton;

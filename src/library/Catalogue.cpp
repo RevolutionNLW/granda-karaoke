@@ -10,6 +10,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLoggingCategory>
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QThread>
@@ -132,6 +133,27 @@ QString Catalogue::canonicalPath(const QString& path)
     for (const QString& part : missing)
         canonical = directory.filePath(part), directory.setPath(canonical);
     return QDir::cleanPath(canonical);
+}
+
+QString Catalogue::normalizedPlaylistRelativePath(const QString& path)
+{
+    QString normalized = path;
+    normalized.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    return QDir::cleanPath(normalized);
+}
+
+bool Catalogue::playlistSnapshotPathsMatch(const QString& firstRoot,
+                                           const QString& firstRelativePath,
+                                           const QString& secondRoot,
+                                           const QString& secondRelativePath)
+{
+    // Drive-letter and mount-point changes are handled by the active-root
+    // fallback. Relinking deliberately does not support case-only changes:
+    // real moved-root snapshots retain the catalogue's relative-path spelling.
+    return QDir::fromNativeSeparators(canonicalPath(firstRoot))
+            == QDir::fromNativeSeparators(canonicalPath(secondRoot))
+        && normalizedPlaylistRelativePath(firstRelativePath)
+            == normalizedPlaylistRelativePath(secondRelativePath);
 }
 
 bool Catalogue::pathIsInsideOrEqual(const QString& candidate, const QString& root)
@@ -316,11 +338,12 @@ bool Catalogue::ensureSchema(QString* error)
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_files_dir_stem ON files(root_id, rel_dir, file_name)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_zip_members_file_kind ON zip_members(zip_file_id, kind)"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_sources_song ON sources(song_id)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_sources_mp3_file ON sources(mp3_file_id)"),
         QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_loose_identity ON sources(root_id, kind, mp3_file_id, graphics_file_id) WHERE zip_file_id IS NULL"),
         QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_zip_identity ON sources(root_id, kind, zip_file_id, zip_mp3_member, zip_graphics_member) WHERE zip_file_id IS NOT NULL"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_songs_search ON songs(search_text)"),
         QStringLiteral("CREATE UNIQUE INDEX IF NOT EXISTS idx_library_roots_one_active ON library_roots(active) WHERE active=1"),
-        QStringLiteral("PRAGMA user_version=3")
+        QStringLiteral("PRAGMA user_version=4")
     };
     if (currentVersion == 1
         && !query.exec(QStringLiteral(
@@ -495,6 +518,33 @@ QList<CatalogueSearchRow> Catalogue::searchActive(const QString& text, int limit
     return searchImpl(text, limit, false, true, error);
 }
 
+QList<CatalogueSearchRow> Catalogue::browseActive(QString* error) const
+{
+    QList<CatalogueSearchRow> result;
+    QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral(
+            "SELECT so.id,so.display_title,so.display_artist,so.disc_id,so.track,"
+            "so.playable,so.confidence FROM songs so WHERE EXISTS("
+            "SELECT 1 FROM sources active_source "
+            "JOIN library_roots active_root ON active_root.id=active_source.root_id "
+            "WHERE active_source.song_id=so.id AND active_source.kind='loose_cdg' "
+            "AND (active_source.playable=1 "
+            "OR active_source.unplayable_reason='root_offline') "
+            "AND active_root.active=1) "
+            "ORDER BY CASE WHEN trim(coalesce(so.display_artist,''))<>'' THEN 0 ELSE 1 END,"
+            "lower(so.display_artist),lower(so.display_title),so.disc_id,so.track,so.id"))) {
+        setError(sqlError(query, QStringLiteral("Browse failed")), error);
+        return result;
+    }
+    while (query.next()) {
+        result.append({query.value(0).toLongLong(), query.value(1).toString(),
+                       query.value(2).toString(), query.value(3).toString(),
+                       query.value(4).toInt(), query.value(5).toBool(),
+                       query.value(6).toString()});
+    }
+    return result;
+}
+
 QList<CatalogueSearchRow> Catalogue::searchImpl(const QString& text, int limit,
                                                 bool includeUnplayable, bool activeOnly,
                                                 QString* error) const
@@ -548,6 +598,104 @@ PlaybackPaths Catalogue::playbackPathsFor(qint64 songId, QString* error) const
 PlaybackPaths Catalogue::activePlaybackPathsFor(qint64 songId, QString* error) const
 {
     return playbackPathsForImpl(songId, true, error);
+}
+
+std::optional<SongRef> Catalogue::songRef(qint64 songId, QString* error) const
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Catalogue is not open"), error);
+        return std::nullopt;
+    }
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "SELECT so.id,so.display_title,so.display_artist,so.disc_id,so.track,"
+        "r.path,mf.rel_path FROM songs so "
+        "LEFT JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+        "LEFT JOIN library_roots r ON r.id=s.root_id "
+        "LEFT JOIN files mf ON mf.id=s.mp3_file_id "
+        "WHERE so.id=? ORDER BY CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,"
+        "mf.present DESC,s.playable DESC,s.id LIMIT 1"));
+    query.addBindValue(songId);
+    if (!query.exec()) {
+        setError(sqlError(query, QStringLiteral("Song reference lookup failed")), error);
+        return std::nullopt;
+    }
+    if (!query.next())
+        return std::nullopt;
+    return SongRef{query.value(0).toLongLong(), query.value(1).toString(),
+                   query.value(2).toString(), query.value(3).toString(),
+                   query.value(4).toInt(), query.value(5).toString(),
+                   query.value(6).toString()};
+}
+
+qint64 Catalogue::findSongByMp3Path(const QString& rootPath, const QString& relPath,
+                                    QString* error) const
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Catalogue is not open"), error);
+        return 0;
+    }
+    QSqlQuery rootQuery(m_database);
+    rootQuery.prepare(QStringLiteral("SELECT id FROM library_roots WHERE path=?"));
+    rootQuery.addBindValue(canonicalPath(rootPath));
+    if (!rootQuery.exec()) {
+        setError(sqlError(rootQuery, QStringLiteral("Song root lookup failed")), error);
+        return 0;
+    }
+
+    QSet<qint64> matches;
+    while (rootQuery.next()) {
+        QSqlQuery query(m_database);
+        query.prepare(playlistSongLookupSql());
+        query.addBindValue(rootQuery.value(0));
+        query.addBindValue(normalizedPlaylistRelativePath(relPath));
+        if (!query.exec()) {
+            setError(sqlError(query, QStringLiteral("Song path lookup failed")), error);
+            return 0;
+        }
+        while (query.next())
+            matches.insert(query.value(0).toLongLong());
+    }
+    return matches.size() == 1 ? *matches.constBegin() : 0;
+}
+
+qint64 Catalogue::findUniqueActiveSongByMp3Path(const QString& relPath,
+                                                QString* error) const
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Catalogue is not open"), error);
+        return 0;
+    }
+    QSqlQuery rootQuery(m_database);
+    if (!rootQuery.exec(QStringLiteral(
+            "SELECT id FROM library_roots WHERE active=1"))) {
+        setError(sqlError(rootQuery, QStringLiteral("Active song root lookup failed")), error);
+        return 0;
+    }
+
+    QSet<qint64> matches;
+    while (rootQuery.next()) {
+        QSqlQuery query(m_database);
+        query.prepare(playlistSongLookupSql());
+        query.addBindValue(rootQuery.value(0));
+        query.addBindValue(normalizedPlaylistRelativePath(relPath));
+        if (!query.exec()) {
+            setError(sqlError(query, QStringLiteral("Active song path lookup failed")), error);
+            return 0;
+        }
+        while (query.next())
+            matches.insert(query.value(0).toLongLong());
+    }
+    return matches.size() == 1 ? *matches.constBegin() : 0;
+}
+
+QString Catalogue::playlistSongLookupSql()
+{
+    return QStringLiteral(
+        "SELECT s.song_id FROM files f "
+        "JOIN sources s ON s.mp3_file_id=f.id "
+        "WHERE f.root_id=? AND f.rel_path=? "
+        "AND f.present=1 AND s.song_id IS NOT NULL");
 }
 
 PlaybackPaths Catalogue::playbackPathsForImpl(qint64 songId, bool activeOnly,
