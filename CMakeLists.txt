@@ -11,7 +11,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Sql)
 include(cmake/GStreamer.cmake)
 
 # Development runs link against the SDK in place. Packaging/deployment of the
@@ -28,8 +28,36 @@ add_library(fks_cdg STATIC
 )
 target_include_directories(fks_cdg PUBLIC src)
 
+# Read-only song-library parsing primitives.  This target deliberately has no
+# UI or media-playback dependency so the parsers remain independently testable.
+add_library(fks_library STATIC
+    src/library/Catalogue.cpp
+    src/library/Catalogue.h
+    src/library/CatalogueTools.cpp
+    src/library/CatalogueTools.h
+    src/library/FilenameParser.cpp
+    src/library/FilenameParser.h
+    src/library/Id3Reader.cpp
+    src/library/Id3Reader.h
+    src/library/LibraryScanner.cpp
+    src/library/LibraryScanner.h
+    src/library/MetadataResolver.cpp
+    src/library/MetadataResolver.h
+    src/library/ZipDirectory.cpp
+    src/library/ZipDirectory.h
+)
+target_include_directories(fks_library PUBLIC src)
+target_link_libraries(fks_library PUBLIC Qt6::Core Qt6::Sql)
+
+add_executable(fks-catalogue tools/fks-catalogue.cpp)
+target_link_libraries(fks-catalogue PRIVATE fks_library)
+
 # Application core shared by the executable and the tests.
 add_library(fks_core STATIC
+    src/LibraryController.cpp
+    src/LibraryController.h
+    src/LibraryView.cpp
+    src/LibraryView.h
     src/Logging.cpp
     src/Logging.h
     src/SongPair.cpp
@@ -46,7 +74,7 @@ add_library(fks_core STATIC
     src/MainWindow.h
 )
 target_include_directories(fks_core PUBLIC src)
-target_link_libraries(fks_core PUBLIC fks_cdg Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
+target_link_libraries(fks_core PUBLIC fks_cdg fks_library Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
 
 if(APPLE)
     target_link_libraries(fks_core PRIVATE "-framework IOKit" "-framework CoreFoundation")
@@ -61,7 +89,7 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
-foreach(_target fks_cdg fks_core FrankiesKaraokeStudio)
+foreach(_target fks_cdg fks_library fks-catalogue fks_core FrankiesKaraokeStudio)
     if(MSVC)
         target_compile_options(${_target} PRIVATE /W4)
     else()

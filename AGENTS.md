@@ -29,9 +29,8 @@ tasks from Claude. Claude reviews every diff and reruns the tests itself.
 - Never copy real karaoke media into the repository. Tests use synthetic media.
   Real media is only read in place, through `FKS_TEST_MEDIA_DIR`.
 - Keep platform-specific code isolated and minimal.
-- Milestone 2 includes key/tempo and per-song settings persistence. Song
-  library, playlists, autoplay and ZIP remain out of scope. Do not make them
-  harder to add later.
+- Milestone 3 adds the song library catalogue and search. Playlists, autoplay,
+  ZIP playback and MCG remain out of scope. Do not make them harder to add later.
 
 ## Build and test (macOS)
 

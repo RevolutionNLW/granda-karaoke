@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 
 #include "Logging.h"
+#include "LibraryController.h"
+#include "LibraryView.h"
 #include "LyricsView.h"
 #include "SongPair.h"
 
@@ -11,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
@@ -30,7 +33,7 @@ QPushButton* makeButton(const QString& text, QWidget* parent)
 {
     auto* button = new QPushButton(text, parent);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumSize(170, 80);
+    button->setMinimumSize(140, 80);
     QFont font = button->font();
     font.setPointSize(22);
     font.setBold(true);
@@ -69,10 +72,12 @@ bool isEnterKey(const QKeyEvent* event)
 
 } // namespace
 
-MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore, QWidget* parent)
+MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
+                       LibraryController* libraryController, QWidget* parent)
     : QWidget(parent)
     , m_player(player)
     , m_settingsStore(settingsStore)
+    , m_libraryController(libraryController)
 {
     Q_ASSERT(m_player);
     Q_ASSERT(m_settingsStore);
@@ -84,6 +89,10 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     m_lyrics = new LyricsView(m_pages);
     m_pages->addWidget(m_controls);
     m_pages->addWidget(m_lyrics);
+    if (m_libraryController) {
+        m_library = new LibraryView(m_libraryController, m_pages);
+        m_pages->addWidget(m_library);
+    }
     auto* windowLayout = new QVBoxLayout(this);
     windowLayout->setContentsMargins(0, 0, 0, 0);
     windowLayout->addWidget(m_pages);
@@ -109,6 +118,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     hintFont.setPointSize(18);
     m_hintLabel->setFont(hintFont);
 
+    m_findButton = makeButton(QStringLiteral("Find a Song"), m_controls);
     m_openButton = makeButton(QStringLiteral("Open Song"), m_controls);
     m_playButton = makeButton(QStringLiteral("Play"), m_controls);
     m_pauseButton = makeButton(QStringLiteral("Pause"), m_controls);
@@ -154,7 +164,8 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     exitRow->addWidget(m_exitButton);
 
     auto* buttons = new QHBoxLayout;
-    buttons->setSpacing(16);
+    buttons->setSpacing(10);
+    buttons->addWidget(m_findButton);
     buttons->addWidget(m_openButton);
     buttons->addWidget(m_playButton);
     buttons->addWidget(m_pauseButton);
@@ -174,6 +185,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     layout->addStretch();
 
     connect(m_exitButton, &QPushButton::clicked, this, &QWidget::close);
+    connect(m_findButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
     connect(m_openButton, &QPushButton::clicked, this, &MainWindow::chooseSong);
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
     connect(m_pauseButton, &QPushButton::clicked, this, &MainWindow::onPause);
@@ -199,6 +211,10 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     connect(m_player, &KaraokePlayer::settingsChanged, this, &MainWindow::updateControls);
     connect(m_player, &KaraokePlayer::frameChanged, m_lyrics, &LyricsView::setFrame);
     connect(m_lyrics, &LyricsView::controlsRequested, this, &MainWindow::hideLyrics);
+    if (m_library) {
+        connect(m_library, &LibraryView::backRequested, this, &MainWindow::hideLyrics);
+        connect(m_library, &LibraryView::singRequested, this, &MainWindow::singLibrarySong);
+    }
 
     m_lyrics->setFrame(m_player->currentFrame());
     onStateChanged(m_player->state());
@@ -212,10 +228,18 @@ bool MainWindow::lyricsVisible() const
     return m_pages->currentWidget() == m_lyrics;
 }
 
+bool MainWindow::libraryVisible() const
+{
+    return m_library && m_pages->currentWidget() == m_library;
+}
+
 void MainWindow::keyPressEvent(QKeyEvent* event)
 {
     if (!QApplication::activeModalWidget()) {
-        if (lyricsVisible() && event->key() == Qt::Key_Escape) {
+        if (libraryVisible()) {
+            event->ignore();
+            return;
+        } else if (lyricsVisible() && event->key() == Qt::Key_Escape) {
             hideLyrics();
         } else if (!lyricsVisible() && isEnterKey(event)) {
             const auto state = m_player->state();
@@ -236,9 +260,41 @@ void MainWindow::closeEvent(QCloseEvent* event)
 void MainWindow::changeEvent(QEvent* event)
 {
     QWidget::changeEvent(event);
-    if (event->type() == QEvent::ActivationChange && isActiveWindow()
-        && QApplication::focusWidget() != this)
-        setFocus(Qt::OtherFocusReason);
+    if (event->type() == QEvent::ActivationChange && isActiveWindow()) {
+        if (libraryVisible())
+            m_library->searchBox()->setFocus(Qt::OtherFocusReason);
+        else if (QApplication::focusWidget() != this)
+            setFocus(Qt::OtherFocusReason);
+    }
+}
+
+void MainWindow::showLibrary()
+{
+    if (!m_library)
+        return;
+    m_pages->setCurrentWidget(m_library);
+    m_library->activate();
+}
+
+void MainWindow::singLibrarySong(qint64 songId)
+{
+    if (!m_libraryController)
+        return;
+    if (!m_libraryController->isRootConnected()) {
+        m_library->showMessage(QStringLiteral("This song's music drive is not connected."));
+        return;
+    }
+    QString error;
+    const PlaybackPaths paths = m_libraryController->playbackPathsFor(songId, &error);
+    if (!paths.playable() || !QFileInfo::exists(paths.mp3Path)
+        || !QFileInfo::exists(paths.graphicsPath)) {
+        qCWarning(lcUi).noquote() << "Catalogue song is missing:" << error << paths.reason;
+        m_library->showMessage(
+            QStringLiteral("This song can't be found. The library will be checked again."));
+        m_libraryController->requestRefreshScan();
+        return;
+    }
+    openSong(paths.mp3Path);
 }
 
 void MainWindow::chooseSong()
@@ -354,6 +410,10 @@ void MainWindow::hideLyrics()
 
 void MainWindow::onStateChanged(KaraokePlayer::State state)
 {
+    if (m_libraryController) {
+        m_libraryController->setPlaybackActive(
+            state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused);
+    }
     m_errorText.clear();
     m_displaySleepBlocker.setActive(state == KaraokePlayer::State::Playing);
     switch (state) {
@@ -395,6 +455,11 @@ void MainWindow::showError(const QString& message)
 QString MainWindow::statusText() const
 {
     return m_statusLabel->text();
+}
+
+QString MainWindow::songText() const
+{
+    return m_songLabel->text();
 }
 
 void MainWindow::updateControls()

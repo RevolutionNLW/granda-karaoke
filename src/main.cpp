@@ -1,4 +1,5 @@
 #include "KaraokePlayer.h"
+#include "LibraryController.h"
 #include "Logging.h"
 #include "MainWindow.h"
 #include "SongSettings.h"
@@ -31,10 +32,14 @@ int main(int argc, char* argv[])
     const QString settingsPath = QDir(QStandardPaths::writableLocation(
         QStandardPaths::AppDataLocation)).filePath(QStringLiteral("song-settings.json"));
     SongSettingsStore settingsStore(settingsPath);
-    MainWindow window(&player, &settingsStore);
+    const QString cataloguePath = QDir(QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation)).filePath(QStringLiteral("library.sqlite"));
+    LibraryController libraryController(cataloguePath);
+    MainWindow window(&player, &settingsStore, &libraryController);
     window.resize(900, 520);
     window.showFullScreen();
     window.setFocus(Qt::OtherFocusReason);
+    libraryController.startConfiguredScan();
 
     // Optional: a song path on the command line is opened at start-up.
     const QStringList args = QApplication::arguments();

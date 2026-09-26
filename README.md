@@ -35,6 +35,21 @@ multiple app instances are open, each write is locked and merged with the curren
 If the file is damaged or belongs to an unsupported format version, it is preserved beside
 the new file with a `.corrupt-<timestamp>` suffix.
 
+## Song Library (Milestone 3)
+
+**Find a Song** opens a large-text library screen. Choose the folder containing the
+karaoke collection once, then search by any part of a title or singer name. Searches
+show only playable MP3+CDG pairs from the active music folder, never start playback
+automatically, and keep working from the saved catalogue when the external music drive
+is disconnected. The scanner runs in the background and pauses disk access while a
+song is playing or paused.
+
+The catalogue is `library.sqlite` in the platform local application-data folder (on
+macOS, normally `~/Library/Application Support/Granda/FrankiesKaraokeStudio/`). The
+`fks-catalogue` command-line tool can scan and inspect the same catalogue; run it without
+arguments for its command list. ZIP and MCG songs are catalogued, but ZIP-only songs and
+MCG songs are not playable yet. Playlists, queues and autoplay are not included.
+
 ## Layout
 
 | Path | Purpose |
@@ -43,6 +58,9 @@ the new file with a `.corrupt-<timestamp>` suffix.
 | `src/KaraokePlayer.*` | GStreamer audio playback; drives the CDG decoder from the audio position |
 | `src/SongPair.*` | Finds the matching `.mp3`/`.cdg` companion and checks both are readable |
 | `src/SongSettings.*` | Content identity and atomic per-song Key/Tempo JSON storage |
+| `src/library/` | Catalogue, filename/tag parsing, metadata resolution and background scanning |
+| `src/LibraryController.*` | Active music root, GUI catalogue connection and scanner-thread lifecycle |
+| `src/LibraryView.*` | Large-text search, results and folder setup page |
 | `src/MainWindow.*` | Single fullscreen window with controls (including Exit) and lyrics pages |
 | `src/LyricsView.*` | Child lyrics page with aspect-correct nearest-neighbour painting |
 | `src/platform/DisplaySleepBlocker.*` | Prevents idle display sleep while Playing (macOS/Windows) |

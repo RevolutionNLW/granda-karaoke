@@ -7,6 +7,8 @@
 #include <QWidget>
 
 class LyricsView;
+class LibraryController;
+class LibraryView;
 class QStackedWidget;
 class QLabel;
 class QPushButton;
@@ -17,6 +19,7 @@ class MainWindow : public QWidget {
 
 public:
     explicit MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
+                        LibraryController* libraryController = nullptr,
                         QWidget* parent = nullptr);
     ~MainWindow() override;
 
@@ -26,9 +29,11 @@ public:
 
     LyricsView* lyricsView() const { return m_lyrics; }
     bool lyricsVisible() const;
+    bool libraryVisible() const;
     bool displaySleepBlocked() const { return m_displaySleepBlocker.isActive(); }
     QPushButton* exitButton() const { return m_exitButton; }
     QPushButton* openButton() const { return m_openButton; }
+    QPushButton* findButton() const { return m_findButton; }
     QPushButton* playButton() const { return m_playButton; }
     QPushButton* pauseButton() const { return m_pauseButton; }
     QPushButton* stopButton() const { return m_stopButton; }
@@ -41,6 +46,8 @@ public:
     QLabel* keyValueLabel() const { return m_keyValueLabel; }
     QLabel* tempoValueLabel() const { return m_tempoValueLabel; }
     QString statusText() const;
+    QString songText() const;
+    LibraryView* libraryView() const { return m_library; }
 
     // When false, problems are shown only in the status line (used by tests).
     void setShowErrorDialogs(bool show) { m_showErrorDialogs = show; }
@@ -52,6 +59,8 @@ protected:
 
 private:
     void chooseSong();
+    void showLibrary();
+    void singLibrarySong(qint64 songId);
     void onPlay();
     void onPause();
     void onStop();
@@ -67,14 +76,17 @@ private:
 
     KaraokePlayer* m_player;
     ISongSettingsStore* m_settingsStore;
+    LibraryController* m_libraryController;
     DisplaySleepBlocker m_displaySleepBlocker;
     QStackedWidget* m_pages;
     QWidget* m_controls;
     LyricsView* m_lyrics;
+    LibraryView* m_library = nullptr;
     QLabel* m_songLabel;
     QLabel* m_statusLabel;
     QLabel* m_hintLabel;
     QPushButton* m_openButton;
+    QPushButton* m_findButton;
     QPushButton* m_playButton;
     QPushButton* m_pauseButton;
     QPushButton* m_stopButton;
