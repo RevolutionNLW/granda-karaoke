@@ -8,6 +8,7 @@
 #include "BusTestPlayer.h"
 #include "SongSettings.h"
 #include "TestMedia.h"
+#include "ui/Theme.h"
 
 #include <QPushButton>
 #include <QLabel>
@@ -16,6 +17,7 @@
 #include <QStackedWidget>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QToolButton>
 #include <QtTest>
 
 using State = KaraokePlayer::State;
@@ -71,6 +73,8 @@ private:
 
 void TestMainWindow::initTestCase()
 {
+    // Measure and drive the window as it ships: with the application theme.
+    theme::apply(*qobject_cast<QApplication*>(QCoreApplication::instance()));
     QString error;
     QVERIFY2(KaraokePlayer::initializeGStreamer(&error), qPrintable(error));
     m_songPath = m_dir.filePath("Long Song.mp3");
@@ -270,13 +274,13 @@ void TestMainWindow::escapeReturnsToControlsWithoutTouchingAudio()
 void TestMainWindow::keysNeverClickButtons()
 {
     std::vector<std::unique_ptr<QSignalSpy>> clicks;
-    for (auto* button : {m_window->openButton(), m_window->playButton(),
-                        m_window->pauseButton(), m_window->stopButton(), m_window->exitButton(),
-                        m_window->keyDownButton(), m_window->keyUpButton(),
-                        m_window->keyResetButton(), m_window->tempoDownButton(),
-                        m_window->tempoUpButton(), m_window->tempoResetButton()}) {
+    const QList<QAbstractButton*> buttons = m_window->findChildren<QAbstractButton*>();
+    QVERIFY(buttons.contains(m_window->lyricsButton()));
+    QVERIFY(buttons.contains(m_window->settingsButton()));
+    QVERIFY(buttons.contains(m_window->exitButton()));
+    for (QAbstractButton* button : buttons) {
         QCOMPARE(button->focusPolicy(), Qt::NoFocus);
-        clicks.push_back(std::make_unique<QSignalSpy>(button, &QPushButton::clicked));
+        clicks.push_back(std::make_unique<QSignalSpy>(button, &QAbstractButton::clicked));
     }
     QVERIFY(m_window->openSong(m_songPath));
     m_player->play();

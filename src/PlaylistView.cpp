@@ -4,12 +4,16 @@
 #include "LibraryResultsModel.h"
 #include "playlist/PlaylistPlayback.h"
 #include "playlist/PlaylistStore.h"
+#include "ui/Controls.h"
+#include "ui/Theme.h"
 
 #include <QComboBox>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
 #include <QEvent>
+#include <QFontDatabase>
+#include <QFrame>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -19,16 +23,162 @@
 #include <QListWidget>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPainter>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QStyledItemDelegate>
+#include <QTabBar>
 #include <QVBoxLayout>
+
+#include <functional>
 
 namespace {
 
 constexpr int ItemIdRole = Qt::UserRole + 1;
 constexpr int BaseTextRole = Qt::UserRole + 2;
+constexpr int TitleRole = Qt::UserRole + 3;
+constexpr int ArtistRole = Qt::UserRole + 4;
+constexpr int DiscRole = Qt::UserRole + 5;
+constexpr int PlayingRole = Qt::UserRole + 6;
 constexpr auto PlaylistItemMimeType = "application/x-fks-playlist-item-id";
+
+// Where the playlist's columns sit in a row (shared by the rows and the
+// column captions above them): number, song, artist and, when there is room,
+// the disc.
+struct PlaylistColumns {
+    QRect number;
+    QRect song;
+    QRect artist;
+    QRect disc;
+};
+
+PlaylistColumns playlistColumns(const QRect& row)
+{
+    PlaylistColumns columns;
+    const int gap = theme::px(12);
+    const QRect inner = row.adjusted(gap, 0, -gap, 0);
+    columns.number = QRect(inner.left(), row.top(), theme::px(30), row.height());
+    const int left = columns.number.right() + theme::px(10);
+    const int available = inner.right() - left;
+    const int disc = available >= theme::px(440) ? theme::px(104) : 0;
+    const int songWidth = (available - disc) * 54 / 100;
+    columns.song = QRect(left, row.top(), songWidth - gap, row.height());
+    columns.artist = QRect(left + songWidth, row.top(),
+                           available - disc - songWidth - (disc ? gap : 0), row.height());
+    if (disc)
+        columns.disc = QRect(inner.right() - disc, row.top(), disc, row.height());
+    return columns;
+}
+
+// The playlist's rows: number (or the play mark for the song now playing),
+// song, artist and disc. The now-playing mark is separate from the selection,
+// which is gold only in the pane being used.
+class PlaylistRowDelegate final : public QStyledItemDelegate {
+public:
+    PlaylistRowDelegate(QObject* parent, std::function<bool()> active)
+        : QStyledItemDelegate(parent)
+        , m_active(std::move(active))
+    {
+        m_mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override
+    {
+        return QSize(40, option.fontMetrics.height() + theme::rowPadding());
+    }
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override
+    {
+        painter->save();
+        const bool selected = option.state.testFlag(QStyle::State_Selected);
+        const bool strong = selected && m_active();
+        painter->fillRect(option.rect, selected
+            ? (strong ? theme::color::selection : theme::color::selectionIdle)
+            : (index.row() % 2 && theme::alternateRows() ? theme::color::rowAlternate
+                                                          : theme::color::rowBase));
+        if (strong)
+            painter->fillRect(QRect(option.rect.left(), option.rect.top(), theme::px(3),
+                                    option.rect.height()), theme::color::accent);
+        const PlaylistColumns columns = playlistColumns(option.rect);
+        const QColor main = strong ? theme::color::selectionText : theme::color::text;
+        const QColor secondary = strong ? theme::color::selectionText
+                                        : theme::color::secondaryText;
+        const bool playing = index.data(PlayingRole).toBool();
+        if (playing) {
+            const int size = theme::px(12);
+            const QRect mark(columns.number.left(), columns.number.center().y() - size / 2,
+                             size, size);
+            ui::glyphIcon(ui::Glyph::Play, theme::color::accent).paint(painter, mark);
+        } else {
+            painter->setPen(secondary);
+            painter->drawText(columns.number, Qt::AlignLeft | Qt::AlignVCenter,
+                              QString::number(index.row() + 1));
+        }
+        const auto draw = [painter](const QRect& rect, const QString& text, const QFont& font,
+                                    const QColor& color) {
+            if (rect.width() <= 0)
+                return;
+            painter->setFont(font);
+            painter->setPen(color);
+            painter->drawText(rect, Qt::AlignLeft | Qt::AlignVCenter,
+                              painter->fontMetrics().elidedText(text, Qt::ElideRight,
+                                                                rect.width()));
+        };
+        QFont songFont = option.font;
+        songFont.setBold(playing);
+        draw(columns.song, index.data(TitleRole).toString(), songFont, main);
+        draw(columns.artist, index.data(ArtistRole).toString(), option.font, main);
+        QFont mono = m_mono;
+        mono.setPixelSize(theme::px(13));
+        draw(columns.disc, index.data(DiscRole).toString(), mono, secondary);
+        painter->restore();
+    }
+
+private:
+    std::function<bool()> m_active;
+    QFont m_mono;
+};
+
+// Column captions above the playlist rows, lined up with them.
+class PlaylistHeader final : public QWidget {
+public:
+    PlaylistHeader(QListWidget* list, QWidget* parent)
+        : QWidget(parent)
+        , m_list(list)
+    {
+        setObjectName(QStringLiteral("listHeader"));
+        theme::setFixedHeight(this, 34);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.fillRect(rect(), theme::color::rowBase);
+        painter.fillRect(QRect(0, height() - 1, width(), 1), QColor(0x2a, 0x2d, 0x32));
+        QFont font = this->font();
+        font.setPixelSize(theme::px(11));
+        font.setBold(true);
+        font.setLetterSpacing(QFont::AbsoluteSpacing, 0.6);
+        painter.setFont(font);
+        painter.setPen(theme::color::textMuted);
+        const PlaylistColumns columns = playlistColumns(
+            QRect(0, 0, m_list->viewport()->width(), height() - 1));
+        const auto caption = [&painter](const QRect& rect, const QString& text) {
+            if (rect.width() > 0)
+                painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter, text);
+        };
+        caption(columns.number, QStringLiteral("#"));
+        caption(columns.song, QStringLiteral("SONG"));
+        caption(columns.artist, QStringLiteral("ARTIST"));
+        caption(columns.disc, QStringLiteral("DISC ID"));
+    }
+
+private:
+    QListWidget* m_list;
+};
 
 class PlaylistListWidget final : public QListWidget {
 public:
@@ -40,7 +190,33 @@ public:
     {
     }
 
+    // A quiet line under the songs saying how to add more.
+    void setHint(const QString& hint)
+    {
+        m_hint = hint;
+        viewport()->update();
+    }
+
 protected:
+    void paintEvent(QPaintEvent* event) override
+    {
+        QListWidget::paintEvent(event);
+        if (m_hint.isEmpty())
+            return;
+        const int top = count() > 0 ? visualItemRect(item(count() - 1)).bottom() + 1 : 0;
+        const QRect area(theme::px(12), top + theme::px(8), viewport()->width() - theme::px(24),
+                         fontMetrics().height() + theme::px(8));
+        if (area.bottom() > viewport()->height())
+            return;
+        QPainter painter(viewport());
+        QFont font = this->font();
+        font.setPixelSize(theme::px(12));
+        painter.setFont(font);
+        painter.setPen(QColor(0x75, 0x72, 0x6c));
+        painter.drawText(area, Qt::AlignLeft | Qt::AlignVCenter,
+                         QFontMetrics(font).elidedText(m_hint, Qt::ElideRight, area.width()));
+    }
+
     QStringList mimeTypes() const override
     {
         QStringList types = QListWidget::mimeTypes();
@@ -104,6 +280,7 @@ private:
     }
 
     DropAcceptance m_acceptsDrop;
+    QString m_hint;
 };
 
 std::optional<qint64> playlistItemId(const QMimeData* mimeData)
@@ -125,11 +302,27 @@ std::optional<qint64> librarySongId(const QMimeData* mimeData)
     return ok && songId != 0 ? std::optional<qint64>(songId) : std::nullopt;
 }
 
+// A playlist song's name as shown: its title, else its disc and track, else
+// its file name.
+QString entryTitle(const PlaylistEntry& entry)
+{
+    QString title = entry.title.trimmed();
+    if (title.isEmpty() && !entry.discId.trimmed().isEmpty()) {
+        title = QStringLiteral("Disc %1").arg(entry.discId.trimmed());
+        if (entry.track > 0)
+            title += QStringLiteral(" Track %1").arg(entry.track);
+    }
+    if (title.isEmpty())
+        title = QFileInfo(entry.mp3RelPath).completeBaseName();
+    if (title.isEmpty())
+        title = QStringLiteral("Unknown song");
+    return title;
+}
+
 QPushButton* makeSmallButton(const QString& text, QWidget* parent)
 {
     auto* button = new QPushButton(text, parent);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumHeight(36);
     return button;
 }
 
@@ -142,33 +335,73 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     , m_libraryController(libraryController)
     , m_playback(playback)
 {
-    auto* title = new QLabel(QStringLiteral("Frankie's Playlists"), this);
-    QFont titleFont = title->font();
-    titleFont.setPointSize(20);
-    titleFont.setBold(true);
-    title->setFont(titleFont);
+    auto* pane = new QFrame(this);
+    pane->setObjectName(QStringLiteral("pane"));
+    auto* title = new QLabel(QStringLiteral("Frankie's Playlists"), pane);
+    title->setObjectName(QStringLiteral("paneTitle"));
+    m_countLabel = new QLabel(pane);
+    m_countLabel->setObjectName(QStringLiteral("paneCount"));
 
-    m_chooser = new QComboBox(this);
+    // The playlist's own list of names drives everything; it is shown as tabs.
+    m_chooser = new QComboBox(pane);
     m_chooser->setObjectName(QStringLiteral("playlistChooser"));
-    m_chooser->setMinimumHeight(42);
+    m_chooser->setFocusPolicy(Qt::NoFocus);
+    m_chooser->hide();
+    m_tabs = new QTabBar(pane);
+    m_tabs->setObjectName(QStringLiteral("playlistTabs"));
+    m_tabs->setFocusPolicy(Qt::NoFocus);
+    m_tabs->setDrawBase(false);
+    m_tabs->setExpanding(false);
+    m_tabs->setElideMode(Qt::ElideRight);
+    m_tabs->setUsesScrollButtons(true);
+    // Its scroll arrows must never take the keyboard either.
+    for (QWidget* arrow : m_tabs->findChildren<QWidget*>())
+        arrow->setFocusPolicy(Qt::NoFocus);
 
-    m_newButton = makeSmallButton(QStringLiteral("New Playlist"), this);
-    m_renameButton = makeSmallButton(QStringLiteral("Rename"), this);
-    m_deleteButton = makeSmallButton(QStringLiteral("Delete"), this);
-    auto* admin = new QHBoxLayout;
-    admin->addWidget(m_newButton);
-    admin->addWidget(m_renameButton);
-    admin->addWidget(m_deleteButton);
+    // Creating, renaming and deleting playlists is occasional: small and
+    // out of the way.
+    m_newButton = makeSmallButton(QStringLiteral("+"), pane);
+    m_newButton->setToolTip(QStringLiteral("New playlist"));
+    m_renameButton = makeSmallButton(QStringLiteral("Rename"), pane);
+    m_deleteButton = makeSmallButton(QStringLiteral("Delete"), pane);
+    m_newButton->setObjectName(QStringLiteral("ghostButton"));
+    for (QPushButton* button : {m_renameButton, m_deleteButton})
+        button->setObjectName(QStringLiteral("linkButton"));
+    auto* headerFrame = new QFrame(pane);
+    headerFrame->setObjectName(QStringLiteral("paneHeader"));
+    auto* header = new QVBoxLayout(headerFrame);
+    header->setContentsMargins(16, 12, 12, 10);
+    header->setSpacing(10);
+    auto* titleRow = new QHBoxLayout;
+    titleRow->setSpacing(6);
+    titleRow->addWidget(title);
+    titleRow->addWidget(m_countLabel);
+    titleRow->addStretch();
+    titleRow->addWidget(m_renameButton);
+    titleRow->addWidget(m_deleteButton);
+    auto* tabRow = new QHBoxLayout;
+    tabRow->setSpacing(6);
+    tabRow->addWidget(m_tabs, 1);
+    tabRow->addWidget(m_newButton);
+    header->addLayout(titleRow);
+    header->addLayout(tabRow);
 
-    m_message = new QLabel(this);
+    m_message = new QLabel(pane);
+    m_message->setObjectName(QStringLiteral("paneHint"));
     m_message->setWordWrap(true);
-    m_message->setAlignment(Qt::AlignCenter);
+    theme::setContentsMargins(m_message, 16, 8, 16, 0);
+    m_message->hide();
 
-    m_items = new PlaylistListWidget(
-        [this](const QMimeData* mimeData) { return canAcceptDrop(mimeData); }, this);
+    auto* items = new PlaylistListWidget(
+        [this](const QMimeData* mimeData) { return canAcceptDrop(mimeData); }, pane);
+    m_items = items;
     m_items->setObjectName(QStringLiteral("playlistItems"));
     m_items->setSelectionMode(QAbstractItemView::SingleSelection);
     m_items->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_items->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_items->setTextElideMode(Qt::ElideRight);
+    m_items->setUniformItemSizes(true);
+    m_items->setItemDelegate(new PlaylistRowDelegate(m_items, [this] { return m_active; }));
     m_items->setFocusPolicy(Qt::StrongFocus);
     m_items->setDragEnabled(true);
     m_items->setAcceptDrops(true);
@@ -178,32 +411,67 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     m_items->setDropIndicatorShown(true);
     m_items->installEventFilter(this);
     m_items->viewport()->installEventFilter(this);
+    auto* columnHeader = new PlaylistHeader(m_items, pane);
+    m_columnHeader = columnHeader;
+    connect(theme::notifier(), &theme::Notifier::changed, this, [this] {
+        m_items->doItemsLayout();
+        m_items->viewport()->update();
+        m_columnHeader->update();
+    });
 
-    m_playButton = makeSmallButton(QStringLiteral("Play"), this);
-    m_moveUpButton = makeSmallButton(QStringLiteral("Move Up"), this);
-    m_moveDownButton = makeSmallButton(QStringLiteral("Move Down"), this);
-    m_removeButton = makeSmallButton(QStringLiteral("Remove"), this);
-    auto* actions = new QHBoxLayout;
+    m_playButton = makeSmallButton(QStringLiteral("Play"), pane);
+    m_moveUpButton = makeSmallButton(QStringLiteral("↑ Up"), pane);
+    m_moveDownButton = makeSmallButton(QStringLiteral("↓ Down"), pane);
+    m_removeButton = makeSmallButton(QStringLiteral("Remove"), pane);
+    for (QPushButton* button : {m_playButton, m_moveUpButton, m_moveDownButton, m_removeButton})
+        button->setObjectName(QStringLiteral("ghostButton"));
+    m_playButton->setIcon(ui::glyphIcon(ui::Glyph::Play, theme::color::accent));
+    auto* footer = new QFrame(pane);
+    footer->setObjectName(QStringLiteral("paneFooter"));
+    auto* actions = new QHBoxLayout(footer);
+    actions->setContentsMargins(12, 8, 12, 8);
+    actions->setSpacing(6);
     actions->addWidget(m_playButton);
+    actions->addStretch();
     actions->addWidget(m_moveUpButton);
     actions->addWidget(m_moveDownButton);
     actions->addWidget(m_removeButton);
 
-    m_autoplayButton = makeSmallButton(QStringLiteral("Autoplay: Off"), this);
-    m_autoplayButton->setCheckable(true);
+    m_autoplayButton = new ui::ToggleSwitch(pane);
+    m_autoplayButton->setText(QStringLiteral("Autoplay: Off"));
+    m_autoplayButton->setObjectName(QStringLiteral("autoplayButton"));
+    m_autoplayButton->setToolTip(QStringLiteral("Play the next playlist song by itself"));
+
+    auto* paneLayout = new QVBoxLayout(pane);
+    paneLayout->setContentsMargins(1, 1, 1, 1);
+    paneLayout->setSpacing(0);
+    paneLayout->addWidget(headerFrame);
+    paneLayout->addWidget(m_message);
+    paneLayout->addWidget(columnHeader);
+    paneLayout->addWidget(m_items, 1);
+    paneLayout->addWidget(footer);
+    m_autoplayRow = new QHBoxLayout;
+    m_autoplayRow->setContentsMargins(14, 0, 14, 10);
+    m_autoplayRow->addWidget(m_autoplayButton);
+    paneLayout->addLayout(m_autoplayRow);
 
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(12, 0, 0, 0);
-    layout->setSpacing(8);
-    layout->addWidget(title);
-    layout->addWidget(m_chooser);
-    layout->addLayout(admin);
-    layout->addWidget(m_message);
-    layout->addWidget(m_items, 1);
-    layout->addLayout(actions);
-    layout->addWidget(m_autoplayButton);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(pane);
 
-    connect(m_chooser, &QComboBox::currentIndexChanged, this, [this](int) {
+    connect(m_tabs, &QTabBar::tabBarClicked, this, &PlaylistView::interacted);
+    for (QPushButton* button : {m_newButton, m_renameButton, m_deleteButton, m_playButton,
+                                m_moveUpButton, m_moveDownButton, m_removeButton})
+        connect(button, &QPushButton::pressed, this, &PlaylistView::interacted);
+    connect(m_tabs, &QTabBar::currentChanged, this, [this](int tab) {
+        if (tab >= 0 && tab != m_chooser->currentIndex())
+            m_chooser->setCurrentIndex(tab);
+    });
+    connect(m_chooser, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (m_tabs->currentIndex() != index) {
+            const QSignalBlocker blocker(m_tabs);
+            m_tabs->setCurrentIndex(index);
+        }
         if (m_store && m_store->isOpen() && displayedPlaylistId() != 0)
             m_store->setLastPlaylistId(displayedPlaylistId());
         refreshItems();
@@ -241,11 +509,35 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
         connect(m_libraryController, &LibraryController::libraryReady,
                 this, [this] { refreshItems(); });
         // The final metadata/duplicate pass and offline marking happen after
-        // libraryReady, so refresh once more when the whole scan finishes.
-        connect(m_libraryController, &LibraryController::scanFinished,
-                this, [this](const QVariantMap&) { refreshItems(); });
+        // libraryReady; every finished scan, and every name correction, is
+        // followed by catalogueChanged.
+        connect(m_libraryController, &LibraryController::catalogueChanged,
+                this, [this] { refreshItems(); });
     }
     refresh();
+}
+
+void PlaylistView::showAdjacentPlaylist(int step)
+{
+    const int tab = m_tabs->currentIndex() + step;
+    if (tab >= 0 && tab < m_tabs->count()) {
+        m_tabs->setCurrentIndex(tab);
+        emit interacted();
+    }
+}
+
+void PlaylistView::setActive(bool active)
+{
+    if (m_active == active)
+        return;
+    m_active = active;
+    m_items->viewport()->update();
+}
+
+QPushButton* PlaylistView::takeAutoplayButton()
+{
+    m_autoplayRow->removeWidget(m_autoplayButton);
+    return m_autoplayButton;
 }
 
 void PlaylistView::activate()
@@ -253,9 +545,16 @@ void PlaylistView::activate()
     refresh();
 }
 
+void PlaylistView::setMessageText(const QString& text)
+{
+    // The message line takes no room while there is nothing to say.
+    m_message->setText(text);
+    m_message->setVisible(!text.isEmpty());
+}
+
 void PlaylistView::showMessage(const QString& message)
 {
-    m_message->setText(message);
+    setMessageText(message);
 }
 
 qint64 PlaylistView::displayedPlaylistId() const
@@ -273,8 +572,10 @@ void PlaylistView::refresh()
 {
     if (!m_store || !m_store->isOpen()) {
         m_chooser->clear();
+        while (m_tabs->count() > 0)
+            m_tabs->removeTab(0);
         m_items->clear();
-        m_message->setText(QStringLiteral("Playlists are unavailable right now."));
+        setMessageText(QStringLiteral("Playlists are unavailable right now."));
         m_chooser->setEnabled(false);
         m_newButton->setEnabled(false);
         m_autoplayButton->setEnabled(false);
@@ -301,16 +602,22 @@ void PlaylistView::refreshPlaylists(qint64 preferredId)
 {
     const QList<PlaylistInfo> all = m_store->playlists();
     const QSignalBlocker blocker(m_chooser);
+    const QSignalBlocker tabBlocker(m_tabs);
     m_chooser->clear();
+    while (m_tabs->count() > 0)
+        m_tabs->removeTab(0);
     int select = -1;
     for (const PlaylistInfo& playlist : all) {
         m_chooser->addItem(playlist.name, playlist.id);
+        m_tabs->addTab(playlist.name);
+        m_tabs->setTabToolTip(m_tabs->count() - 1, playlist.name);
         if (playlist.id == preferredId)
             select = m_chooser->count() - 1;
     }
     if (select < 0 && !all.isEmpty())
         select = 0;
     m_chooser->setCurrentIndex(select);
+    m_tabs->setCurrentIndex(select);
     if (select >= 0)
         m_store->setLastPlaylistId(displayedPlaylistId());
     refreshItems();
@@ -319,18 +626,9 @@ void PlaylistView::refreshPlaylists(qint64 preferredId)
 
 QString PlaylistView::displayText(const PlaylistEntry& entry) const
 {
-    QString title = entry.title.trimmed();
-    if (title.isEmpty() && !entry.discId.trimmed().isEmpty()) {
-        title = QStringLiteral("Disc %1").arg(entry.discId.trimmed());
-        if (entry.track > 0)
-            title += QStringLiteral(" Track %1").arg(entry.track);
-    }
-    if (title.isEmpty())
-        title = QFileInfo(entry.mp3RelPath).completeBaseName();
-    if (title.isEmpty())
-        title = QStringLiteral("Unknown song");
+    const QString title = entryTitle(entry);
     const QString artist = entry.artist.trimmed();
-    return artist.isEmpty() ? title : title + QStringLiteral(" — ") + artist;
+    return artist.isEmpty() ? title : title + QStringLiteral(" \u2014 ") + artist;
 }
 
 void PlaylistView::refreshItems(qint64 selectItemId, bool ensureVisible)
@@ -339,15 +637,17 @@ void PlaylistView::refreshItems(qint64 selectItemId, bool ensureVisible)
         selectItemId = selectedItemId();
     const int scrollValue = m_items->verticalScrollBar()->value();
     m_items->clear();
+    m_countLabel->clear();
+    static_cast<PlaylistListWidget*>(m_items)->setHint({});
     const qint64 playlistId = displayedPlaylistId();
     if (!m_store || !m_store->isOpen() || playlistId == 0) {
         if (m_store && m_store->isOpen())
-            m_message->setText(QStringLiteral("No playlists yet — press New Playlist"));
+            setMessageText(QStringLiteral("No playlists yet \u2014 press New"));
         updateButtons();
         return;
     }
 
-    m_message->clear();
+    setMessageText({});
     QListWidgetItem* selected = nullptr;
     for (const PlaylistEntry& entry : m_store->items(playlistId)) {
         PlaylistEntry displayEntry = entry;
@@ -369,9 +669,20 @@ void PlaylistView::refreshItems(qint64 selectItemId, bool ensureVisible)
         auto* row = new QListWidgetItem(text, m_items);
         row->setData(ItemIdRole, entry.itemId);
         row->setData(BaseTextRole, text);
+        displayEntry.artist = displayEntry.artist.trimmed();
+        row->setData(TitleRole, entryTitle(displayEntry));
+        row->setData(ArtistRole, displayEntry.artist);
+        QString disc = displayEntry.discId.trimmed();
+        if (!disc.isEmpty() && displayEntry.track > 0)
+            disc += QStringLiteral("-%1").arg(displayEntry.track, 2, 10, QLatin1Char('0'));
+        row->setData(DiscRole, disc);
         if (entry.itemId == selectItemId)
             selected = row;
     }
+    m_countLabel->setText(QStringLiteral("(%1)").arg(m_items->count()));
+    static_cast<PlaylistListWidget*>(m_items)->setHint(m_items->count() > 0
+        ? QStringLiteral("Drag songs here from the library, or double-click a song to play it.")
+        : QStringLiteral("Drag songs here from the library."));
     if (selected) {
         m_items->setCurrentItem(selected);
     } else if (m_items->count() > 0) {
@@ -400,10 +711,12 @@ void PlaylistView::updatePlaybackMarkers()
     for (int row = 0; row < m_items->count(); ++row) {
         QListWidgetItem* item = m_items->item(row);
         QString text = item->data(BaseTextRole).toString();
-        if (active && context && context->playlistId == playlistId
-            && context->itemId == item->data(ItemIdRole).toLongLong())
+        const bool playing = active && context && context->playlistId == playlistId
+            && context->itemId == item->data(ItemIdRole).toLongLong();
+        if (playing)
             text.prepend(QStringLiteral("▶ "));
         item->setText(text);
+        item->setData(PlayingRole, playing);
     }
 }
 
@@ -540,12 +853,12 @@ void PlaylistView::removeSelected()
     const QListWidgetItem* selected = m_items->currentItem();
     const QString songText = selected
         ? selected->data(BaseTextRole).toString() : displayText(*entry);
-    const bool confirmed = m_removeConfirmation
+    const bool confirmed = !m_confirmRemove || (m_removeConfirmation
         ? m_removeConfirmation(this, songText, playlist->name)
         : QMessageBox::question(this, QStringLiteral("Remove Song"),
               QStringLiteral("Remove \"%1\" from \"%2\"? The song stays in your library.")
                   .arg(songText, playlist->name),
-              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes);
     if (!confirmed || !m_store->item(itemId))
         return;
     QString error;
@@ -560,6 +873,8 @@ void PlaylistView::removeSelected()
 
 bool PlaylistView::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_items->viewport() && event->type() == QEvent::Resize)
+        m_columnHeader->update();
     if (watched == m_items->viewport()
         && event->type() == QEvent::Drop) {
         auto acceptCopy = [](QDropEvent* drop) {
@@ -615,6 +930,7 @@ bool PlaylistView::eventFilter(QObject* watched, QEvent* event)
         }
         refreshItems(selectedId, true);
         acceptCopy(drop);
+        emit interacted();
         return true;
     }
     if (watched == m_items && event->type() == QEvent::KeyPress) {
@@ -657,5 +973,5 @@ bool PlaylistView::canAcceptDrop(const QMimeData* mimeData) const
 void PlaylistView::showStoreError(const QString& fallback, const QString& detail)
 {
     Q_UNUSED(detail)
-    m_message->setText(fallback);
+    setMessageText(fallback);
 }

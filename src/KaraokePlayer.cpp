@@ -1,5 +1,6 @@
 #include "KaraokePlayer.h"
 
+#include "AudioOutputs.h"
 #include "Logging.h"
 
 #include <QDir>
@@ -131,7 +132,15 @@ bool KaraokePlayer::ensurePipeline()
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "sync"))
             g_object_set(sink, "sync", TRUE, nullptr);
         g_object_set(m_pipeline, "audio-sink", sink, nullptr);
+    } else if (!m_outputName.isEmpty()) {
+        // A chosen output; if it is not connected the default is used, and
+        // the chosen one is looked for again at the next song.
+        if (GstElement* sink = audio::createSink(m_outputName))
+            g_object_set(m_pipeline, "audio-sink", sink, nullptr);
+        else
+            m_outputChanged = true;
     }
+    g_object_set(m_pipeline, "volume", m_volumePercent / 100.0, nullptr);
     return true;
 }
 
@@ -287,6 +296,11 @@ bool KaraokePlayer::load(const SongPair& pair)
     qCInfo(lcCdg) << "CDG packets:" << m_decoder.packetCount()
                   << "duration ms:" << m_decoder.durationMs();
 
+    // A newly chosen sound output starts with this song.
+    if (m_outputChanged) {
+        destroyPipeline();
+        m_outputChanged = false;
+    }
     if (!ensurePipeline())
         return loadFailed(QStringLiteral("The audio system could not play music."));
 
@@ -318,6 +332,26 @@ bool KaraokePlayer::load(const SongPair& pair)
     setState(State::Ready);
     m_timer.start();
     return true;
+}
+
+void KaraokePlayer::setAudioOutput(const QString& name)
+{
+    if (name == m_outputName)
+        return;
+    qCInfo(lcPlayer).noquote() << "Sound output:" << (name.isEmpty() ? QStringLiteral("default") : name);
+    m_outputName = name;
+    // Nothing loaded: the next pipeline is made with the new output anyway.
+    if (m_pipeline && !hasSong())
+        destroyPipeline();
+    else
+        m_outputChanged = m_pipeline != nullptr;
+}
+
+void KaraokePlayer::setVolumePercent(int percent)
+{
+    m_volumePercent = qBound(0, percent, 100);
+    if (m_pipeline)
+        g_object_set(m_pipeline, "volume", m_volumePercent / 100.0, nullptr);
 }
 
 void KaraokePlayer::play()
@@ -787,6 +821,10 @@ void KaraokePlayer::fail(const QString& userMessage)
     if (m_errorReported)
         return;
     m_errorReported = true;
+    // A chosen output that failed (e.g. unplugged) is looked for afresh with
+    // the next song, rather than reusing the failed one.
+    if (!m_outputName.isEmpty())
+        m_outputChanged = true;
     if (m_pipeline) {
         gst_element_set_state(m_pipeline, GST_STATE_READY);
         discardPendingMessages();

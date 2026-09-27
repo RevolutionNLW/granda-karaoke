@@ -236,6 +236,42 @@ bool SongSettingsStore::preserveCorruptFile()
     }
 }
 
+bool SongSettingsStore::forgetAll(QString* backupPath, QString* error)
+{
+    const auto fail = [error](const QString& message) {
+        qCWarning(lcApp).noquote() << message;
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (m_readOnly)
+        return fail(QStringLiteral("Song settings are read-only this session; nothing was reset."));
+    QLockFile lock(m_path + QStringLiteral(".lock"));
+    lock.setStaleLockTime(kSettingsStaleLockMs);
+    if (!lock.tryLock(kSettingsLockTimeoutMs))
+        return fail(QStringLiteral("Song settings are busy; nothing was reset."));
+    // Keep the old file first: the reset can be undone by putting it back.
+    if (QFileInfo::exists(m_path)) {
+        const QString copy = m_path + QStringLiteral(".before-reset-")
+            + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+        if (!QFile::copy(m_path, copy))
+            return fail(QStringLiteral("Could not keep a copy of the song settings; nothing was reset."));
+        if (backupPath)
+            *backupPath = copy;
+    }
+    const QHash<QString, Entry> previous = m_entries;
+    const QSet<QString> previousUnsaved = m_unsaved;
+    m_entries.clear();
+    m_unsaved.clear();
+    if (!save()) {
+        m_entries = previous;
+        m_unsaved = previousUnsaved;
+        return fail(QStringLiteral("Song settings could not be written; nothing was reset."));
+    }
+    qCInfo(lcApp) << "All per-song Key/Tempo settings were reset";
+    return true;
+}
+
 bool SongSettingsStore::save() const
 {
     const QFileInfo info(m_path);

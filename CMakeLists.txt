@@ -92,6 +92,12 @@ target_link_libraries(fks-catalogue PRIVATE fks_ocr)
 
 # Application core shared by the executable and the tests.
 add_library(fks_core STATIC
+    src/AppPreferences.cpp
+    src/AppPreferences.h
+    src/AudioOutputs.cpp
+    src/BackgroundWork.cpp
+    src/BackgroundWork.h
+    src/AudioOutputs.h
     src/LibraryController.cpp
     src/LibraryController.h
     src/LibraryResultsModel.cpp
@@ -118,6 +124,16 @@ add_library(fks_core STATIC
     src/platform/DisplaySleepBlocker.h
     src/MainWindow.cpp
     src/MainWindow.h
+    src/SettingsDialog.cpp
+    src/SettingsDialog.h
+    src/ui/Controls.cpp
+    src/ui/Controls.h
+    src/ui/ElidedLabel.cpp
+    src/ui/ElidedLabel.h
+    src/ui/Shortcuts.cpp
+    src/ui/Shortcuts.h
+    src/ui/Theme.cpp
+    src/ui/Theme.h
 )
 target_include_directories(fks_core PUBLIC src)
 target_link_libraries(fks_core PUBLIC fks_ocr fks_playlist Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
@@ -137,7 +153,7 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
 
 foreach(_target fks_cdg fks_library fks_ocr fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
     if(MSVC)
-        target_compile_options(${_target} PRIVATE /W4)
+        target_compile_options(${_target} PRIVATE /W4 /utf-8)
     else()
         target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()

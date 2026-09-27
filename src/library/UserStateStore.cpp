@@ -283,6 +283,37 @@ QString UserStateStore::preference(const QString& key, QString* error) const
     return query.next() ? query.value(0).toString() : QString();
 }
 
+bool UserStateStore::setPreferences(const QList<QPair<QString, QString>>& values, QString* error)
+{
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("Could not save preferences: %1").arg(m_database.lastError().text()), error);
+        return false;
+    }
+    for (const auto& [key, value] : values) {
+        if (!setPreference(key, value, error)) {
+            undoTransaction();
+            return false;
+        }
+    }
+    if (!m_database.commit()) {
+        setError(QStringLiteral("Could not save preferences: %1").arg(m_database.lastError().text()), error);
+        undoTransaction();
+        return false;
+    }
+    return true;
+}
+
+void UserStateStore::undoTransaction()
+{
+    if (m_database.rollback())
+        return;
+    // Closing undoes the unfinished transaction; later saves then fail
+    // openly instead of seeming to succeed inside it.
+    qCWarning(lcUserState).noquote() << "Could not undo unsaved preferences; closing"
+                                     << m_databasePath << ":" << m_database.lastError().text();
+    close();
+}
+
 bool UserStateStore::setPreference(const QString& key, const QString& value, QString* error)
 {
     QSqlQuery query(m_database);

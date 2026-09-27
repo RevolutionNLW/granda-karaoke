@@ -2,103 +2,114 @@
 
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
+#include "ui/Controls.h"
+#include "ui/ElidedLabel.h"
+#include "ui/Theme.h"
 
 #include <QComboBox>
 #include <QFileDialog>
+#include <QFontDatabase>
 #include <QFontMetrics>
+#include <QFrame>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListView>
 #include <QPainter>
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QStyledItemDelegate>
 #include <QTimer>
+#include <QTreeView>
 #include <QVBoxLayout>
+
+#include <functional>
 
 namespace {
 
-QPushButton* makeLibraryButton(const QString& text, QWidget* parent, bool mainButton)
+QPushButton* makeLibraryButton(const QString& text, QWidget* parent)
 {
     auto* button = new QPushButton(text, parent);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumHeight(mainButton ? 76 : 48);
-    QFont font = button->font();
-    font.setPointSize(mainButton ? 22 : 16);
-    font.setBold(mainButton);
-    button->setFont(font);
     return button;
 }
 
-class SongResultDelegate final : public QStyledItemDelegate {
+// Paints the song table: one line per karaoke version, the selection (gold in
+// the pane in use, grey otherwise), and the now-playing marker, which is
+// separate from the selection. A plain model and a painting delegate stay fast
+// with tens of thousands of rows.
+class SongTableDelegate final : public QStyledItemDelegate {
 public:
-    using QStyledItemDelegate::QStyledItemDelegate;
-
-    QSize sizeHint(const QStyleOptionViewItem& option,
-                   const QModelIndex& index) const override
+    SongTableDelegate(QTreeView* view, std::function<bool()> active)
+        : QStyledItemDelegate(view)
+        , m_view(view)
+        , m_active(std::move(active))
     {
-        Q_UNUSED(option)
-        Q_UNUSED(index)
-        return QSize(100, 82);
+        m_mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override
+    {
+        return QSize(40, option.fontMetrics.height() + theme::rowPadding());
     }
 
     void paint(QPainter* painter, const QStyleOptionViewItem& option,
                const QModelIndex& index) const override
     {
+        using Model = LibraryResultsModel;
         painter->save();
         const bool selected = option.state.testFlag(QStyle::State_Selected);
-        painter->fillRect(option.rect,
-                          selected ? option.palette.highlight()
-                                   : option.palette.base());
-        const QColor textColor = selected ? option.palette.highlightedText().color()
-                                          : option.palette.text().color();
-        const QColor secondary = selected ? textColor : option.palette.color(QPalette::Mid);
-        const QRect row = option.rect.adjusted(14, 6, -14, -6);
-        const int rightWidth = 190;
-        const QRect mainRect(row.left(), row.top(), qMax(0, row.width() - rightWidth - 12),
-                             row.height());
-        const QRect rightRect(mainRect.right() + 12, row.top(), rightWidth, row.height());
+        const bool strong = selected && m_active();
+        const QColor background = selected
+            ? (strong ? theme::color::selection : theme::color::selectionIdle)
+            : (index.row() % 2 && theme::alternateRows() ? theme::color::rowAlternate
+                                                          : theme::color::rowBase);
+        painter->fillRect(option.rect, background);
+        const bool firstVisual = m_view->header()->visualIndex(index.column()) == 0
+            || m_view->isFirstColumnSpanned(index.row(), {});
+        if (strong && firstVisual)
+            painter->fillRect(QRect(option.rect.left(), option.rect.top(), theme::px(3),
+                                    option.rect.height()), theme::color::accent);
 
-        if (index.data(LibraryResultsModel::MoreRole).toBool()) {
-            QFont font = option.font;
-            font.setPointSize(18);
-            painter->setFont(font);
-            painter->setPen(secondary);
-            painter->drawText(row, Qt::AlignVCenter | Qt::AlignLeft,
-                              index.data(Qt::DisplayRole).toString());
+        QRect text = option.rect.adjusted(theme::px(12), 0, -theme::px(12), 0);
+        if (index.data(Model::MoreRole).toBool()) {
+            painter->setPen(theme::color::textMuted);
+            painter->drawText(text, Qt::AlignLeft | Qt::AlignVCenter,
+                              index.model()->index(index.row(), Model::SongColumn)
+                                  .data().toString());
             painter->restore();
             return;
         }
-
-        QFont titleFont = option.font;
-        titleFont.setPointSize(22);
-        titleFont.setBold(true);
-        painter->setFont(titleFont);
-        painter->setPen(textColor);
-        const QString title = QFontMetrics(titleFont).elidedText(
-            index.data(Qt::DisplayRole).toString(), Qt::ElideRight, mainRect.width());
-        painter->drawText(QRect(mainRect.left(), mainRect.top(), mainRect.width(), 38),
-                          Qt::AlignLeft | Qt::AlignVCenter, title);
-
-        QFont artistFont = option.font;
-        artistFont.setPointSize(17);
-        painter->setFont(artistFont);
-        painter->setPen(secondary);
-        const QString artist = QFontMetrics(artistFont).elidedText(
-            index.data(LibraryResultsModel::ArtistRole).toString(),
-            Qt::ElideRight, mainRect.width());
-        painter->drawText(QRect(mainRect.left(), mainRect.top() + 39, mainRect.width(), 28),
-                          Qt::AlignLeft | Qt::AlignVCenter, artist);
-
-        QFont discFont = option.font;
-        discFont.setPointSize(13);
-        painter->setFont(discFont);
-        painter->drawText(rightRect, Qt::AlignRight | Qt::AlignVCenter,
-                          index.data(LibraryResultsModel::DiscRole).toString());
+        if (firstVisual && index.data(Model::PlayingRole).toBool()) {
+            const int size = theme::px(12);
+            const QRect mark(text.left(), text.center().y() - size / 2, size, size);
+            ui::glyphIcon(ui::Glyph::Play, theme::color::accent).paint(painter, mark);
+            text.setLeft(text.left() + theme::px(18));
+        }
+        const int column = index.column();
+        const bool secondary = column == Model::LabelColumn || column == Model::DiscColumn
+            || column == Model::PlaysColumn;
+        painter->setPen(strong ? theme::color::selectionText
+                               : secondary ? theme::color::secondaryText : theme::color::text);
+        QFont font = option.font;
+        if (column == Model::DiscColumn) {
+            font = m_mono;
+            font.setPixelSize(theme::px(13));
+        }
+        painter->setFont(font);
+        const Qt::Alignment align = (column == Model::PlaysColumn ? Qt::AlignRight : Qt::AlignLeft)
+            | Qt::AlignVCenter;
+        painter->drawText(text, int(align),
+                          painter->fontMetrics().elidedText(index.data().toString(),
+                                                            Qt::ElideRight, text.width()));
         painter->restore();
     }
+
+private:
+    QTreeView* m_view;
+    std::function<bool()> m_active;
+    QFont m_mono;
 };
 
 } // namespace
@@ -107,19 +118,23 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     : QWidget(parent)
     , m_controller(controller)
 {
-    m_backButton = makeLibraryButton(QStringLiteral("Back"), this, false);
-    m_backButton->setMinimumWidth(120);
-    m_statusLabel = new QLabel(this);
+    auto* pane = new QFrame(this);
+    pane->setObjectName(QStringLiteral("pane"));
+
+    auto* title = new QLabel(QStringLiteral("Local Song Library"), pane);
+    title->setObjectName(QStringLiteral("paneTitle"));
+    m_statusLabel = new QLabel(pane);
+    m_statusLabel->setObjectName(QStringLiteral("paneStatus"));
     m_statusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    QFont statusFont = m_statusLabel->font();
-    statusFont.setPointSize(14);
-    m_statusLabel->setFont(statusFont);
-    auto* header = new QHBoxLayout;
-    header->addWidget(m_backButton);
+    auto* headerFrame = new QFrame(pane);
+    headerFrame->setObjectName(QStringLiteral("paneHeader"));
+    auto* header = new QHBoxLayout(headerFrame);
+    header->setContentsMargins(16, 12, 16, 12);
+    header->addWidget(title);
     header->addStretch();
     header->addWidget(m_statusLabel);
 
-    m_content = new QStackedWidget(this);
+    m_content = new QStackedWidget(pane);
     m_setupPage = new QWidget(m_content);
     m_searchPage = new QWidget(m_content);
     m_content->addWidget(m_setupPage);
@@ -129,30 +144,28 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                               m_setupPage);
     m_setupLabel->setAlignment(Qt::AlignCenter);
     m_setupLabel->setWordWrap(true);
-    QFont setupFont = m_setupLabel->font();
-    setupFont.setPointSize(24);
-    m_setupLabel->setFont(setupFont);
-    m_chooseFolderButton = makeLibraryButton(QStringLiteral("Choose Music Folder"),
-                                             m_setupPage, true);
+    m_chooseFolderButton = makeLibraryButton(QStringLiteral("Choose Music Folder"), m_setupPage);
+    m_chooseFolderButton->setObjectName(QStringLiteral("playButton"));
     auto* setupLayout = new QVBoxLayout(m_setupPage);
     setupLayout->addStretch();
     setupLayout->addWidget(m_setupLabel);
-    setupLayout->addSpacing(20);
+    theme::addSpacing(setupLayout, 12);
     setupLayout->addWidget(m_chooseFolderButton, 0, Qt::AlignHCenter);
     setupLayout->addStretch();
 
-    m_searchBox = new QLineEdit(m_searchPage);
+    // The search box and the sort choice beside it. The order applies to
+    // browsing and to search results, and is remembered by the library.
+    m_searchBar = new QWidget(this);
+    m_searchBar->setObjectName(QStringLiteral("searchBar"));
+    m_searchBox = new QLineEdit(m_searchBar);
     m_searchBox->setObjectName(QStringLiteral("librarySearchBox"));
-    m_searchBox->setPlaceholderText(QStringLiteral("Type a song or singer"));
-    m_searchBox->setMinimumHeight(62);
-    QFont searchFont = m_searchBox->font();
-    searchFont.setPointSize(26);
-    m_searchBox->setFont(searchFont);
+    m_searchBox->setPlaceholderText(QStringLiteral("Search songs, artists or disc IDs\u2026"));
+    m_searchBox->setClearButtonEnabled(true);
+    m_searchBox->addAction(ui::glyphIcon(ui::Glyph::Search, theme::color::textMuted),
+                           QLineEdit::LeadingPosition);
     m_searchBox->installEventFilter(this);
 
-    // A small order choice beside the search box; it applies to browsing and
-    // to search results, and is remembered by the library.
-    m_sortBox = new QComboBox(m_searchPage);
+    m_sortBox = new QComboBox(m_searchBar);
     m_sortBox->setObjectName(QStringLiteral("librarySort"));
     m_sortBox->setFocusPolicy(Qt::NoFocus);
     m_sortBox->setToolTip(QStringLiteral("Order of the songs"));
@@ -167,71 +180,105 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     };
     for (const auto& [text, sort] : sorts)
         m_sortBox->addItem(QString::fromUtf8(text), int(sort));
-    QFont sortFont = m_sortBox->font();
-    sortFont.setPointSize(16);
-    m_sortBox->setFont(sortFont);
     if (m_controller)
         m_sortBox->setCurrentIndex(m_sortBox->findData(int(m_controller->librarySort())));
+    auto* sortCaption = new QLabel(QStringLiteral("Sort:"), m_searchBar);
+    sortCaption->setObjectName(QStringLiteral("caption"));
+    auto* searchRow = new QHBoxLayout(m_searchBar);
+    searchRow->setContentsMargins(0, 0, 0, 0);
+    searchRow->setSpacing(10);
+    searchRow->addWidget(m_searchBox, 1);
+    theme::addSpacing(searchRow, 6);
+    searchRow->addWidget(sortCaption);
+    searchRow->addWidget(m_sortBox);
 
-    m_hintLabel = new QLabel(QStringLiteral("Type to search, or scroll to browse"),
-                             m_searchPage);
-    m_hintLabel->setAlignment(Qt::AlignCenter);
-    QFont hintFont = m_hintLabel->font();
-    hintFont.setPointSize(20);
-    m_hintLabel->setFont(hintFont);
+    m_hintLabel = new ElidedLabel(
+        QStringLiteral("Double-click a song to sing it, or drag it to a playlist"), m_searchPage);
+    m_hintLabel->setObjectName(QStringLiteral("paneHint"));
 
-    m_results = new QListView(m_searchPage);
+    m_results = new QTreeView(m_searchPage);
     m_resultsModel = new LibraryResultsModel(m_results);
+    if (m_controller) {
+        LibraryController* controller = m_controller;
+        m_resultsModel->setPlayCountProvider([controller](qint64 songId) {
+            return controller->playStats(songId).playCount;
+        });
+    }
     m_results->setModel(m_resultsModel);
     m_results->setObjectName(QStringLiteral("libraryResults"));
     m_results->setFocusPolicy(Qt::NoFocus);
     m_results->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_results->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_results->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    m_results->setUniformItemSizes(true);
+    m_results->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_results->setUniformRowHeights(true);
+    m_results->setRootIsDecorated(false);
+    m_results->setItemsExpandable(false);
+    m_results->setIndentation(0);
+    m_results->setAllColumnsShowFocus(true);
+    QHeaderView* columns = m_results->header();
+    columns->setSectionsClickable(false);
+    columns->setSectionsMovable(false);
+    columns->setHighlightSections(false);
+    columns->setStretchLastSection(false);
+    applyColumnWidths();
+    connect(theme::notifier(), &theme::Notifier::changed, this, [this] {
+        applyColumnWidths();
+        m_results->doItemsLayout();
+        m_results->viewport()->update();
+    });
+    columns->setSectionResizeMode(LibraryResultsModel::ArtistColumn, QHeaderView::Stretch);
+    columns->setSectionResizeMode(LibraryResultsModel::SongColumn, QHeaderView::Stretch);
+    columns->setSectionResizeMode(LibraryResultsModel::LabelColumn, QHeaderView::Fixed);
+    columns->setSectionResizeMode(LibraryResultsModel::DiscColumn, QHeaderView::Fixed);
+    columns->setSectionResizeMode(LibraryResultsModel::PlaysColumn, QHeaderView::Fixed);
+    // Artist first, as people look for songs by singer.
+    columns->moveSection(columns->visualIndex(LibraryResultsModel::ArtistColumn), 0);
+    // Clicking a song keeps the keyboard with the search box (never the
+    // playlist), so Up/Down/Enter always act on the library.
+    m_results->viewport()->installEventFilter(this);
     m_results->setDragEnabled(true);
     m_results->setAcceptDrops(false);
     m_results->setDragDropMode(QAbstractItemView::DragOnly);
     m_results->setDefaultDropAction(Qt::CopyAction);
-    m_results->setItemDelegate(new SongResultDelegate(m_results));
+    m_results->setItemDelegate(new SongTableDelegate(m_results, [this] { return m_active; }));
 
     m_messageLabel = new QLabel(m_searchPage);
-    m_messageLabel->setAlignment(Qt::AlignCenter);
     m_messageLabel->setWordWrap(true);
-    m_messageLabel->setStyleSheet(QStringLiteral("color: #b00020;"));
-    QFont messageFont = m_messageLabel->font();
-    messageFont.setPointSize(18);
-    m_messageLabel->setFont(messageFont);
+    m_messageLabel->setStyleSheet(theme::dangerStyle());
 
-    m_changeFolderButton = makeLibraryButton(QStringLiteral("Change Folder"),
-                                             m_searchPage, false);
-    m_addToPlaylistButton = makeLibraryButton(QStringLiteral("Add to Playlist"),
-                                              m_searchPage, false);
+    m_addToPlaylistButton = makeLibraryButton(QStringLiteral("Add to Playlist"), m_searchPage);
     m_addToPlaylistButton->setEnabled(false);
-    m_singButton = makeLibraryButton(QStringLiteral("Sing This Song"), m_searchPage, true);
-    m_singButton->setMinimumWidth(240);
+    m_singButton = makeLibraryButton(QStringLiteral("Sing This Song"), m_searchPage);
     m_singButton->setEnabled(false);
-    auto* actions = new QHBoxLayout;
-    actions->addWidget(m_changeFolderButton);
-    actions->addStretch();
+    for (QPushButton* button : {m_addToPlaylistButton, m_singButton})
+        button->setObjectName(QStringLiteral("ghostButton"));
+    auto* footer = new QFrame(m_searchPage);
+    footer->setObjectName(QStringLiteral("paneFooter"));
+    auto* actions = new QHBoxLayout(footer);
+    actions->setContentsMargins(16, 8, 12, 8);
+    actions->setSpacing(8);
+    actions->addWidget(m_hintLabel);
+    actions->addWidget(m_messageLabel, 1);
     actions->addWidget(m_addToPlaylistButton);
     actions->addWidget(m_singButton);
 
-    auto* searchLayout = new QVBoxLayout(m_searchPage);
-    searchLayout->setSpacing(10);
-    auto* searchRow = new QHBoxLayout;
-    searchRow->addWidget(m_searchBox, 1);
-    searchRow->addWidget(m_sortBox);
-    searchLayout->addLayout(searchRow);
-    searchLayout->addWidget(m_hintLabel);
-    searchLayout->addWidget(m_results, 1);
-    searchLayout->addWidget(m_messageLabel);
-    searchLayout->addLayout(actions);
+    m_searchLayout = new QVBoxLayout(m_searchPage);
+    m_searchLayout->setContentsMargins(0, 0, 0, 0);
+    m_searchLayout->setSpacing(0);
+    m_searchLayout->addWidget(m_searchBar);
+    m_searchLayout->addWidget(m_results, 1);
+    m_searchLayout->addWidget(footer);
+
+    auto* paneLayout = new QVBoxLayout(pane);
+    paneLayout->setContentsMargins(1, 1, 1, 1);
+    paneLayout->setSpacing(0);
+    paneLayout->addWidget(headerFrame);
+    paneLayout->addWidget(m_content, 1);
 
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(24, 16, 24, 16);
-    layout->setSpacing(12);
-    layout->addLayout(header);
-    layout->addWidget(m_content, 1);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(pane);
 
     m_debounce = new QTimer(this);
     m_debounce->setSingleShot(true);
@@ -239,7 +286,9 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     connect(m_debounce, &QTimer::timeout, this, &LibraryView::refreshSearch);
     connect(m_searchBox, &QLineEdit::textChanged, this, [this](const QString& text) {
         m_messageLabel->clear();
-        if (text.trimmed().isEmpty()) {
+        if (text.trimmed() == m_shownQuery) {
+            m_debounce->stop();
+        } else if (text.trimmed().isEmpty()) {
             m_debounce->stop();
             refreshSearch();
         } else {
@@ -258,11 +307,12 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     });
     connect(m_results->selectionModel(), &QItemSelectionModel::currentChanged,
             this, [this] { updateSelectionActions(); });
-    connect(m_results, &QListView::doubleClicked, this,
+    connect(m_results, &QAbstractItemView::doubleClicked, this,
             [this](const QModelIndex&) { singSelected(); });
-    connect(m_backButton, &QPushButton::clicked, this, &LibraryView::backRequested);
     connect(m_chooseFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
-    connect(m_changeFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
+    for (QPushButton* button : {m_singButton, m_addToPlaylistButton})
+        connect(button, &QPushButton::pressed, this, &LibraryView::interacted);
+    connect(m_sortBox, &QComboBox::activated, this, &LibraryView::interacted);
     connect(m_singButton, &QPushButton::clicked, this, &LibraryView::singSelected);
     connect(m_addToPlaylistButton, &QPushButton::clicked, this, [this] {
         const qint64 songId = selectedSongId();
@@ -272,6 +322,8 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     if (m_controller) {
         connect(m_controller, &LibraryController::stateChanged,
                 this, &LibraryView::updateState);
+        connect(m_controller, &LibraryController::playStatsChanged,
+                m_resultsModel, &LibraryResultsModel::forgetPlayCount);
         connect(m_controller, &LibraryController::catalogueChanged,
                 this, &LibraryView::refreshSearch);
         connect(m_controller, &LibraryController::libraryReady,
@@ -280,6 +332,39 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                 this, [this](const QVariantMap&) { refreshSearch(); });
     }
     updateState();
+}
+
+void LibraryView::applyColumnWidths()
+{
+    QHeaderView* columns = m_results->header();
+    columns->setMinimumSectionSize(theme::px(40));
+    columns->resizeSection(LibraryResultsModel::LabelColumn, theme::px(120));
+    columns->resizeSection(LibraryResultsModel::DiscColumn, theme::px(124));
+    columns->resizeSection(LibraryResultsModel::PlaysColumn, theme::px(64));
+}
+
+void LibraryView::setColumnVisible(int column, bool visible)
+{
+    m_results->setColumnHidden(column, !visible);
+}
+
+void LibraryView::setActive(bool active)
+{
+    if (m_active == active)
+        return;
+    m_active = active;
+    m_results->viewport()->update();
+}
+
+void LibraryView::setPlayingSongId(qint64 songId)
+{
+    m_resultsModel->setPlayingSongId(songId);
+}
+
+QWidget* LibraryView::takeSearchBar()
+{
+    m_searchLayout->removeWidget(m_searchBar);
+    return m_searchBar;
 }
 
 void LibraryView::activate()
@@ -323,6 +408,7 @@ void LibraryView::updateState()
             "The song library could not be opened. You can still use Open Song."));
         m_chooseFolderButton->hide();
         m_content->setCurrentWidget(m_setupPage);
+        m_searchBar->setEnabled(false);
         return;
     }
     m_statusLabel->setText(m_controller->statusText());
@@ -330,6 +416,7 @@ void LibraryView::updateState()
     m_chooseFolderButton->show();
     m_setupLabel->setText(QStringLiteral("Choose the folder that holds your karaoke songs"));
     m_content->setCurrentWidget(configured ? m_searchPage : m_setupPage);
+    m_searchBar->setEnabled(configured);
 }
 
 void LibraryView::chooseFolder()
@@ -355,6 +442,7 @@ void LibraryView::refreshSearch()
 {
     const qint64 keepSongId = selectedSongId();
     const QString text = m_searchBox->text().trimmed();
+    m_shownQuery = text;
     m_results->show();
     m_hintLabel->setVisible(text.isEmpty());
     if (!m_controller || !m_controller->hasActiveRoot()) {
@@ -377,6 +465,8 @@ void LibraryView::refreshSearch()
     if (showMore)
         rows.resize(200);
     m_resultsModel->setRows(rows, showMore);
+    if (showMore)
+        m_results->setFirstColumnSpanned(m_resultsModel->songCount(), {}, true);
     const int keepRow = m_resultsModel->rowForSongId(keepSongId);
     m_results->setCurrentIndex(keepRow >= 0 ? m_resultsModel->index(keepRow, 0)
                                             : QModelIndex());
@@ -385,10 +475,14 @@ void LibraryView::refreshSearch()
 
 bool LibraryView::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_results->viewport() && event->type() == QEvent::MouseButtonPress
+        && m_searchBox->isEnabled())
+        m_searchBox->setFocus(Qt::MouseFocusReason);
     if (watched == m_searchBox && event->type() == QEvent::KeyPress) {
         auto* key = static_cast<QKeyEvent*>(event);
         if (key->key() == Qt::Key_Escape) {
-            emit backRequested();
+            // Escape only ever clears the search.
+            m_searchBox->clear();
             return true;
         }
         if (key->key() == Qt::Key_Up) {

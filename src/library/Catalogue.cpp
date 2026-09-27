@@ -72,8 +72,10 @@ bool lexicalPathIsInsideOrEqual(const QString& candidate, const QString& root)
     QString parent = lexicalPath(root);
     if (child == parent)
         return true;
-    if (!parent.endsWith(QDir::separator()))
-        parent.append(QDir::separator());
+    // Qt paths always use '/', on Windows too: QDir::separator() is '\\' there,
+    // and no path inside the folder would ever match.
+    if (!parent.endsWith(QLatin1Char('/')))
+        parent.append(QLatin1Char('/'));
     return child.startsWith(parent);
 }
 
@@ -156,32 +158,68 @@ ProbeResult probeCatalogue(const QString& path, int* version, QStringList* roots
 }
 
 // ORDER BY for a library sort over songs `so` LEFT JOINed to song_plays `p`.
+// Characters skipped at the start of a name when placing it alphabetically
+// ("#SELFIE" under S, "'Til" under T, "(Everything I Do)" under E). The names
+// shown are never changed. (An SQL string: the apostrophe is doubled.)
+const char* const kLeadingPunctuation =
+    R"('  #''"()[]{}<>.,-_*!?&@$%^+=~`/\|:;¡¿‘’“”')";
+
+// The alphabetical key of a name, and its group: letters first (A-Z, then
+// letters beyond A-Z such as Ø or É, by character), then names starting with a
+// digit, then symbols, and blank names last. The groups
+// keep this order in both directions; only the order within them reverses.
+QString alphabeticKey(const QString& column)
+{
+    return QStringLiteral("lower(ltrim(coalesce(%1,''),%2))")
+        .arg(column, QString::fromUtf8(kLeadingPunctuation));
+}
+
+QString alphabeticGroup(const QString& column)
+{
+    const QString key = alphabeticKey(column);
+    return QStringLiteral("CASE WHEN trim(coalesce(%1,''))='' THEN 3 WHEN %2='' THEN 2 "
+                          "WHEN substr(%2,1,1) BETWEEN 'a' AND 'z' THEN 0 "
+                          "WHEN unicode(substr(%2,1,1))>127 THEN 0 "
+                          "WHEN substr(%2,1,1) BETWEEN '0' AND '9' THEN 1 ELSE 2 END")
+        .arg(column, key);
+}
+
+// Group, key (in the given direction), then the full name as a tie-break.
+QString alphabetic(const QString& column, bool descending = false)
+{
+    return QStringLiteral("%1,%2%3,lower(%4)")
+        .arg(alphabeticGroup(column), alphabeticKey(column),
+             descending ? QStringLiteral(" DESC") : QString(), column);
+}
+
 QString sortClause(LibrarySort sort)
 {
-    const QString blankArtist = QStringLiteral("CASE WHEN trim(coalesce(so.display_artist,''))<>'' THEN 0 ELSE 1 END");
-    const QString blankTitle = QStringLiteral("CASE WHEN trim(coalesce(so.display_title,''))<>'' THEN 0 ELSE 1 END");
+    const QString artistColumn = QStringLiteral("so.display_artist");
+    const QString titleColumn = QStringLiteral("so.display_title");
     const QString blankLabel = QStringLiteral("CASE WHEN trim(coalesce(so.label,''))<>'' THEN 0 ELSE 1 END");
-    const QString artist = QStringLiteral("lower(so.display_artist)");
-    const QString title = QStringLiteral("lower(so.display_title)");
+    const QString artist = alphabetic(artistColumn);
+    const QString title = alphabetic(titleColumn);
     const QString stable = QStringLiteral("%1,lower(so.label),so.disc_id,so.track,so.id").arg(blankLabel);
-    const QString byArtist = QStringLiteral("%1,%2,%3,%4,%5").arg(blankArtist, artist, blankTitle, title, stable);
+    const QString byArtist = QStringLiteral("%1,%2,%3").arg(artist, title, stable);
     switch (sort) {
     case LibrarySort::ArtistAsc:
         return byArtist;
     case LibrarySort::ArtistDesc:
-        return QStringLiteral("%1,%2 DESC,%3,%4,%5").arg(blankArtist, artist, blankTitle, title, stable);
+        return QStringLiteral("%1,%2,%3").arg(alphabetic(artistColumn, true), title, stable);
     case LibrarySort::TitleAsc:
-        return QStringLiteral("%1,%2,%3,%4,%5").arg(blankTitle, title, blankArtist, artist, stable);
+        return QStringLiteral("%1,%2,%3").arg(title, artist, stable);
     case LibrarySort::TitleDesc:
-        return QStringLiteral("%1,%2 DESC,%3,%4,%5").arg(blankTitle, title, blankArtist, artist, stable);
+        return QStringLiteral("%1,%2,%3").arg(alphabetic(titleColumn, true), artist, stable);
     case LibrarySort::MostPlayed:
         return QStringLiteral("coalesce(p.play_count,0) DESC,") + byArtist;
     case LibrarySort::RecentlyPlayed:
         return QStringLiteral("CASE WHEN p.last_played_ms IS NULL THEN 1 ELSE 0 END,p.last_played_ms DESC,")
             + byArtist;
     case LibrarySort::LabelAsc:
-        return QStringLiteral("%1,lower(so.label),%2,%3,%4,%5,so.disc_id,so.track,so.id")
-            .arg(blankLabel, blankArtist, artist, blankTitle, title);
+        // Labels keep their own plain order; songs within a label follow the
+        // artist and song order above.
+        return QStringLiteral("%1,lower(so.label),%2,%3,so.disc_id,so.track,so.id")
+            .arg(blankLabel, artist, title);
     }
     return byArtist;
 }
@@ -264,8 +302,10 @@ bool Catalogue::pathIsInsideOrEqual(const QString& candidate, const QString& roo
 #endif
     if (child == parent)
         return true;
-    if (!parent.endsWith(QDir::separator()))
-        parent.append(QDir::separator());
+    // Qt paths always use '/', on Windows too: QDir::separator() is '\\' there,
+    // and no path inside the folder would ever match.
+    if (!parent.endsWith(QLatin1Char('/')))
+        parent.append(QLatin1Char('/'));
     return child.startsWith(parent);
 }
 
@@ -855,27 +895,29 @@ CatalogueRoot Catalogue::activeRoot(QString* error) const
 {
     QSqlQuery query(m_database);
     if (!query.exec(QStringLiteral(
-            "SELECT id,path,online,active FROM library_roots WHERE active=1 LIMIT 1"))) {
+            "SELECT id,path,online,active,last_scan_completed FROM library_roots WHERE active=1 LIMIT 1"))) {
         setError(sqlError(query, QStringLiteral("Could not read active library root")), error);
         return {};
     }
     if (!query.next())
         return {};
     return {query.value(0).toLongLong(), query.value(1).toString(),
-            query.value(2).toBool(), query.value(3).toBool()};
+            query.value(2).toBool(), query.value(3).toBool(), query.value(4).toLongLong()};
 }
 
 QList<CatalogueRoot> Catalogue::roots(QString* error) const
 {
     QList<CatalogueRoot> result;
     QSqlQuery query(m_database);
-    if (!query.exec(QStringLiteral("SELECT id, path, online, active FROM library_roots ORDER BY id"))) {
+    if (!query.exec(QStringLiteral(
+            "SELECT id, path, online, active, last_scan_completed FROM library_roots ORDER BY id"))) {
         setError(sqlError(query, QStringLiteral("Could not list roots")), error);
         return result;
     }
     while (query.next())
         result.append({query.value(0).toLongLong(), query.value(1).toString(),
-                       query.value(2).toBool(), query.value(3).toBool()});
+                       query.value(2).toBool(), query.value(3).toBool(),
+                       query.value(4).toLongLong()});
     return result;
 }
 
@@ -1983,6 +2025,51 @@ qint64 Catalogue::reviewCount(ReviewFilter filter, QString* error) const
         return 0;
     }
     return query.value(0).toLongLong();
+}
+
+std::optional<ReviewSummary> Catalogue::readReviewSummary(const QString& databasePath,
+                                                          QString* error)
+{
+    const QString name = QStringLiteral("fks-review-summary-%1")
+                             .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    std::optional<ReviewSummary> result;
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        database.setDatabaseName(databasePath);
+        database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=5000"));
+        if (!database.open()) {
+            if (error)
+                *error = database.lastError().text();
+        } else {
+            QSqlQuery query(database);
+            const QString trusted = MetadataResolver::hasTrustedSql(QStringLiteral("so"));
+            if (query.exec(QStringLiteral(
+                    "SELECT count(*),"
+                    "sum(CASE WHEN so.confidence='high' THEN 1 ELSE 0 END),"
+                    "sum(CASE WHEN so.confidence='medium' THEN 1 ELSE 0 END),"
+                    "sum(CASE WHEN so.confidence='low' THEN 1 ELSE 0 END),"
+                    "sum(CASE WHEN so.confidence='unresolved' THEN 1 ELSE 0 END),"
+                    "sum(CASE WHEN so.conflict=1 THEN 1 ELSE 0 END),"
+                    "sum(CASE WHEN %1 THEN 1 ELSE 0 END) FROM songs so WHERE 1=1")
+                               .arg(trusted) + kReviewScope)
+                && query.next()) {
+                ReviewSummary summary;
+                summary.all = query.value(0).toLongLong();
+                summary.high = query.value(1).toLongLong();
+                summary.medium = query.value(2).toLongLong();
+                summary.low = query.value(3).toLongLong();
+                summary.unresolved = query.value(4).toLongLong();
+                summary.conflicts = query.value(5).toLongLong();
+                summary.manual = query.value(6).toLongLong();
+                result = summary;
+            } else if (error) {
+                *error = query.lastError().text();
+            }
+            database.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(name);
+    return result;
 }
 
 QVariantMap Catalogue::reviewDetail(qint64 songId, QString* error) const

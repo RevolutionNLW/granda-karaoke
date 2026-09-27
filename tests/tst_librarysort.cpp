@@ -19,7 +19,7 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QLineEdit>
-#include <QListView>
+#include <QTreeView>
 #include <QListWidget>
 #include <QPushButton>
 #include <QScrollBar>
@@ -145,6 +145,7 @@ private slots:
     void userStateKeepsLocationsAndIsNeverErased();
     void movedSongSearchReadsEachCandidateOnce();
     void sortChangeStartsAtTopWithoutSelection();
+    void alphabeticalSortsReadLikeAMusicLibrary();
 };
 
 void TestLibrarySort::initTestCase()
@@ -359,7 +360,6 @@ void TestLibrarySort::playsCountOncePerSungStart()
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
     // Library Sing loads without playing: nothing counted until Play starts it.
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* library = window.libraryView();
     library->searchBox()->setText(QStringLiteral("ring of fire"));
     library->refreshSearch();
@@ -405,7 +405,6 @@ void TestLibrarySort::playsCountOncePerSungStart()
     QCOMPARE(plays(QStringLiteral("waterloo")), 0);
 
     // Playlist play and the song Autoplay starts after it each count once.
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     window.playlistView()->itemList()->setCurrentRow(0);
     QTest::mouseClick(window.playlistView()->playButton(), Qt::LeftButton);
     QTRY_COMPARE_WITH_TIMEOUT(plays(QStringLiteral("waterloo")), 1, 4000);
@@ -427,7 +426,6 @@ void TestLibrarySort::playsCountOncePerSungStart()
 
     // A song that fails to load is never counted.
     QVERIFY(QFile::resize(root + QStringLiteral("/Other/XYZ001-01 - Beatles - Help.cdg"), 0));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     library->searchBox()->setText(QStringLiteral("help"));
     library->refreshSearch();
     QCOMPARE(library->songResultCount(), 1);
@@ -829,7 +827,6 @@ void TestLibrarySort::sortChangeStartsAtTopWithoutSelection()
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
     // A playlist song is playing while the library is sorted.
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     window.playlistView()->itemList()->setCurrentRow(0);
     QTest::mouseClick(window.playlistView()->playButton(), Qt::LeftButton);
     QTRY_COMPARE_WITH_TIMEOUT(player.state(), KaraokePlayer::State::Playing, 4000);
@@ -837,9 +834,8 @@ void TestLibrarySort::sortChangeStartsAtTopWithoutSelection()
     const auto context = window.playlistPlayback()->context();
     QVERIFY(context.has_value());
 
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* library = window.libraryView();
-    QListView* list = library->resultsList();
+    QTreeView* list = library->resultsList();
     auto sortBy = [&](LibrarySort sort) {
         library->sortBox()->setCurrentIndex(library->sortBox()->findData(int(sort)));
     };
@@ -887,6 +883,96 @@ void TestLibrarySort::sortChangeStartsAtTopWithoutSelection()
     QVERIFY(player.state() == KaraokePlayer::State::Playing || player.state() == KaraokePlayer::State::Finished);
     QCOMPARE(window.playlistPlayback()->context(), context);
     QCOMPARE(playlists.items(playlistId).size(), 1);
+}
+
+void TestLibrarySort::alphabeticalSortsReadLikeAMusicLibrary()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    // Artist and song names given exactly (as a correction would), including
+    // leading punctuation, numbers and symbols; one song has no artist.
+    const QList<QPair<QString, QString>> names = {
+        {QStringLiteral("Zed Band"), QStringLiteral("Zombie")},
+        {QStringLiteral("abba"), QStringLiteral("always")},
+        {QStringLiteral("#Selfie Crew"), QStringLiteral("#SELFIE")},
+        {QStringLiteral("'Til Tuesday"), QStringLiteral("'Til There Was You")},
+        {QStringLiteral("(Duet) Bing & Bob"), QStringLiteral("(Everything I Do) I Do It For You")},
+        {QStringLiteral("3 Doors Down"), QStringLiteral("3 Times a Lady")},
+        {QStringLiteral("!!!"), QStringLiteral("...")},
+        {QStringLiteral("Middle Singer"), QStringLiteral("Morning")},
+        {QStringLiteral("\u00D8stkyst Hustlers"), QStringLiteral("\u00C9t\u00E9")},
+    };
+    const QStringList words = {QStringLiteral("Alpha"), QStringLiteral("Bravo"), QStringLiteral("Charlie"),
+                               QStringLiteral("Delta"), QStringLiteral("Echo"), QStringLiteral("Foxtrot"),
+                               QStringLiteral("Golf"), QStringLiteral("Hotel"), QStringLiteral("India")};
+    for (int i = 0; i < names.size(); ++i) {
+        const QString base = root + QStringLiteral("/SRT001-%1 - Singer %2 - Tune %2")
+                                        .arg(i + 1, 2, 10, QLatin1Char('0')).arg(words.at(i));
+        QDir().mkpath(root);
+        QVERIFY(testmedia::writeFile(base + QStringLiteral(".mp3"), base.toUtf8() + QByteArray(2000, 'a')));
+        QVERIFY(testmedia::writeFile(base + QStringLiteral(".cdg"), base.toUtf8() + QByteArray(2400, 'b')));
+    }
+    QVERIFY(QDir().mkpath(root + QStringLiteral("/SGB39")));
+    QVERIFY(testmedia::writeFile(root + QStringLiteral("/SGB39/3902.mp3"), QByteArray(2000, 'c')));
+    QVERIFY(testmedia::writeFile(root + QStringLiteral("/SGB39/3902.cdg"), QByteArray(2400, 'd')));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/overrides.sqlite")));
+    scan(controller, root);
+    for (int i = 0; i < names.size(); ++i) {
+        const auto rows = controller.search(QStringLiteral("Tune ") + words.at(i), 5);
+        QCOMPARE(rows.size(), 1);
+        QVERIFY(controller.setManualOverride(rows.first().songId, names.at(i).first, names.at(i).second));
+    }
+    const auto order = [&controller](LibrarySort sort, bool byArtist) {
+        controller.setLibrarySort(sort);
+        QStringList result;
+        for (const CatalogueSearchRow& row : controller.browse())
+            result.append(byArtist ? row.displayArtist : row.displayTitle);
+        return result;
+    };
+    const QString blank;  // the song with no artist, always last by artist
+
+    // Letters (leading punctuation ignored), then numbers, then symbols, then blanks.
+    QCOMPARE(order(LibrarySort::ArtistAsc, true),
+             (QStringList{QStringLiteral("abba"), QStringLiteral("(Duet) Bing & Bob"),
+                          QStringLiteral("Middle Singer"), QStringLiteral("#Selfie Crew"),
+                          QStringLiteral("'Til Tuesday"), QStringLiteral("Zed Band"),
+                          QStringLiteral("\u00D8stkyst Hustlers"),  // letters beyond Z come after it
+                          QStringLiteral("3 Doors Down"), QStringLiteral("!!!"), blank}));
+    // Z to A reverses the letters only: numbers, symbols and blanks stay after them.
+    QCOMPARE(order(LibrarySort::ArtistDesc, true),
+             (QStringList{QStringLiteral("\u00D8stkyst Hustlers"), QStringLiteral("Zed Band"),
+                          QStringLiteral("'Til Tuesday"),
+                          QStringLiteral("#Selfie Crew"), QStringLiteral("Middle Singer"),
+                          QStringLiteral("(Duet) Bing & Bob"), QStringLiteral("abba"),
+                          QStringLiteral("3 Doors Down"), QStringLiteral("!!!"), blank}));
+    // (The song with no name of its own is shown by disc: "Disc SGB39 - Track 02".)
+    const QString byDisc = QStringLiteral("Disc SGB39 - Track 02");
+    QCOMPARE(order(LibrarySort::TitleAsc, false),
+             (QStringList{QStringLiteral("always"), byDisc,
+                          QStringLiteral("(Everything I Do) I Do It For You"),
+                          QStringLiteral("Morning"), QStringLiteral("#SELFIE"),
+                          QStringLiteral("'Til There Was You"), QStringLiteral("Zombie"),
+                          QStringLiteral("\u00C9t\u00E9"),
+                          QStringLiteral("3 Times a Lady"), QStringLiteral("...")}));
+    QCOMPARE(order(LibrarySort::TitleDesc, false),
+             (QStringList{QStringLiteral("\u00C9t\u00E9"), QStringLiteral("Zombie"), QStringLiteral("'Til There Was You"),
+                          QStringLiteral("#SELFIE"), QStringLiteral("Morning"),
+                          QStringLiteral("(Everything I Do) I Do It For You"), byDisc,
+                          QStringLiteral("always"), QStringLiteral("3 Times a Lady"),
+                          QStringLiteral("...")}));
+
+    // Search results follow the same order; the names shown are untouched.
+    controller.setLibrarySort(LibrarySort::TitleAsc);
+    QStringList found;
+    for (const CatalogueSearchRow& row : controller.search(QStringLiteral("Selfie"), 10))
+        found.append(row.displayTitle);
+    QCOMPARE(found, QStringList{QStringLiteral("#SELFIE")});
+    found.clear();
+    for (const CatalogueSearchRow& row : controller.search(QStringLiteral("Til"), 10))
+        found.append(row.displayArtist);
+    QVERIFY(found.contains(QStringLiteral("'Til Tuesday")));
 }
 
 QTEST_MAIN(TestLibrarySort)

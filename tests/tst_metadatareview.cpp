@@ -1,6 +1,7 @@
 #include "BusTestPlayer.h"
 #include "LibraryController.h"
 #include "LyricsView.h"
+#include "LibraryView.h"
 #include "MainWindow.h"
 #include "PlaylistView.h"
 #include "MetadataReviewDialog.h"
@@ -19,6 +20,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QTreeView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -803,7 +805,6 @@ void TestMetadataReview::previewNeverCreatesPlaylistContextOrAutoplays()
 
     // A preview started while a playlist song plays drops its context, so
     // Autoplay cannot advance from the preview either.
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     window.playlistView()->itemList()->setCurrentRow(0);
     QTest::mouseClick(window.playlistView()->playButton(), Qt::LeftButton);
     QVERIFY(window.playlistPlayback()->context().has_value());
@@ -829,6 +830,18 @@ void TestMetadataReview::previewNeverCreatesPlaylistContextOrAutoplays()
         QVERIFY(!button->isEnabled());
     QTest::keyClick(&window, Qt::Key_Return);
     QVERIFY(!window.lyricsVisible());
+    // Nor can Enter in the home screen's search box or playlist replace it.
+    QTreeView* results = window.libraryView()->resultsList();
+    QVERIFY(results->model()->rowCount() > 0);
+    results->setCurrentIndex(results->model()->index(0, 0));
+    QTest::keyClick(window.libraryView()->searchBox(), Qt::Key_Return);
+    window.playlistView()->itemList()->setCurrentRow(0);
+    QTest::keyClick(window.playlistView()->itemList(), Qt::Key_Return);
+    QVERIFY(window.isPreviewing());
+    QVERIFY(!window.lyricsVisible());
+    QVERIFY(!window.playlistPlayback()->context());
+    QVERIFY(QFileInfo(player.song().mp3Path).canonicalFilePath()
+            == QFileInfo(otherMp3).canonicalFilePath());
     QTest::mouseClick(dialog->stopPreviewButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Stopped);
     QVERIFY(!window.isPreviewing());

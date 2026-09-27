@@ -2,6 +2,7 @@
 
 #include "Logging.h"
 #include "LibraryController.h"
+#include "LibraryResultsModel.h"
 #include "LibraryView.h"
 #include "MetadataReviewDialog.h"
 #include "LyricsView.h"
@@ -9,21 +10,36 @@
 #include "SongPair.h"
 #include "playlist/PlaylistPlayback.h"
 #include "playlist/PlaylistStore.h"
+#include "AppPreferences.h"
+#include "SettingsDialog.h"
+#include "ui/Controls.h"
+#include "ui/Shortcuts.h"
+#include "ui/ElidedLabel.h"
+#include "ui/Theme.h"
 
+#include <QAbstractButton>
 #include <QApplication>
+#include <QElapsedTimer>
 #include <QCloseEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontDatabase>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QAction>
+#include <QComboBox>
+#include <QListWidget>
+#include <QTreeView>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
-#include <QShortcut>
+#include <QSplitter>
 #include <QStandardPaths>
 #include <QStackedWidget>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
@@ -34,40 +50,37 @@ QString formatTime(qint64 ms)
     return QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0'));
 }
 
-QPushButton* makeButton(const QString& text, QWidget* parent)
+QPushButton* makeButton(const QString& text, QWidget* parent,
+                        const QString& objectName = {})
 {
     auto* button = new QPushButton(text, parent);
     button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumSize(115, 80);
-    QFont font = button->font();
-    font.setPointSize(22);
-    font.setBold(true);
-    button->setFont(font);
+    if (!objectName.isEmpty())
+        button->setObjectName(objectName);
     return button;
 }
 
-QPushButton* makeSettingButton(const QString& text, QWidget* parent, int minimumWidth = 100)
-{
-    auto* button = new QPushButton(text, parent);
-    button->setFocusPolicy(Qt::NoFocus);
-    button->setMinimumSize(minimumWidth, 64);
-    QFont font = button->font();
-    font.setPointSize(24);
-    font.setBold(true);
-    button->setFont(font);
-    return button;
-}
-
-QLabel* makeSettingLabel(const QString& text, QWidget* parent)
+QLabel* makeLabel(const QString& text, QWidget* parent, const QString& objectName)
 {
     auto* label = new QLabel(text, parent);
-    label->setAlignment(Qt::AlignCenter);
-    label->setMinimumWidth(110);
-    QFont font = label->font();
-    font.setPointSize(26);
-    font.setBold(true);
-    label->setFont(font);
+    label->setObjectName(objectName);
     return label;
+}
+
+QLabel* makeElidedLabel(QWidget* parent, const QString& objectName)
+{
+    auto* label = new ElidedLabel(parent);
+    label->setObjectName(objectName);
+    return label;
+}
+
+QFrame* makeSeparator(QWidget* parent)
+{
+    auto* line = new QFrame(parent);
+    line->setObjectName(QStringLiteral("barSeparator"));
+    line->setFixedWidth(1);
+    theme::setMinimumHeight(line, 22);
+    return line;
 }
 
 bool isEnterKey(const QKeyEvent* event)
@@ -79,8 +92,11 @@ bool isEnterKey(const QKeyEvent* event)
 
 MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
                        LibraryController* libraryController,
-                       PlaylistStore* playlistStore, QWidget* parent)
+                       PlaylistStore* playlistStore, AppPreferences* preferences,
+                       QWidget* parent)
     : QWidget(parent)
+    , m_ownPreferences(preferences ? nullptr : std::make_unique<AppPreferences>())
+    , m_preferences(preferences ? preferences : m_ownPreferences.get())
     , m_player(player)
     , m_settingsStore(settingsStore)
     , m_libraryController(libraryController)
@@ -93,124 +109,62 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
 
     setFocusPolicy(Qt::StrongFocus);
     m_pages = new QStackedWidget(this);
-    m_controls = new QWidget(m_pages);
+    m_home = new QWidget(m_pages);
+    m_home->setObjectName(QStringLiteral("home"));
     m_lyrics = new LyricsView(m_pages);
-    m_pages->addWidget(m_controls);
+    m_pages->addWidget(m_home);
     m_pages->addWidget(m_lyrics);
-    if (m_libraryController) {
-        m_libraryPage = new QWidget(m_pages);
-        m_library = new LibraryView(m_libraryController, m_libraryPage);
-        m_playlistView = new PlaylistView(m_playlistStore, m_libraryController,
-                                           m_playlistPlayback, m_libraryPage);
-        auto* libraryLayout = new QHBoxLayout(m_libraryPage);
-        libraryLayout->setContentsMargins(0, 0, 0, 0);
-        libraryLayout->addWidget(m_library, 3);
-        libraryLayout->addWidget(m_playlistView, 2);
-        m_pages->addWidget(m_libraryPage);
-    }
     auto* windowLayout = new QVBoxLayout(this);
     windowLayout->setContentsMargins(0, 0, 0, 0);
     windowLayout->addWidget(m_pages);
 
-    m_songLabel = new QLabel(m_controls);
-    m_songLabel->setWordWrap(true);
-    m_songLabel->setAlignment(Qt::AlignCenter);
-    QFont songFont = m_songLabel->font();
-    songFont.setPointSize(26);
-    songFont.setBold(true);
-    m_songLabel->setFont(songFont);
+    if (m_libraryController) {
+        m_library = new LibraryView(m_libraryController, m_home);
+        m_playlistView = new PlaylistView(m_playlistStore, m_libraryController,
+                                          m_playlistPlayback, m_home);
+    }
 
-    m_statusLabel = new QLabel(m_controls);
-    m_statusLabel->setWordWrap(true);
-    m_statusLabel->setAlignment(Qt::AlignCenter);
-    QFont statusFont = m_statusLabel->font();
-    statusFont.setPointSize(22);
-    m_statusLabel->setFont(statusFont);
+    auto* homeLayout = new QVBoxLayout(m_home);
+    homeLayout->setContentsMargins(0, 0, 0, 0);
+    homeLayout->setSpacing(0);
+    homeLayout->addWidget(buildPlayerBar());
+    if (m_library) {
+        auto* searchRow = new QHBoxLayout;
+        searchRow->setContentsMargins(16, 12, 16, 12);
+        searchRow->addWidget(m_library->takeSearchBar());
+        homeLayout->addLayout(searchRow);
 
-    m_hintLabel = new QLabel(m_controls);
-    m_hintLabel->setAlignment(Qt::AlignCenter);
-    QFont hintFont = m_hintLabel->font();
-    hintFont.setPointSize(18);
-    m_hintLabel->setFont(hintFont);
-
-    m_findButton = makeButton(QStringLiteral("Find a Song"), m_controls);
-    m_playlistsButton = makeButton(QStringLiteral("Playlists"), m_controls);
-    m_openButton = makeButton(QStringLiteral("Open Song"), m_controls);
-    m_playButton = makeButton(QStringLiteral("Play"), m_controls);
-    m_pauseButton = makeButton(QStringLiteral("Pause"), m_controls);
-    m_stopButton = makeButton(QStringLiteral("Stop"), m_controls);
-
-    auto* keyTitle = makeSettingLabel(QStringLiteral("KEY"), m_controls);
-    keyTitle->setMinimumWidth(150);
-    m_keyDownButton = makeSettingButton(QStringLiteral("\u2212"), m_controls);
-    m_keyValueLabel = makeSettingLabel(QStringLiteral("0"), m_controls);
-    m_keyUpButton = makeSettingButton(QStringLiteral("+"), m_controls);
-    m_keyResetButton = makeSettingButton(QStringLiteral("Reset"), m_controls, 150);
-    auto* keyRow = new QHBoxLayout;
-    keyRow->setSpacing(12);
-    keyRow->addStretch();
-    keyRow->addWidget(keyTitle);
-    keyRow->addWidget(m_keyDownButton);
-    keyRow->addWidget(m_keyValueLabel);
-    keyRow->addWidget(m_keyUpButton);
-    keyRow->addWidget(m_keyResetButton);
-    keyRow->addStretch();
-
-    auto* tempoTitle = makeSettingLabel(QStringLiteral("TEMPO"), m_controls);
-    tempoTitle->setMinimumWidth(150);
-    m_tempoDownButton = makeSettingButton(QStringLiteral("\u2212"), m_controls);
-    m_tempoValueLabel = makeSettingLabel(QStringLiteral("100%"), m_controls);
-    m_tempoUpButton = makeSettingButton(QStringLiteral("+"), m_controls);
-    m_tempoResetButton = makeSettingButton(QStringLiteral("Reset"), m_controls, 150);
-    auto* tempoRow = new QHBoxLayout;
-    tempoRow->setSpacing(12);
-    tempoRow->addStretch();
-    tempoRow->addWidget(tempoTitle);
-    tempoRow->addWidget(m_tempoDownButton);
-    tempoRow->addWidget(m_tempoValueLabel);
-    tempoRow->addWidget(m_tempoUpButton);
-    tempoRow->addWidget(m_tempoResetButton);
-    tempoRow->addStretch();
-
-    m_exitButton = new QPushButton(QStringLiteral("Exit"), m_controls);
-    m_exitButton->setFocusPolicy(Qt::NoFocus);
-    m_exitButton->setMinimumSize(90, 44);
-    auto* exitRow = new QHBoxLayout;
-    exitRow->addStretch();
-    exitRow->addWidget(m_exitButton);
-
-    auto* buttons = new QHBoxLayout;
-    buttons->setSpacing(10);
-    buttons->addWidget(m_findButton);
-    buttons->addWidget(m_playlistsButton);
-    buttons->addWidget(m_openButton);
-    buttons->addWidget(m_playButton);
-    buttons->addWidget(m_pauseButton);
-    buttons->addWidget(m_stopButton);
-
-    auto* layout = new QVBoxLayout(m_controls);
-    layout->setContentsMargins(24, 16, 24, 16);
-    layout->setSpacing(10);
-    layout->addLayout(exitRow);
-    layout->addStretch();
-    layout->addWidget(m_songLabel);
-    layout->addWidget(m_statusLabel);
-    layout->addLayout(buttons);
-    layout->addLayout(keyRow);
-    layout->addLayout(tempoRow);
-    layout->addWidget(m_hintLabel);
-    layout->addStretch();
+        // Library and playlists side by side (about 60/40); the divider can
+        // be dragged, and each side scrolls on its own.
+        auto* workspace = new QSplitter(Qt::Horizontal, m_home);
+        workspace->setObjectName(QStringLiteral("workspace"));
+        workspace->setChildrenCollapsible(false);
+        workspace->setHandleWidth(theme::px(12));
+        theme::setMinimumWidth(m_library, 380);
+        workspace->addWidget(m_library);
+        workspace->addWidget(m_playlistView);
+        workspace->setStretchFactor(0, 3);
+        workspace->setStretchFactor(1, 2);
+        workspace->setSizes({600, 400});
+        // Enough room for several rows on each side at the smallest size.
+        theme::setMinimumHeight(workspace, 300);
+        connect(theme::notifier(), &theme::Notifier::changed, workspace, [workspace] {
+            workspace->setHandleWidth(theme::px(12));
+        });
+        auto* workspaceRow = new QHBoxLayout;
+        workspaceRow->setContentsMargins(16, 0, 16, 16);
+        workspaceRow->addWidget(workspace);
+        homeLayout->addLayout(workspaceRow, 1);
+    } else {
+        homeLayout->addStretch();
+    }
 
     connect(m_exitButton, &QPushButton::clicked, this, &QWidget::close);
-    connect(m_findButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
-    if (m_libraryController) {
-        // Maintenance only: no button on the singer's screens.
-        auto* review = new QShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M), this);
-        review->setContext(Qt::WindowShortcut);
-        connect(review, &QShortcut::activated, this, [this] { openMetadataReview(); });
-    }
-    connect(m_playlistsButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
-    connect(m_openButton, &QPushButton::clicked, this, &MainWindow::chooseSong);
+    connect(m_lyricsButton, &QPushButton::clicked, this, [this] {
+        if (songActive())
+            showLyrics();
+    });
+    connect(m_settingsButton, &QToolButton::clicked, this, [this] { openSettings(); });
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
     connect(m_pauseButton, &QPushButton::clicked, this, &MainWindow::onPause);
     connect(m_stopButton, &QPushButton::clicked, this, &MainWindow::onStop);
@@ -247,7 +201,6 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     connect(m_player, &KaraokePlayer::frameChanged, m_lyrics, &LyricsView::setFrame);
     connect(m_lyrics, &LyricsView::controlsRequested, this, &MainWindow::hideLyrics);
     if (m_library) {
-        connect(m_library, &LibraryView::backRequested, this, &MainWindow::hideLyrics);
         connect(m_library, &LibraryView::singRequested, this, &MainWindow::singLibrarySong);
         connect(m_library, &LibraryView::addRequested,
                 m_playlistView, &PlaylistView::addSong);
@@ -255,16 +208,399 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
                 m_library, &LibraryView::setPlaylistAvailable);
         connect(m_playlistView, &PlaylistView::playRequested,
                 this, &MainWindow::playPlaylistItem);
-        connect(m_playlistView, &PlaylistView::backRequested,
-                this, &MainWindow::hideLyrics);
+        // Escape in the playlist returns to the search box.
+        connect(m_playlistView, &PlaylistView::backRequested, this, [this] {
+            m_library->searchBox()->setFocus(Qt::OtherFocusReason);
+        });
         connect(m_playlistPlayback, &PlaylistPlayback::autoplayRequested,
                 this, [this](PlaylistEntry entry) { playPlaylistItem(entry, true); });
         m_library->setPlaylistAvailable(m_playlistView->displayedPlaylistId() != 0);
+        // Only the pane in use shows its selection in gold: the one last
+        // clicked, or holding the keyboard.
+        connect(qApp, &QApplication::focusChanged, this, [this](QWidget*, QWidget* now) {
+            if (now && m_home->isAncestorOf(now))
+                setPlaylistInUse(m_playlistView->isAncestorOf(now));
+        });
+        m_library->resultsList()->viewport()->installEventFilter(this);
+        m_playlistView->itemList()->viewport()->installEventFilter(this);
+        connect(m_playlistView, &PlaylistView::interacted, this, [this] { setPlaylistInUse(true); });
+        connect(m_library, &LibraryView::interacted, this, [this] { setPlaylistInUse(false); });
+        // Now Playing follows name corrections for the song loaded.
+        const auto retitle = [this] {
+            m_titlePath.clear();
+            m_titleSongId = -1;
+            updateControls();
+        };
+        connect(m_libraryController, &LibraryController::catalogueChanged, this, retitle);
+        connect(m_libraryController, &LibraryController::libraryReady, this, retitle);
+        // Enter is decided here first (see eventFilter).
+        m_library->searchBox()->installEventFilter(this);
+        m_playlistView->itemList()->installEventFilter(this);
+        if (m_libraryController->hasActiveRoot())
+            m_library->refreshSearch();
     }
 
     m_lyrics->setFrame(m_player->currentFrame());
     onStateChanged(m_player->state());
-    setFocus(Qt::OtherFocusReason);
+    installShortcuts();
+    // Sound: the volume always, the chosen output only if it is to be kept.
+    m_player->setVolumePercent(m_preferences->number(pref::Volume, 100));
+    if (m_preferences->flag(pref::RememberAudioOutput, true))
+        m_player->setAudioOutput(m_preferences->text(pref::AudioOutput));
+    else
+        m_preferences->reset(pref::AudioOutput);  // this session starts on the usual output
+    connect(m_preferences, &AppPreferences::changed, this, &MainWindow::applyPreference);
+    for (const QString& key : {pref::ShowLabelColumn, pref::ShowPlaysColumn, pref::ConfirmRemoveSong})
+        applyPreference(key);
+    // Everything above is stated at 100%: bring it to the interface scale.
+    theme::rescale(this);
+    focusHome();
+}
+
+QWidget* MainWindow::buildPlayerBar()
+{
+    auto* bar = new QFrame(m_home);
+    bar->setObjectName(QStringLiteral("playerBar"));
+
+    // Top row: the brand and what is playing.
+    auto* brandMark = new QLabel(bar);
+    brandMark->setObjectName(QStringLiteral("brandMark"));
+    theme::setFixedSize(brandMark, 34, 34);
+    brandMark->setAlignment(Qt::AlignCenter);
+    const auto drawBrand = [this, brandMark] {
+        brandMark->setPixmap(ui::glyphIcon(ui::Glyph::App, theme::color::accent)
+                                 .pixmap(QSize(theme::px(22), theme::px(22)), devicePixelRatioF()));
+    };
+    drawBrand();
+    connect(theme::notifier(), &theme::Notifier::changed, brandMark, drawBrand);
+    auto* appTitle = makeLabel(QStringLiteral("Frankie's Karaoke Studio"), bar,
+                               QStringLiteral("appTitle"));
+    auto* nowPlaying = new QFrame(bar);
+    nowPlaying->setObjectName(QStringLiteral("nowPlaying"));
+    auto* nowCaption = makeLabel(QStringLiteral("NOW PLAYING:"), nowPlaying,
+                                 QStringLiteral("nowPlayingCaption"));
+    // Long names are shortened with "..." rather than widening the window.
+    m_songLabel = makeElidedLabel(nowPlaying, QStringLiteral("nowPlayingSong"));
+    m_statusLabel = makeElidedLabel(nowPlaying, QStringLiteral("playerStatus"));
+    m_statusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    auto* nowLayout = new QHBoxLayout(nowPlaying);
+    nowLayout->setContentsMargins(14, 7, 14, 7);
+    nowLayout->setSpacing(8);
+    nowLayout->addWidget(nowCaption);
+    nowLayout->addWidget(m_songLabel, 3);
+    nowLayout->addWidget(m_statusLabel, 2);
+
+    auto* topRow = new QHBoxLayout;
+    topRow->setSpacing(10);
+    topRow->addWidget(brandMark);
+    topRow->addWidget(appTitle);
+    theme::addSpacing(topRow, 12);
+    topRow->addWidget(nowPlaying, 1);
+    theme::addSpacing(topRow, 4);
+
+    // Bottom row: transport, Autoplay, Key and Tempo, then page buttons.
+    // Play and Pause share one place: only the one that applies is shown.
+    m_playButton = new ui::IconButton(ui::Glyph::Play, QStringLiteral("Play"), bar);
+    m_playButton->setObjectName(QStringLiteral("playPauseButton"));
+    m_playButton->setIcon(ui::glyphIcon(ui::Glyph::Play, theme::color::onAccent));
+    m_pauseButton = new ui::IconButton(ui::Glyph::Pause, QStringLiteral("Pause"), bar);
+    m_pauseButton->setObjectName(QStringLiteral("playPauseButton"));
+    m_pauseButton->setIcon(ui::glyphIcon(ui::Glyph::Pause, theme::color::onAccent));
+    m_stopButton = new ui::IconButton(ui::Glyph::Stop, QStringLiteral("Stop"), bar);
+    m_stopButton->setObjectName(QStringLiteral("transportButton"));
+    for (QPushButton* button : {m_playButton, m_pauseButton, m_stopButton})
+        theme::setFixedSize(button, 48, 38);
+
+    const auto makeStepper = [bar](const QString& title, QPushButton*& down, QLabel*& value,
+                                   QPushButton*& up, QPushButton*& reset) {
+        auto* row = new QHBoxLayout;
+        row->setSpacing(6);
+        row->addWidget(makeLabel(title, bar, QStringLiteral("controlCaption")));
+        down = makeButton(QStringLiteral("\u2212"), bar, QStringLiteral("stepButton"));
+        value = makeLabel(QString(), bar, QStringLiteral("settingValue"));
+        value->setAlignment(Qt::AlignCenter);
+        QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        mono.setBold(true);
+        value->setFont(mono);
+        theme::setFontPixelSize(value, 14);
+        up = makeButton(QStringLiteral("+"), bar, QStringLiteral("stepButton"));
+        reset = makeButton(QStringLiteral("Reset"), bar, QStringLiteral("linkButton"));
+        row->addWidget(down);
+        row->addWidget(value);
+        row->addWidget(up);
+        row->addWidget(reset);
+        return row;
+    };
+    QHBoxLayout* keyRow = makeStepper(QStringLiteral("Key:"), m_keyDownButton, m_keyValueLabel,
+                                      m_keyUpButton, m_keyResetButton);
+    m_keyValueLabel->setText(QStringLiteral("0"));
+    QHBoxLayout* tempoRow = makeStepper(QStringLiteral("Tempo:"), m_tempoDownButton,
+                                        m_tempoValueLabel, m_tempoUpButton, m_tempoResetButton);
+    m_tempoValueLabel->setText(QStringLiteral("100%"));
+
+    m_lyricsButton = makeButton(QStringLiteral("Lyrics"), bar, QStringLiteral("ghostButton"));
+    m_lyricsButton->setIcon(ui::glyphIcon(ui::Glyph::Lyrics, theme::color::text));
+    m_lyricsButton->setToolTip(QStringLiteral("Back to the lyrics (Enter)"));
+    m_settingsButton = new QToolButton(bar);
+    m_settingsButton->setObjectName(QStringLiteral("settingsButton"));
+    m_settingsButton->setFocusPolicy(Qt::NoFocus);
+    m_settingsButton->setText(QStringLiteral("Settings"));
+    m_settingsButton->setIcon(ui::glyphIcon(ui::Glyph::Gear, theme::color::text));
+    theme::setIconSize(m_settingsButton, 18);
+    m_settingsButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    m_settingsButton->setToolTip(QStringLiteral("Settings"));
+    m_exitButton = makeButton(QStringLiteral("Exit"), bar, QStringLiteral("ghostButton"));
+
+    const auto separator = [bar](QHBoxLayout* row) {
+        theme::addSpacing(row, 10);
+        row->addWidget(makeSeparator(bar));
+        theme::addSpacing(row, 10);
+    };
+    auto* controlRow = new QHBoxLayout;
+    controlRow->setSpacing(6);
+    controlRow->addWidget(m_playButton);
+    controlRow->addWidget(m_pauseButton);
+    controlRow->addWidget(m_stopButton);
+    if (m_playlistView) {
+        separator(controlRow);
+        controlRow->addWidget(makeLabel(QStringLiteral("Autoplay"), bar,
+                                        QStringLiteral("controlCaption")));
+        controlRow->addWidget(m_playlistView->takeAutoplayButton());
+    }
+    separator(controlRow);
+    controlRow->addLayout(keyRow);
+    separator(controlRow);
+    controlRow->addLayout(tempoRow);
+    controlRow->addStretch();
+    // Lyrics, Settings and Exit sit at the top right, beside Now Playing.
+    topRow->addWidget(m_lyricsButton);
+    topRow->addWidget(m_settingsButton);
+    topRow->addWidget(m_exitButton);
+
+    auto* layout = new QVBoxLayout(bar);
+    layout->setContentsMargins(18, 12, 18, 12);
+    layout->setSpacing(12);
+    layout->addLayout(topRow);
+    layout->addLayout(controlRow);
+    return bar;
+}
+
+void MainWindow::installShortcuts()
+{
+    // Each action goes through the same button or slot as the mouse, so a
+    // disabled button (no song, no selection, a preview) does nothing here
+    // either. Letters and Space typed into a text box always go to the box.
+    const QHash<QString, QKeySequence> keys = shortcuts::effective(*m_preferences);
+    for (const shortcuts::Action& definition : shortcuts::actions()) {
+        auto* action = new QAction(definition.title, this);
+        action->setObjectName(definition.id);
+        action->setShortcutContext(Qt::WindowShortcut);
+        action->setShortcut(keys.value(definition.id));
+        const QString id = definition.id;
+        connect(action, &QAction::triggered, this, [this, id] { runAction(id); });
+        addAction(action);
+        m_actions.insert(id, action);
+    }
+}
+
+void MainWindow::runAction(const QString& id)
+{
+    if (QApplication::activeModalWidget())
+        return;
+    // While the lyrics are up only the song itself can be controlled (play,
+    // pause, stop, Key, Tempo, lyrics) or the program left: nothing on the
+    // hidden home screen is acted on.
+    const bool songControl = id.startsWith(QLatin1String("playback."))
+        || id.startsWith(QLatin1String("key.")) || id.startsWith(QLatin1String("tempo."));
+    if (lyricsVisible() && !songControl && id != QLatin1String("app.exit"))
+        return;
+    // A maintenance preview is never replaced from the keyboard.
+    if (m_previewing
+        && (id == QLatin1String("library.sing") || id == QLatin1String("playlist.play")
+            || id == QLatin1String("playback.restart") || id == QLatin1String("app.openFile")))
+        return;
+    const auto press = [](QAbstractButton* button) {
+        if (button && button->isEnabled())
+            button->click();
+    };
+    const auto sortBy = [this](LibrarySort sort) {
+        if (m_library && m_library->sortBox()->isEnabled())
+            m_library->sortBox()->setCurrentIndex(m_library->sortBox()->findData(int(sort)));
+    };
+    if (id == QLatin1String("playback.playPause"))
+        press(m_player->state() == KaraokePlayer::State::Playing ? m_pauseButton : m_playButton);
+    else if (id == QLatin1String("playback.stop"))
+        press(m_stopButton);
+    else if (id == QLatin1String("playback.restart")) {
+        // From the beginning, as Stop then Play would (not for a preview).
+        if (m_player->hasSong() && !m_previewing) {
+            m_player->stop();
+            onPlay();
+        }
+    } else if (id == QLatin1String("playback.autoplay"))
+        press(m_playlistView ? m_playlistView->autoplayButton() : nullptr);
+    else if (id == QLatin1String("playback.lyrics"))
+        press(m_lyricsButton);
+    else if (id == QLatin1String("key.down"))
+        press(m_keyDownButton);
+    else if (id == QLatin1String("key.up"))
+        press(m_keyUpButton);
+    else if (id == QLatin1String("key.reset"))
+        press(m_keyResetButton);
+    else if (id == QLatin1String("tempo.down"))
+        press(m_tempoDownButton);
+    else if (id == QLatin1String("tempo.up"))
+        press(m_tempoUpButton);
+    else if (id == QLatin1String("tempo.reset"))
+        press(m_tempoResetButton);
+    else if (!m_library && !id.startsWith(QLatin1String("app.")))
+        return;
+    else if (id == QLatin1String("library.focusSearch")) {
+        if (lyricsVisible())
+            return;
+        setPlaylistInUse(false);
+        m_library->searchBox()->setFocus(Qt::ShortcutFocusReason);
+        m_library->searchBox()->selectAll();
+    } else if (id == QLatin1String("library.clearSearch"))
+        m_library->searchBox()->clear();
+    else if (id == QLatin1String("library.sing"))
+        press(m_library->singButton());
+    else if (id == QLatin1String("library.add"))
+        press(m_library->addToPlaylistButton());
+    else if (id == QLatin1String("library.sort.artistAsc"))
+        sortBy(LibrarySort::ArtistAsc);
+    else if (id == QLatin1String("library.sort.artistDesc"))
+        sortBy(LibrarySort::ArtistDesc);
+    else if (id == QLatin1String("library.sort.titleAsc"))
+        sortBy(LibrarySort::TitleAsc);
+    else if (id == QLatin1String("library.sort.titleDesc"))
+        sortBy(LibrarySort::TitleDesc);
+    else if (id == QLatin1String("library.sort.mostPlayed"))
+        sortBy(LibrarySort::MostPlayed);
+    else if (id == QLatin1String("library.sort.recentlyPlayed"))
+        sortBy(LibrarySort::RecentlyPlayed);
+    else if (id == QLatin1String("library.sort.labelAsc"))
+        sortBy(LibrarySort::LabelAsc);
+    else if (id == QLatin1String("playlist.play"))
+        press(m_playlistView->playButton());
+    else if (id == QLatin1String("playlist.moveUp"))
+        press(m_playlistView->moveUpButton());
+    else if (id == QLatin1String("playlist.moveDown"))
+        press(m_playlistView->moveDownButton());
+    else if (id == QLatin1String("playlist.remove"))
+        press(m_playlistView->removeButton());
+    else if (id == QLatin1String("playlist.new"))
+        press(m_playlistView->newButton());
+    else if (id == QLatin1String("playlist.rename"))
+        press(m_playlistView->renameButton());
+    else if (id == QLatin1String("playlist.delete"))
+        press(m_playlistView->deleteButton());
+    else if (id == QLatin1String("playlist.next"))
+        m_playlistView->showAdjacentPlaylist(1);
+    else if (id == QLatin1String("playlist.previous"))
+        m_playlistView->showAdjacentPlaylist(-1);
+    else if (id == QLatin1String("app.settings"))
+        openSettings();
+    else if (id == QLatin1String("app.review"))
+        openMetadataReview();
+    else if (id == QLatin1String("app.openFile"))
+        chooseSong();
+    else if (id == QLatin1String("app.changeFolder")) {
+        if (m_library)
+            m_library->chooseFolder();
+    } else if (id == QLatin1String("app.rescan")) {
+        if (m_libraryController)
+            m_libraryController->requestRefreshScan();
+    } else if (id == QLatin1String("app.exit"))
+        close();
+}
+
+void MainWindow::applyPreference(const QString& key)
+{
+    if (key.startsWith(pref::ShortcutPrefix)) {
+        // One change can free or take another action's keys: redo them all.
+        const QHash<QString, QKeySequence> keys = shortcuts::effective(*m_preferences);
+        for (auto it = m_actions.cbegin(); it != m_actions.cend(); ++it)
+            it.value()->setShortcut(keys.value(it.key()));
+    } else if (key == pref::ShowLabelColumn && m_library) {
+        m_library->setColumnVisible(LibraryResultsModel::LabelColumn,
+                                    m_preferences->flag(key, true));
+    } else if (key == pref::ShowPlaysColumn && m_library) {
+        m_library->setColumnVisible(LibraryResultsModel::PlaysColumn,
+                                    m_preferences->flag(key, true));
+    } else if (key == pref::ConfirmRemoveSong && m_playlistView) {
+        m_playlistView->setConfirmRemove(m_preferences->flag(key, true));
+    } else if (key == pref::Volume) {
+        m_player->setVolumePercent(m_preferences->number(key, 100));
+    } else if (key == pref::AudioOutput) {
+        m_player->setAudioOutput(m_preferences->text(key));
+    } else if (key == pref::KeepDisplayAwake) {
+        applyDisplaySleep();
+    } else if (key == pref::ScalePercent) {
+        theme::setScalePercent(m_preferences->number(key, 100));
+    } else if (key == pref::CompactRows) {
+        theme::setCompactRows(m_preferences->flag(key, false));
+    } else if (key == pref::AlternateRows) {
+        theme::setAlternateRows(m_preferences->flag(key, true));
+    }
+}
+
+void MainWindow::applyDisplaySleep()
+{
+    m_displaySleepBlocker.setActive(m_player->state() == KaraokePlayer::State::Playing
+                                    && m_preferences->flag(pref::KeepDisplayAwake, true));
+}
+
+SettingsDialog* MainWindow::openSettings()
+{
+    if (!m_settings) {
+        SettingsDialog::Context context;
+        context.preferences = m_preferences;
+        context.libraryController = m_libraryController;
+        context.libraryView = m_library;
+        context.playlistStore = m_playlistStore;
+        context.songSettings = m_settingsStore;
+        context.player = m_player;
+        context.dataLocations = m_dataLocations;
+        context.openSongFile = [this] { chooseSong(); };
+        context.openNeedsReview = [this] { openMetadataReview(); };
+        m_settings = new SettingsDialog(context, this);
+        m_settings->setAttribute(Qt::WA_DeleteOnClose);
+        connect(m_settings, &QDialog::finished, this, &MainWindow::restoreFocus);
+    }
+    QElapsedTimer timer;
+    timer.start();
+    // Modal, but a window of its own rather than a macOS sheet (whose
+    // slide-in animation made Settings feel slow to open).
+    m_settings->setWindowModality(Qt::ApplicationModal);
+    m_settings->show();
+    m_settings->raise();
+    m_settings->activateWindow();
+    qCInfo(lcTiming).noquote() << "Settings: show" << timer.nsecsElapsed() / 1000000.0 << "ms";
+    return m_settings;
+}
+
+bool MainWindow::songActive() const
+{
+    const auto state = m_player->state();
+    return !m_previewing
+        && (state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused);
+}
+
+void MainWindow::restoreFocus()
+{
+    if (lyricsVisible())
+        setFocus(Qt::OtherFocusReason);
+    else
+        focusHome();
+}
+
+void MainWindow::focusHome()
+{
+    if (m_library && m_library->searchBox()->isEnabled())
+        m_library->searchBox()->setFocus(Qt::OtherFocusReason);
+    else
+        setFocus(Qt::OtherFocusReason);
 }
 
 MainWindow::~MainWindow() = default;
@@ -276,23 +612,58 @@ bool MainWindow::lyricsVisible() const
 
 bool MainWindow::libraryVisible() const
 {
-    return m_libraryPage && m_pages->currentWidget() == m_libraryPage;
+    return m_library && m_pages->currentWidget() == m_home;
+}
+
+void MainWindow::setPlaylistInUse(bool playlist)
+{
+    m_playlistView->setActive(playlist);
+    m_library->setActive(!playlist);
+    // The gold pane is always the one the keyboard acts on: Up/Down and Enter
+    // go to the playlist list or to the library's search box. (Buttons never
+    // take the keyboard themselves.)
+    QWidget* keyboard = playlist ? static_cast<QWidget*>(m_playlistView->itemList())
+                                 : static_cast<QWidget*>(m_library->searchBox());
+    if (!lyricsVisible() && keyboard->isEnabled() && focusWidget() != keyboard)
+        keyboard->setFocus(Qt::MouseFocusReason);
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event->type() == QEvent::MouseButtonPress && m_library) {
+        if (watched == m_playlistView->itemList()->viewport())
+            setPlaylistInUse(true);
+        else if (watched == m_library->resultsList()->viewport()
+                 || watched == m_library->searchBox())
+            setPlaylistInUse(false);
+    }
+    if (event->type() == QEvent::KeyPress && isEnterKey(static_cast<QKeyEvent*>(event))) {
+        // A maintenance preview is never replaced from the keyboard.
+        if (m_previewing)
+            return true;
+        // While a song is on, Enter in the search box or the playlist only
+        // ever returns to its lyrics; it never starts another song.
+        if (songActive()) {
+            showLyrics();
+            return true;
+        }
+        // With nothing searched for and no song chosen, Enter does not pick
+        // the first song of the whole library.
+        if (m_library && watched == m_library->searchBox()
+            && m_library->searchBox()->text().trimmed().isEmpty()
+            && m_library->selectedSongId() == 0)
+            return true;
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event)
 {
     if (!QApplication::activeModalWidget()) {
-        if (libraryVisible()) {
-            event->ignore();
-            return;
-        } else if (lyricsVisible() && event->key() == Qt::Key_Escape) {
+        if (lyricsVisible() && event->key() == Qt::Key_Escape)
             hideLyrics();
-        } else if (!lyricsVisible() && isEnterKey(event)) {
-            const auto state = m_player->state();
-            if (!m_previewing
-                && (state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused))
-                showLyrics();
-        }
+        else if (!lyricsVisible() && isEnterKey(event) && songActive())
+            showLyrics();
     }
     // No other key, including Space, performs an action.
     event->accept();
@@ -300,6 +671,31 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    if (m_preferences->flag(pref::ConfirmExit, false) && !m_exitConfirmed
+        && !(m_exitConfirmation && m_exitConfirmation())) {
+        event->ignore();
+        if (m_exitConfirmation)
+            return;  // declined
+        // Non-blocking, so playback is never run from a nested event loop.
+        auto* box = new QMessageBox(QMessageBox::Question, QStringLiteral("Exit"),
+                                    QStringLiteral("Exit Frankie's Karaoke Studio?"),
+                                    QMessageBox::Yes | QMessageBox::No, this);
+        box->setDefaultButton(QMessageBox::No);
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        connect(box, &QMessageBox::finished, this, [this](int result) {
+            if (result == QMessageBox::Yes) {
+                m_exitConfirmed = true;
+                close();
+            } else {
+                restoreFocus();
+            }
+        });
+        box->open();
+        return;
+    }
+    m_exitConfirmed = false;
+    if (m_preferences->flag(pref::RememberWindow, true))
+        m_preferences->setText(pref::WindowGeometry, QString::fromLatin1(saveGeometry().toBase64()));
     m_playlistPlayback->cancelPendingAutoplay();
     m_player->stop();
     event->accept();
@@ -309,10 +705,13 @@ void MainWindow::changeEvent(QEvent* event)
 {
     QWidget::changeEvent(event);
     if (event->type() == QEvent::ActivationChange && isActiveWindow()) {
-        if (libraryVisible())
-            m_library->searchBox()->setFocus(Qt::OtherFocusReason);
-        else if (QApplication::focusWidget() != this)
-            setFocus(Qt::OtherFocusReason);
+        QWidget* focused = QApplication::focusWidget();
+        if (lyricsVisible()) {
+            if (focused != this)
+                setFocus(Qt::OtherFocusReason);
+        } else if (!focused || focused == this || !m_home->isAncestorOf(focused)) {
+            focusHome();
+        }
     }
 }
 
@@ -336,6 +735,7 @@ MetadataReviewDialog* MainWindow::openMetadataReview()
             if (m_previewing)
                 m_review->showPreviewFrame(frame);
         });
+        theme::rescale(m_review);
     }
     m_review->refresh();
     m_review->show();
@@ -400,16 +800,6 @@ void MainWindow::setPreviewing(bool previewing)
         m_review->showPreviewFrame(m_player->currentFrame());
 }
 
-void MainWindow::showLibrary()
-{
-    if (!m_library)
-        return;
-    m_pages->setCurrentWidget(m_libraryPage);
-    m_library->activate();
-    if (m_playlistView)
-        m_playlistView->activate();
-}
-
 void MainWindow::singLibrarySong(qint64 songId)
 {
     m_playlistPlayback->cancelPendingAutoplay();
@@ -429,10 +819,14 @@ void MainWindow::singLibrarySong(qint64 songId)
         m_libraryController->requestRefreshScan();
         return;
     }
-    if (loadSong(paths.mp3Path)) {
-        m_playSongId = songId;
-        m_playlistPlayback->clear();
-    }
+    if (!loadSong(paths.mp3Path))
+        return;
+    m_playSongId = songId;
+    m_playlistPlayback->clear();
+    updateControls();
+    // Singing a library song starts it straight away (and shows its lyrics),
+    // just like Play.
+    m_player->play();
 }
 
 void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
@@ -480,6 +874,7 @@ void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
         return;
     }
     m_playSongId = resolution.songId;
+    updateControls();
     m_playlistPlayback->startedFromPlaylist(entry.playlistId, entry.itemId);
     m_player->play();
 }
@@ -495,7 +890,7 @@ void MainWindow::chooseSong()
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("Open Song"), startDir,
         QStringLiteral("Karaoke songs (*.mp3 *.cdg *.MP3 *.CDG)"));
-    setFocus(Qt::OtherFocusReason);
+    restoreFocus();
     if (path.isEmpty())
         return;  // Cancelled: whatever was playing carries on.
 
@@ -511,6 +906,7 @@ bool MainWindow::openSong(const QString& path)
     if (m_libraryController)
         m_playSongId = m_libraryController->songIdForMp3File(m_player->song().mp3Path);
     m_playlistPlayback->clear();
+    updateControls();
     return true;
 }
 
@@ -552,7 +948,13 @@ bool MainWindow::loadSong(const QString& path)
         qCWarning(lcUi) << "Song settings cannot be saved because its files could not be fingerprinted";
         m_identityWarningLogged = true;
     }
-    const SongSettings settings = m_settingsStore->settingsFor(m_songIdentity).clamped();
+    // A song sung before keeps its own Key/Tempo; any other starts from the
+    // defaults chosen in Settings (normally 0 and 100%).
+    const SongSettings settings = (!m_songIdentity.isEmpty()
+                                   && m_settingsStore->hasSettingsFor(m_songIdentity)
+        ? m_settingsStore->settingsFor(m_songIdentity)
+        : SongSettings{m_preferences->number(pref::DefaultKey, 0),
+                       m_preferences->number(pref::DefaultTempo, 100)}).clamped();
     m_player->setKeySemitones(settings.keySemitones);
     m_player->setTempoPercent(settings.tempoPercent);
     updateControls();
@@ -614,6 +1016,11 @@ void MainWindow::showLyrics()
 {
     if (m_previewing)
         return;  // a preview's lyrics stay in the maintenance screen
+    // Coming back from the lyrics returns the keyboard to where it was.
+    if (!lyricsVisible()) {
+        QWidget* focused = focusWidget();
+        m_homeFocus = focused && m_home->isAncestorOf(focused) ? focused : nullptr;
+    }
     m_lyrics->setFrame(m_player->currentFrame());
     // Re-entering fullscreen after the user leaves it is the one intentional
     // window-state change: Play/Enter must always fill the screen.
@@ -625,8 +1032,16 @@ void MainWindow::showLyrics()
 
 void MainWindow::hideLyrics()
 {
-    m_pages->setCurrentWidget(m_controls);
-    setFocus(Qt::OtherFocusReason);
+    const bool fromLyrics = lyricsVisible();
+    m_pages->setCurrentWidget(m_home);
+    QWidget* focused = focusWidget();
+    if (fromLyrics && m_homeFocus && m_homeFocus->isVisible() && m_homeFocus->isEnabled())
+        m_homeFocus->setFocus(Qt::OtherFocusReason);
+    else if (fromLyrics || !focused || focused == this || !m_home->isAncestorOf(focused))
+        focusHome();  // (already on the home screen: the keyboard stays put)
+    // Back on the home screen: notice a music drive connected meanwhile.
+    if (fromLyrics && m_libraryController)
+        m_libraryController->recheckRoot();
 }
 
 void MainWindow::onStateChanged(KaraokePlayer::State state)
@@ -646,15 +1061,21 @@ void MainWindow::onStateChanged(KaraokePlayer::State state)
             state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused);
     }
     m_errorText.clear();
-    m_displaySleepBlocker.setActive(state == KaraokePlayer::State::Playing);
+    applyDisplaySleep();
     switch (state) {
     case KaraokePlayer::State::Playing:
         // A preview's lyrics stay in the maintenance screen.
         if (!m_previewing)
             showLyrics();
         break;
-    case KaraokePlayer::State::Stopped:
     case KaraokePlayer::State::Finished:
+        setPreviewing(false);
+        // The lyrics may stay up at the end of a song (Settings); Autoplay
+        // still moves on to the next playlist song.
+        if (m_preferences->flag(pref::ReturnHomeAtEnd, true))
+            hideLyrics();
+        break;
+    case KaraokePlayer::State::Stopped:
     case KaraokePlayer::State::Error:
     case KaraokePlayer::State::Empty:
         setPreviewing(false);
@@ -682,13 +1103,31 @@ void MainWindow::showError(const QString& message)
     auto* box = new QMessageBox(QMessageBox::Warning, QStringLiteral("Frankie's Karaoke Studio"),
                                 message, QMessageBox::Ok, this);
     box->setAttribute(Qt::WA_DeleteOnClose);
-    connect(box, &QDialog::finished, this, [this] { setFocus(Qt::OtherFocusReason); });
+    connect(box, &QDialog::finished, this, &MainWindow::restoreFocus);
     box->open();
 }
 
 QString MainWindow::statusText() const
 {
     return m_statusLabel->text();
+}
+
+QString MainWindow::songTitle()
+{
+    const QString path = m_player->song().mp3Path;
+    if (path != m_titlePath || m_playSongId != m_titleSongId) {
+        m_titlePath = path;
+        m_titleSongId = m_playSongId;
+        m_title = m_player->song().displayName();
+        const auto song = m_libraryController && m_playSongId != 0
+            ? m_libraryController->songRef(m_playSongId) : std::nullopt;
+        if (song && !song->title.trimmed().isEmpty()) {
+            const QString artist = song->artist.trimmed();
+            m_title = artist.isEmpty() ? song->title.trimmed()
+                                       : artist + QStringLiteral(" \u2013 ") + song->title.trimmed();
+        }
+    }
+    return m_title;
 }
 
 QString MainWindow::songText() const
@@ -702,7 +1141,7 @@ void MainWindow::updateControls()
     const State state = m_player->state();
     const bool hasSong = m_player->hasSong();
 
-    m_songLabel->setText(hasSong ? m_player->song().displayName() : QStringLiteral("No song loaded"));
+    m_songLabel->setText(hasSong ? songTitle() : QStringLiteral("No song loaded"));
 
     const QString time = formatTime(m_player->positionMs());
     const QString total = m_player->durationMs() > 0
@@ -710,21 +1149,19 @@ void MainWindow::updateControls()
         : QString();
 
     QString status;
-    QString hint;
     switch (state) {
     case State::Empty:
-        status = QStringLiteral("Press Open Song to choose a song.");
+        status = m_library ? QStringLiteral("Choose a song from the library or a playlist.")
+                           : QStringLiteral("Open a song file from Settings.");
         break;
     case State::Ready:
         status = QStringLiteral("Ready. Press Play to start.");
         break;
     case State::Playing:
         status = QStringLiteral("Playing  %1%2").arg(time, total);
-        hint = QStringLiteral("Press Enter to show the lyrics.");
         break;
     case State::Paused:
         status = QStringLiteral("Paused at %1. Press Resume to carry on.").arg(time);
-        hint = QStringLiteral("Press Enter to show the lyrics.");
         break;
     case State::Stopped:
         status = QStringLiteral("Stopped. Press Play to start from the beginning.");
@@ -742,13 +1179,20 @@ void MainWindow::updateControls()
     m_statusLabel->setText(status);
     m_statusLabel->setStyleSheet(m_errorText.isEmpty() && state != State::Error
                                      ? QString()
-                                     : QStringLiteral("color: #b00020;"));
-    m_hintLabel->setText(hint);
+                                     : theme::dangerStyle());
 
     m_playButton->setText(state == State::Paused ? QStringLiteral("Resume") : QStringLiteral("Play"));
+    m_playButton->setToolTip(m_playButton->text());
     m_playButton->setEnabled(hasSong && state != State::Playing);
     m_pauseButton->setEnabled(state == State::Playing);
+    // Play and Pause share one place in the player bar.
+    m_pauseButton->setVisible(state == State::Playing);
+    m_playButton->setVisible(state != State::Playing);
     m_stopButton->setEnabled(state == State::Playing || state == State::Paused);
+    m_lyricsButton->setEnabled(songActive());
+    // The library marks the version being sung (not a maintenance preview).
+    if (m_library)
+        m_library->setPlayingSongId(songActive() ? m_playSongId : 0);
 
     const int key = hasSong ? m_player->keySemitones() : 0;
     const int tempo = hasSong ? m_player->tempoPercent() : 100;

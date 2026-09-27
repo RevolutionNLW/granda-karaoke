@@ -9,6 +9,7 @@
 #include "TestMedia.h"
 #include "playlist/PlaylistPlayback.h"
 #include "playlist/PlaylistStore.h"
+#include "ui/Theme.h"
 
 #include <QComboBox>
 #include <QDir>
@@ -26,7 +27,10 @@
 #include <QScrollBar>
 #include <QSignalSpy>
 #include <QSqlQuery>
+#include <QHeaderView>
+#include <QTabBar>
 #include <QTemporaryDir>
+#include <QTreeView>
 #include <QtTest>
 
 #include <utility>
@@ -145,6 +149,12 @@ bool sameFile(const QString& first, const QString& second)
     return QFileInfo(first).canonicalFilePath() == QFileInfo(second).canonicalFilePath();
 }
 
+void setLibraryInUse(LibraryView* library)
+{
+    QTest::mouseClick(library->searchBox(), Qt::LeftButton);
+    QVERIFY(library->isActive());
+}
+
 int libraryRowForSongId(const LibraryView* view, qint64 songId)
 {
     const QAbstractItemModel* model = view->resultsList()->model();
@@ -241,6 +251,9 @@ private slots:
     void rejectedLoadsKeepPlayingContextAndAutoplaySuccessor();
     void resolvedPlaybackIgnoresSongIdCacheWriteFailure();
     void keyboardSelectionAndEscapeKeepPlayback();
+    void homeScreenEnterNeverChangesTheSong();
+    void presentationFollowsPaneInUseAndPlayback();
+    void onlyThePaneInUsePaintsItsSelectionGold();
     void playbackMarkerTracksActualState();
     void movingPastViewportKeepsSelectionFullyVisible();
     void stopAndBusErrorNeverAutoplayWithSuccessors();
@@ -276,7 +289,6 @@ void TestPlaylistView::addAdministrationSwitchAndRestore()
         window.setShowErrorDialogs(false);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
-        QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
         PlaylistView* view = window.playlistView();
         QVERIFY(view->messageLabel()->text().contains(QStringLiteral("No playlists")));
         QVERIFY(!window.libraryView()->addToPlaylistButton()->isEnabled());
@@ -327,7 +339,6 @@ void TestPlaylistView::addAdministrationSwitchAndRestore()
     QVERIFY(playlists.setLastPlaylistId(restoredId));
     BusTestPlayer secondPlayer;
     MainWindow restored(&secondPlayer, &settings, &controller, &playlists);
-    QTest::mouseClick(restored.playlistsButton(), Qt::LeftButton);
     QCOMPARE(restored.playlistView()->displayedPlaylistId(), restoredId);
 }
 
@@ -350,7 +361,6 @@ void TestPlaylistView::removeDeclinedPreservesViewAndStore()
     window.resize(900, 420);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(20);
     view->itemList()->scrollToItem(view->itemList()->currentItem(),
@@ -408,7 +418,6 @@ void TestPlaylistView::removeConfirmsBeforeMutationAndUsesCapturedItem()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(1);
     const QList<qint64> beforeIds = itemIds(playlists, playlistId);
@@ -458,7 +467,6 @@ void TestPlaylistView::removeOnlyOneOccurrenceKeepsLibraryFilesAndOtherPlaylist(
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->playlistChooser()->setCurrentIndex(0);
     view->itemList()->setCurrentRow(0);
@@ -501,7 +509,6 @@ void TestPlaylistView::libraryDropsInsertAtRequestedRows()
     QCOMPARE(library->resultsList()->dragDropMode(), QAbstractItemView::DragOnly);
     QCOMPARE(library->resultsList()->defaultDropAction(), Qt::CopyAction);
     QVERIFY(!library->resultsList()->acceptDrops());
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     QCoreApplication::processEvents();
@@ -587,7 +594,6 @@ void TestPlaylistView::internalDropsMoveUpAndDown()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     QCoreApplication::processEvents();
@@ -631,7 +637,6 @@ void TestPlaylistView::longPlaylistDragAutoScrollsAndUsesStoreDrop()
     window.resize(900, 600);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     QCoreApplication::processEvents();
@@ -716,7 +721,6 @@ void TestPlaylistView::dropsWhilePlayingDoNotTouchPlayback()
     library->refreshSearch();
     auto libraryMime = itemMimeData(library->resultsList(), 0);
     QVERIFY(libraryMime);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     view->itemList()->setCurrentRow(0);
@@ -774,7 +778,6 @@ void TestPlaylistView::dropWithoutDisplayedPlaylistIsRejected()
     library->refreshSearch();
     auto mimeData = itemMimeData(library->resultsList(), 0);
     QVERIFY(mimeData);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(view->displayedPlaylistId(), 0);
 
@@ -805,7 +808,6 @@ void TestPlaylistView::orderingAndDataChangesDoNotTouchPlayback()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(1);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
@@ -817,7 +819,6 @@ void TestPlaylistView::orderingAndDataChangesDoNotTouchPlayback()
     const qint64 before = player.positionMs();
 
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(12);
     const qint64 selected = view->selectedItemId();
     view->itemList()->setFocus();
@@ -873,7 +874,6 @@ void TestPlaylistView::nonPlaylistOriginsNeverAutoplay()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* library = window.libraryView();
     library->searchBox()->clear();
     library->refreshSearch();
@@ -916,7 +916,6 @@ void TestPlaylistView::sameSongAutoplayDependsOnPlaylistOrigin()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* library = window.libraryView();
     library->searchBox()->clear();
     library->refreshSearch();
@@ -930,7 +929,6 @@ void TestPlaylistView::sameSongAutoplayDependsOnPlaylistOrigin()
     QVERIFY(sameFile(player.song().mp3Path, songs.firstMp3));
     QVERIFY(!window.playlistPlayback()->context());
 
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* playlist = window.playlistView();
     playlist->itemList()->setCurrentRow(0);
     QTest::mouseClick(playlist->playButton(), Qt::LeftButton);
@@ -968,7 +966,6 @@ void TestPlaylistView::playlistOriginSurvivesLibraryBrowsingAndPlaylistSwitch()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* playlist = window.playlistView();
     playlist->playlistChooser()->setCurrentIndex(0);
     playlist->itemList()->setCurrentRow(0);
@@ -977,7 +974,6 @@ void TestPlaylistView::playlistOriginSurvivesLibraryBrowsingAndPlaylistSwitch()
     QCOMPARE(window.playlistPlayback()->context()->itemId, originItem);
 
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     playlist->playlistChooser()->setCurrentIndex(1);
     playlist->itemList()->setCurrentRow(1);
     LibraryView* library = window.libraryView();
@@ -1024,7 +1020,6 @@ void TestPlaylistView::explicitPlayAutoplaySettingsAndFailureStates()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(0);
 
@@ -1137,7 +1132,6 @@ void TestPlaylistView::staleCatalogueIdsResolveBySnapshotAndRepair()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(playlists.item(staleEntries.at(collisionRow).itemId)->songId,
              expected.songId);
@@ -1194,7 +1188,6 @@ void TestPlaylistView::movedRootResolvesByUniqueActiveRelativePath()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     QCOMPARE(playlists.item(itemId)->songId, movedSongs.secondId);
     QCOMPARE(playlists.item(itemId)->rootPath, snapshot.rootPath);
     window.playlistView()->itemList()->setCurrentRow(0);
@@ -1241,7 +1234,6 @@ void TestPlaylistView::movedRootRejectsRelativePathWithDifferentMetadata()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(view->itemList()->count(), 1);
     QVERIFY(view->itemList()->item(0)->text().contains(
@@ -1272,7 +1264,6 @@ void TestPlaylistView::resolvedPlaybackIgnoresSongIdCacheWriteFailure()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(playlists.item(itemId)->songId, 999999LL);
     view->itemList()->setCurrentRow(0);
@@ -1315,7 +1306,6 @@ void TestPlaylistView::unresolvedAutoplayStopsWithVisibleFeedback()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(view->itemList()->count(), 3);
     QVERIFY(view->itemList()->item(1)->text().contains(QStringLiteral("Snapshot Missing Song")));
@@ -1327,7 +1317,7 @@ void TestPlaylistView::unresolvedAutoplayStopsWithVisibleFeedback()
     QTRY_COMPARE_WITH_TIMEOUT(player.state(), KaraokePlayer::State::Finished, 4000);
     QTRY_COMPARE(window.statusText(), QStringLiteral("This song can't be found right now."));
     QVERIFY(!window.lyricsVisible());
-    QVERIFY(!window.libraryVisible());
+    QVERIFY(window.libraryVisible());
     QVERIFY(window.playlistPlayback()->context());
     QCOMPARE(window.playlistPlayback()->context()->itemId, firstItem);
     QVERIFY(sameFile(player.song().mp3Path, songs.firstMp3));
@@ -1358,7 +1348,6 @@ void TestPlaylistView::stopAndBusErrorNeverAutoplayWithSuccessors()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(0);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
@@ -1380,7 +1369,6 @@ void TestPlaylistView::stopAndBusErrorNeverAutoplayWithSuccessors()
     QCOMPARE(window.playlistPlayback()->context()->playlistId, playlistId);
     QCOMPARE(window.playlistPlayback()->context()->itemId, firstItem);
 
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(0);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
@@ -1414,7 +1402,6 @@ void TestPlaylistView::pendingAutoplayCancelledBySynchronousStopAndPlay()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
 
     bool stoppedAtFinished = false;
@@ -1437,7 +1424,6 @@ void TestPlaylistView::pendingAutoplayCancelledBySynchronousStopAndPlay()
     QCOMPARE(window.playlistPlayback()->context()->itemId, firstItem);
     disconnect(stopConnection);
 
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(0);
     bool replayedAtFinished = false;
     const QMetaObject::Connection playConnection = connect(
@@ -1496,7 +1482,6 @@ void TestPlaylistView::rejectedLoadsKeepPlayingContextAndAutoplaySuccessor()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->playlistChooser()->setCurrentIndex(0);
     view->itemList()->setCurrentRow(0);
@@ -1506,7 +1491,6 @@ void TestPlaylistView::rejectedLoadsKeepPlayingContextAndAutoplaySuccessor()
     QCOMPARE(player.state(), KaraokePlayer::State::Paused);
     QCOMPARE(window.playlistPlayback()->context()->itemId, playingItem);
 
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->playlistChooser()->setCurrentIndex(1);
     view->itemList()->setCurrentRow(0);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
@@ -1529,7 +1513,6 @@ void TestPlaylistView::rejectedLoadsKeepPlayingContextAndAutoplaySuccessor()
     QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
     QCOMPARE(window.playlistPlayback()->context()->itemId, playingItem);
 
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* library = window.libraryView();
     library->searchBox()->setText(QStringLiteral("First Song"));
     QTRY_COMPARE(library->songResultCount(), 1);
@@ -1567,14 +1550,13 @@ void TestPlaylistView::autoplayOffLeavesFinishedSongLoaded()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     window.playlistView()->itemList()->setCurrentRow(0);
     QTest::mouseClick(window.playlistView()->playButton(), Qt::LeftButton);
     QTRY_COMPARE_WITH_TIMEOUT(player.state(), KaraokePlayer::State::Finished, 4000);
     QVERIFY(sameFile(player.song().mp3Path, songs.firstMp3));
     QCOMPARE(window.playlistPlayback()->context()->itemId, firstItem);
     QVERIFY(!window.lyricsVisible());
-    QVERIFY(!window.libraryVisible());
+    QVERIFY(window.libraryVisible());
 }
 
 void TestPlaylistView::reorderedSuccessorUsesCurrentOrder()
@@ -1596,13 +1578,11 @@ void TestPlaylistView::reorderedSuccessorUsesCurrentOrder()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(1);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(window.playlistPlayback()->context()->itemId, b);
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(2);
     view->itemList()->setFocus();
     QTest::keyClick(view->itemList(), Qt::Key_Down);
@@ -1634,13 +1614,11 @@ void TestPlaylistView::movingPlayingItemUsesItsNewSuccessor()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(1);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(window.playlistPlayback()->context()->itemId, b);
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(1);
     view->itemList()->setFocus();
     QTest::keyClick(view->itemList(), Qt::Key_Down);
@@ -1672,14 +1650,12 @@ void TestPlaylistView::displayedPlaylistDoesNotChangePlaybackOrigin()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->playlistChooser()->setCurrentIndex(0);
     view->itemList()->setCurrentRow(1);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(window.playlistPlayback()->context()->itemId, b);
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->playlistChooser()->setCurrentIndex(1);
     QCOMPARE(view->displayedPlaylistId(), p2);
     QTRY_COMPARE_WITH_TIMEOUT(window.playlistPlayback()->context()->itemId, c, 5000);
@@ -1712,13 +1688,11 @@ void TestPlaylistView::removedOrDeletedOriginDoesNotAdvance()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->playlistChooser()->setCurrentIndex(0);
     view->itemList()->setCurrentRow(1);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->itemList()->setCurrentRow(1);
     view->setRemoveConfirmation(
         [](QWidget*, const QString&, const QString&) { return true; });
@@ -1729,13 +1703,11 @@ void TestPlaylistView::removedOrDeletedOriginDoesNotAdvance()
     QTRY_COMPARE_WITH_TIMEOUT(player.state(), KaraokePlayer::State::Finished, 5000);
     QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
 
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->playlistChooser()->setCurrentIndex(1);
     view->itemList()->setCurrentRow(0);
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(window.playlistPlayback()->context()->itemId, deletedItem);
     QTest::keyClick(&window, Qt::Key_Escape);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     view->setDeleteConfirmation([](QWidget*, const QString&) { return true; });
     QTest::mouseClick(view->deleteButton(), Qt::LeftButton);
     QVERIFY(!playlists.playlist(deletedPlaylist));
@@ -1763,7 +1735,6 @@ void TestPlaylistView::libraryRefreshPreservesPlaylistPosition()
     window.resize(1000, 600);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     view->itemList()->setCurrentRow(16);
     view->itemList()->scrollToItem(view->itemList()->currentItem(),
@@ -1797,7 +1768,6 @@ void TestPlaylistView::keyboardSelectionAndEscapeKeepPlayback()
     MainWindow window(&player, &settings, &controller, &playlists);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QCOMPARE(view->itemList()->currentRow(), 0);
     QCOMPARE(view->selectedItemId(), firstItem);
@@ -1808,14 +1778,275 @@ void TestPlaylistView::keyboardSelectionAndEscapeKeepPlayback()
 
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
+    QVERIFY(window.lyricsVisible());
+    QTest::keyClick(&window, Qt::Key_Escape);
+    QVERIFY(window.libraryVisible());
+    QVERIFY(!window.lyricsVisible());
+    // Escape in the playlist only returns to the search box.
     view->itemList()->setFocus();
     QTest::keyClick(view->itemList(), Qt::Key_Escape);
-    QVERIFY(!window.libraryVisible());
+    QCOMPARE(window.focusWidget(), window.libraryView()->searchBox());
+    QVERIFY(window.libraryVisible());
     QVERIFY(!window.lyricsVisible());
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
     QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
     player.stop();
+}
+
+void TestPlaylistView::homeScreenEnterNeverChangesTheSong()
+{
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 playlistId = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Enter"), &playlistId));
+    addSong(playlists, controller, playlistId, songs.secondId);
+    addSong(playlists, controller, playlistId, songs.firstId);
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    PlaylistView* view = window.playlistView();
+    LibraryView* library = window.libraryView();
+    QVERIFY(!window.lyricsButton()->isEnabled());
+
+    // Idle, nothing searched and nothing chosen: Enter does not pick a song.
+    QVERIFY(library->searchBox()->text().isEmpty());
+    QCOMPARE(library->selectedSongId(), 0LL);
+    QTest::keyClick(library->searchBox(), Qt::Key_Return);
+    QCOMPARE(player.state(), KaraokePlayer::State::Empty);
+    QVERIFY(!window.lyricsVisible());
+
+    view->itemList()->setCurrentRow(0);
+    QTest::mouseClick(view->playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QTest::keyClick(&window, Qt::Key_Escape);
+    // While playing: Enter in the search box with another song chosen.
+    library->resultsList()->setCurrentIndex(library->resultsList()->model()->index(0, 0));
+    QTest::keyClick(library->searchBox(), Qt::Key_Return);
+    QVERIFY(window.lyricsVisible());
+    QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QTest::keyClick(&window, Qt::Key_Escape);
+    library->resultsList()->setCurrentIndex({});
+    QTest::mouseClick(window.pauseButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Paused);
+    QVERIFY(window.libraryVisible());
+    QVERIFY(window.lyricsButton()->isEnabled());
+    QSignalSpy states(&player, &KaraokePlayer::stateChanged);
+
+    // A different library song is chosen: Enter returns to the lyrics only.
+    library->resultsList()->setCurrentIndex(library->resultsList()->model()->index(0, 0));
+    QVERIFY(library->selectedSongId() != 0);
+    QTest::keyClick(library->searchBox(), Qt::Key_Return);
+    QVERIFY(window.lyricsVisible());
+    QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
+
+    // The same from the playlist, with another item selected.
+    QTest::keyClick(&window, Qt::Key_Escape);
+    view->itemList()->setCurrentRow(1);
+    view->itemList()->setFocus();
+    QTest::keyClick(view->itemList(), Qt::Key_Enter);
+    QVERIFY(window.lyricsVisible());
+    QVERIFY(sameFile(player.song().mp3Path, songs.secondMp3));
+
+    // The Lyrics button does the same.
+    QTest::keyClick(&window, Qt::Key_Escape);
+    QTest::mouseClick(window.lyricsButton(), Qt::LeftButton);
+    QVERIFY(window.lyricsVisible());
+    QCOMPARE(states.count(), 0);
+    QCOMPARE(player.state(), KaraokePlayer::State::Paused);
+    player.stop();
+    QVERIFY(!window.lyricsButton()->isEnabled());
+}
+
+void TestPlaylistView::presentationFollowsPaneInUseAndPlayback()
+{
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/overrides.sqlite")),
+                                 nullptr, {},
+                                 temporary.filePath(QStringLiteral("app/user-state.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 firstPlaylist = 0;
+    qint64 secondPlaylist = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("First"), &firstPlaylist));
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Second"), &secondPlaylist));
+    addSong(playlists, controller, firstPlaylist, songs.secondId);
+    addSong(playlists, controller, firstPlaylist, songs.firstId);
+    addSong(playlists, controller, secondPlaylist, songs.thirdId);
+    QVERIFY(playlists.setLastPlaylistId(firstPlaylist));
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    PlaylistView* view = window.playlistView();
+    LibraryView* library = window.libraryView();
+    QTreeView* results = library->resultsList();
+
+    // Tabs show the playlists and switch between them.
+    QCOMPARE(view->playlistTabs()->count(), 2);
+    QCOMPARE(view->playlistTabs()->currentIndex(), view->playlistChooser()->currentIndex());
+    QCOMPARE(view->displayedPlaylistId(), firstPlaylist);
+    view->playlistTabs()->setCurrentIndex(1);
+    QCOMPARE(view->displayedPlaylistId(), secondPlaylist);
+    QCOMPARE(view->itemList()->count(), 1);
+    view->playlistTabs()->setCurrentIndex(0);
+    QCOMPARE(view->displayedPlaylistId(), firstPlaylist);
+    QVERIFY(library->isActive());
+    // Clicking a tab puts the playlist in use, without taking the keyboard.
+    QTest::mouseClick(view->playlistTabs(), Qt::LeftButton, Qt::NoModifier,
+                      view->playlistTabs()->tabRect(1).center());
+    QCOMPARE(view->displayedPlaylistId(), secondPlaylist);
+    QVERIFY(view->isActive());
+    QVERIFY(!library->isActive());
+    QTest::mouseClick(view->playlistTabs(), Qt::LeftButton, Qt::NoModifier,
+                      view->playlistTabs()->tabRect(0).center());
+    QCOMPARE(view->displayedPlaylistId(), firstPlaylist);
+    setLibraryInUse(library);
+
+    // Only the pane in use shows its selection strongly; both keep it.
+    QVERIFY(library->isActive());
+    QVERIFY(!view->isActive());
+    QVERIFY(!view->isActive());
+    QTest::mouseClick(view->itemList()->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      view->itemList()->visualItemRect(view->itemList()->item(1)).center());
+    QTRY_VERIFY(view->isActive());
+    QVERIFY(!library->isActive());
+    const QModelIndex libraryRow = results->model()->index(0, 0);
+    QTest::mouseClick(results->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      results->visualRect(libraryRow).center());
+    QTRY_VERIFY(library->isActive());
+    QVERIFY(!view->isActive());
+    QCOMPARE(window.focusWidget(), library->searchBox());
+    QCOMPARE(view->itemList()->currentRow(), 1);
+    QCOMPARE(results->currentIndex().row(), 0);
+
+    // Play and Pause share one place; the song being sung is marked in the
+    // library separately from the selection.
+    QVERIFY(window.playButton()->isVisible());
+    QVERIFY(!window.pauseButton()->isVisible());
+    view->itemList()->setCurrentRow(0);
+    QTest::mouseClick(view->playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QTest::keyClick(&window, Qt::Key_Escape);
+    QVERIFY(window.pauseButton()->isVisible());
+    QVERIFY(!window.playButton()->isVisible());
+    const int playingRow = libraryRowForSongId(library, songs.secondId);
+    QVERIFY(playingRow >= 0);
+    QVERIFY(results->model()->index(playingRow, 0).data(LibraryResultsModel::PlayingRole).toBool());
+    const int otherRow = libraryRowForSongId(library, songs.firstId);
+    QVERIFY(!results->model()->index(otherRow, 0).data(LibraryResultsModel::PlayingRole).toBool());
+    // The play is counted once the song is heard; its row shows it.
+    const QModelIndex plays = results->model()->index(playingRow, LibraryResultsModel::PlaysColumn);
+    QTRY_COMPARE(plays.data(LibraryResultsModel::PlaysRole).toInt(), 1);
+    QTest::mouseClick(window.pauseButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Paused);
+    QCOMPARE(plays.data().toString(), QStringLiteral("1"));
+    QVERIFY(window.playButton()->isVisible());
+    QCOMPARE(window.playButton()->text(), QStringLiteral("Resume"));
+    QVERIFY(results->model()->index(playingRow, 0).data(LibraryResultsModel::PlayingRole).toBool());
+    // Now Playing follows a name correction for the loaded song.
+    QVERIFY(controller.setManualOverride(songs.secondId, QStringLiteral("Fixed Singer"),
+                                         QStringLiteral("Fixed Title")));
+    QCOMPARE(window.songText(), QStringLiteral("Fixed Singer \u2013 Fixed Title"));
+    const int stillPlaying = libraryRowForSongId(library, songs.secondId);
+    QVERIFY(results->model()->index(stillPlaying, 0).data(LibraryResultsModel::PlayingRole).toBool());
+    player.stop();
+    QVERIFY(!results->model()->index(stillPlaying, 0).data(LibraryResultsModel::PlayingRole).toBool());
+}
+
+// The colour painted in the middle of a row's padding, clear of any text.
+QColor rowColour(QAbstractItemView* view, const QRect& row, int x)
+{
+    const QImage image = view->viewport()->grab().toImage();
+    const qreal scale = image.devicePixelRatio();
+    return image.pixelColor(QPoint(int(x * scale), int(row.center().y() * scale)));
+}
+
+void TestPlaylistView::onlyThePaneInUsePaintsItsSelectionGold()
+{
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 playlistId = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Colours"), &playlistId));
+    addSong(playlists, controller, playlistId, songs.secondId);
+    addSong(playlists, controller, playlistId, songs.firstId);
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    LibraryView* library = window.libraryView();
+    PlaylistView* view = window.playlistView();
+    QTreeView* results = library->resultsList();
+    QListWidget* items = view->itemList();
+
+    const auto libraryRow = [&] { return results->visualRect(results->currentIndex()); };
+    const auto playlistRow = [&] { return items->visualItemRect(items->currentItem()); };
+    const auto libraryColour = [&] {
+        return rowColour(results, libraryRow(), results->viewport()->width() - 6);
+    };
+    const auto playlistColour = [&] { return rowColour(items, playlistRow(), 6); };
+    const auto expectPaint = [&](bool libraryGold) {
+        // The gold pane is the one the keyboard acts on.
+        QCOMPARE(window.focusWidget(), libraryGold ? static_cast<QWidget*>(library->searchBox())
+                                                   : static_cast<QWidget*>(items));
+        QCOMPARE(libraryColour(), libraryGold ? theme::color::selection
+                                              : theme::color::selectionIdle);
+        QCOMPARE(playlistColour(), libraryGold ? theme::color::selectionIdle
+                                               : theme::color::selection);
+    };
+
+    // Click a library song, then a playlist song, then the library again.
+    const QModelIndex song = results->model()->index(1, 0);
+    QTest::mouseClick(results->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      results->visualRect(song).center());
+    QTest::mouseClick(items->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      items->visualItemRect(items->item(1)).center());
+    QCOMPARE(results->currentIndex().row(), 1);
+    QCOMPARE(items->currentRow(), 1);
+    expectPaint(false);
+    QTest::mouseClick(results->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      results->visualRect(song).center());
+    expectPaint(true);
+
+    // Playing is a separate mark; stopping removes it and keeps both selections.
+    items->setCurrentRow(0);
+    QTest::mouseClick(view->playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QTest::keyClick(&window, Qt::Key_Escape);
+    QVERIFY(items->item(0)->text().startsWith(QStringLiteral("▶ ")));
+    items->setCurrentRow(1);
+    player.stop();
+    QVERIFY(!items->item(0)->text().startsWith(QStringLiteral("▶ ")));
+    QCOMPARE(items->currentRow(), 1);
+    QCOMPARE(results->currentIndex().row(), 1);
+    expectPaint(false);  // the Play button was used: the playlist is in use
+
+    // Moving the keyboard between the panes does the same.
+    window.activateWindow();
+    if (!QTest::qWaitForWindowActive(&window))
+        QSKIP("This platform cannot activate the test window for keyboard focus.");
+    library->searchBox()->setFocus(Qt::TabFocusReason);
+    QTRY_VERIFY(library->isActive());
+    expectPaint(true);
+    items->setFocus(Qt::TabFocusReason);
+    QTRY_VERIFY(view->isActive());
+    expectPaint(false);
 }
 
 void TestPlaylistView::playbackMarkerTracksActualState()
@@ -1836,7 +2067,6 @@ void TestPlaylistView::playbackMarkerTracksActualState()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QTest::mouseClick(view->playButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
@@ -1880,7 +2110,6 @@ void TestPlaylistView::movingPastViewportKeepsSelectionFullyVisible()
     window.resize(900, 420);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.playlistsButton(), Qt::LeftButton);
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     QCoreApplication::processEvents();
@@ -1926,7 +2155,6 @@ void TestPlaylistView::unavailableStoreLeavesLibraryUsable()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     QVERIFY(window.playlistView()->messageLabel()->text().contains(
         QStringLiteral("unavailable")));
     QVERIFY(!window.playlistView()->newButton()->isEnabled());
@@ -1935,7 +2163,8 @@ void TestPlaylistView::unavailableStoreLeavesLibraryUsable()
     window.libraryView()->resultsList()->setCurrentIndex(
         window.libraryView()->resultsList()->model()->index(0, 0));
     QTest::mouseClick(window.libraryView()->singButton(), Qt::LeftButton);
-    QCOMPARE(player.state(), KaraokePlayer::State::Ready);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    player.stop();
 }
 
 QTEST_MAIN(TestPlaylistView)

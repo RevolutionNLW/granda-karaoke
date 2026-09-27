@@ -1,10 +1,14 @@
 #include "LibraryController.h"
 
+#include "BackgroundWork.h"
+
+#include "library/CatalogueTools.h"
 #include "library/FilenameParser.h"
 #include "library/LibraryScanner.h"
 #include "ocr/PlatformTitleScreenOcr.h"
 #include "library/MetadataResolver.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QMutexLocker>
@@ -157,6 +161,8 @@ LibraryController::LibraryController(const QString& databasePath,
 
 LibraryController::~LibraryController()
 {
+    // A count still running is not waited for: it finishes on its own and
+    // its result is dropped (main() waits for it before Qt shuts down).
     if (m_scanner) {
         m_scanner->requestCancel();
         m_scannerThread.quit();
@@ -203,11 +209,15 @@ QString LibraryController::statusText() const
     if (!isRootConnected())
         return QStringLiteral("Music drive not connected");
     QString error;
-    const qint64 count = m_catalogue.activeSongCount(&error);
-    if (!error.isEmpty()) {
-        qCWarning(lcLibraryController).noquote() << error;
-        return QStringLiteral("Song library is unavailable");
+    if (m_songCount < 0) {
+        m_songCount = m_catalogue.activeSongCount(&error);
+        if (!error.isEmpty()) {
+            m_songCount = -1;
+            qCWarning(lcLibraryController).noquote() << error;
+            return QStringLiteral("Song library is unavailable");
+        }
     }
+    const qint64 count = m_songCount;
     // Progress is only shown while there is nothing to search yet. Background
     // rescans and tag reading stay quiet once songs can be found.
     if (m_scanning && !m_ready && count == 0) {
@@ -281,6 +291,169 @@ void LibraryController::recordPlay(qint64 songId, const QString& identity,
     flushPendingWrites(false);
 }
 
+void LibraryController::requestReviewSummary()
+{
+    if (m_reviewSummary) {
+        emit reviewSummaryReady(*m_reviewSummary);
+        return;
+    }
+    m_summaryWanted = true;
+    if (!m_summaryRunning)
+        startReviewSummary();
+}
+
+void LibraryController::startReviewSummary()
+{
+    if (!isAvailable())
+        return;
+    m_summaryRunning = true;
+    m_summaryWanted = false;
+    const quint64 generation = m_summaryGeneration;
+    const QString path = m_catalogue.databasePath();
+    const ReviewSummaryReader reader = m_summaryReader
+        ? m_summaryReader
+        : ReviewSummaryReader([](const QString& databasePath) {
+              QString error;
+              auto summary = Catalogue::readReviewSummary(databasePath, &error);
+              if (!summary)
+                  qCWarning(lcLibraryController).noquote() << "Could not count song names:" << error;
+              return summary;
+          });
+    // The worker never touches the controller: its result travels through
+    // the application object and is dropped if the controller has gone.
+    const QPointer<LibraryController> self(this);
+    background::run(QStringLiteral("ReviewSummary"), [self, reader, path, generation] {
+        const std::optional<ReviewSummary> summary = reader(path);
+        if (QCoreApplication* app = QCoreApplication::instance()) {
+            QMetaObject::invokeMethod(app, [self, summary, generation] {
+                if (self)
+                    self->finishReviewSummary(summary, generation);
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+void LibraryController::finishReviewSummary(const std::optional<ReviewSummary>& summary,
+                                            quint64 generation)
+{
+    m_summaryRunning = false;
+    if (generation != m_summaryGeneration) {
+        // The catalogue changed while counting: count again if wanted.
+        if (m_summaryWanted)
+            startReviewSummary();
+        return;
+    }
+    if (summary) {
+        m_reviewSummary = summary;
+        emit reviewSummaryReady(*summary);
+        return;
+    }
+    emit reviewSummaryFailed();
+    if (m_summaryWanted)
+        startReviewSummary();
+}
+
+QString LibraryController::preference(const QString& key) const
+{
+    return m_userState ? m_userState->preference(key) : QString();
+}
+
+bool LibraryController::setPreference(const QString& key, const QString& value)
+{
+    QString error;
+    if (!m_userState || !m_userState->setPreference(key, value, &error)) {
+        qCWarning(lcLibraryController).noquote() << "Could not save setting" << key << error;
+        return false;
+    }
+    return true;
+}
+
+bool LibraryController::setPreferences(const QList<QPair<QString, QString>>& values)
+{
+    QString error;
+    if (!m_userState || !m_userState->setPreferences(values, &error)) {
+        qCWarning(lcLibraryController).noquote() << "Could not save settings" << error;
+        return false;
+    }
+    return true;
+}
+
+QString LibraryController::databasePath() const
+{
+    return m_catalogue.databasePath();
+}
+
+QString LibraryController::userStatePath() const
+{
+    return m_userState ? m_userState->databasePath() : QString();
+}
+
+qint64 LibraryController::lastScanCompletedMs() const
+{
+    return hasActiveRoot() ? activeRoot().lastScanCompleted : 0;
+}
+
+namespace {
+
+bool titleScreenFileAllowed(const QString& path, const QStringList& roots, QString* error)
+{
+    const QString file = Catalogue::canonicalPath(path);
+    for (const QString& root : roots) {
+        if (Catalogue::pathIsInsideOrEqual(file, Catalogue::canonicalPath(root))) {
+            if (error)
+                *error = QStringLiteral("Files inside the music folder are never written or read "
+                                        "here; choose another place.");
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool LibraryController::exportTitleScreens(const QString& path, QString* summary, QString* error)
+{
+    if (!isAvailable() || m_scanning) {
+        if (error)
+            *error = QStringLiteral("The library is busy; please try again when it has finished.");
+        return false;
+    }
+    if (!titleScreenFileAllowed(path, libraryRoots(), error))
+        return false;
+    QString failure;
+    const QVariantMap result = CatalogueTools::exportTitleScreens(m_catalogue, path, &failure);
+    if (!failure.isEmpty()) {
+        if (error)
+            *error = failure;
+        return false;
+    }
+    if (summary)
+        *summary = QStringLiteral("Saved %L1 title screens.").arg(result.value(QStringLiteral("exported")).toLongLong());
+    return true;
+}
+
+bool LibraryController::importTitleScreens(const QString& path, QString* summary, QString* error)
+{
+    if (!isAvailable() || m_scanning) {
+        if (error)
+            *error = QStringLiteral("The library is busy; please try again when it has finished.");
+        return false;
+    }
+    if (!titleScreenFileAllowed(path, libraryRoots(), error))
+        return false;
+    QString failure;
+    const QVariantMap result = CatalogueTools::importTitleScreens(m_catalogue, path, &failure);
+    if (!failure.isEmpty()) {
+        if (error)
+            *error = failure;
+        return false;
+    }
+    if (summary)
+        *summary = QStringLiteral("Read %L1 title screens. Reprocess song names to use them.")
+                       .arg(result.value(QStringLiteral("imported")).toLongLong());
+    return true;
+}
+
 PlayHistoryEntry LibraryController::playHistory(const QString& identity) const
 {
     return m_userState ? m_userState->playHistoryFor(identity) : PlayHistoryEntry{};
@@ -299,6 +472,7 @@ void LibraryController::flushPendingWrites(bool mayWait)
     };
     bool deferred = false;
     bool playsWritten = false;
+    QList<qint64> written;
     while (!m_pendingPlays.isEmpty()) {
         const PendingPlay play = m_pendingPlays.first();
         QString error;
@@ -310,6 +484,7 @@ void LibraryController::flushPendingWrites(bool mayWait)
             qCWarning(lcLibraryController).noquote() << "Could not show the play in the library:" << error;
         } else {
             playsWritten = true;
+            written.append(play.songId);
         }
         m_pendingPlays.removeFirst();
     }
@@ -326,6 +501,8 @@ void LibraryController::flushPendingWrites(bool mayWait)
         }
         m_writeRetry->start();
     }
+    for (const qint64 songId : std::as_const(written))
+        emit playStatsChanged(songId);
 }
 
 SongPlayStats LibraryController::playStats(qint64 songId) const
@@ -760,6 +937,10 @@ void LibraryController::invalidateBrowseCache()
 {
     m_browseRows.clear();
     m_browseCacheValid = false;
+    m_songCount = -1;
+    // Counts made before this change are out of date.
+    m_reviewSummary.reset();
+    ++m_summaryGeneration;
 }
 
 void LibraryController::onFailed(const QString& message)

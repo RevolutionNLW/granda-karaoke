@@ -60,9 +60,12 @@ public:
 
     QString preference(const QString& key, QString* error = nullptr) const;
     bool setPreference(const QString& key, const QString& value, QString* error = nullptr);
+    // Several preferences together: all are saved, or none.
+    bool setPreferences(const QList<QPair<QString, QString>>& values, QString* error = nullptr);
 
 private:
     bool ensureSchema(QString* error);
+    void undoTransaction();
     bool recoverCorruptDatabase(const QString& detail, QString* error);
     void setError(const QString& message, QString* error) const;
 

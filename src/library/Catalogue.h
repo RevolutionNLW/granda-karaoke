@@ -16,6 +16,8 @@ struct CatalogueRoot {
     QString path;
     bool online = false;
     bool active = false;
+    // When the last full scan of this folder finished (ms since epoch, 0 if never).
+    qint64 lastScanCompleted = 0;
 };
 
 struct CatalogueSearchRow {
@@ -64,6 +66,17 @@ struct ReviewRow {
 };
 
 enum class ReviewFilter { Unresolved, Low, Medium, Conflicts, Manual, All };
+
+// How well the library's songs are named, in one pass.
+struct ReviewSummary {
+    qint64 all = 0;
+    qint64 high = 0;
+    qint64 medium = 0;
+    qint64 low = 0;
+    qint64 unresolved = 0;
+    qint64 conflicts = 0;
+    qint64 manual = 0;
+};
 
 struct PlaybackPaths {
     QString mp3Path;
@@ -172,6 +185,10 @@ public:
     QList<ReviewRow> reviewList(ReviewFilter filter, const QString& text, int limit = 500,
                                 QString* error = nullptr) const;
     qint64 reviewCount(ReviewFilter filter, QString* error = nullptr) const;
+    // The review counts of a catalogue file in one query, on a read-only
+    // connection of its own: safe to call on a worker thread.
+    static std::optional<ReviewSummary> readReviewSummary(const QString& databasePath,
+                                                          QString* error = nullptr);
     // Everything known about one song: display, automatic and manual layers,
     // raw file/folder/tag data and the evidence behind the automatic result.
     QVariantMap reviewDetail(qint64 songId, QString* error = nullptr) const;

@@ -7,6 +7,7 @@
 #include "TestMedia.h"
 #include "library/Catalogue.h"
 
+#include <QAbstractButton>
 #include <QCryptographicHash>
 #include <QDirIterator>
 #include <QElapsedTimer>
@@ -15,7 +16,9 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
+#include <QTreeView>
 #include <QMimeData>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QSqlDatabase>
@@ -81,6 +84,7 @@ private slots:
     void initTestCase();
     void setupSearchAndSingUsesExistingOpenFlow();
     void keyboardFilteringSelectionRefreshAndFocus();
+    void dialogsReturnFocusToSearch();
     void emptySearchBrowsesOrderedCatalogueAndKeepsSelection();
     void emptySearchAndResultCap();
     void rootChangeRefreshesBrowseAndSelection();
@@ -117,7 +121,6 @@ void TestLibraryView::setupSearchAndSingUsesExistingOpenFlow()
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     QVERIFY(window.libraryVisible());
     QCOMPARE(window.libraryView()->statusLabel()->text(), QString());
     window.libraryView()->setFolderChooser(
@@ -135,9 +138,13 @@ void TestLibraryView::setupSearchAndSingUsesExistingOpenFlow()
     QVERIFY(window.libraryView()->singButton()->isEnabled());
     QTest::mouseClick(window.libraryView()->singButton(), Qt::LeftButton);
 
-    QCOMPARE(player.state(), KaraokePlayer::State::Ready);
-    QVERIFY(!window.libraryVisible());
-    QVERIFY(window.songText().contains(QStringLiteral("AT001-01")));
+    // Singing starts the song straight away, with its lyrics.
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QVERIFY(window.lyricsVisible());
+    QVERIFY(QFileInfo(player.song().mp3Path).fileName().startsWith(QStringLiteral("AT001-01")));
+    // Now Playing names the song from the library, not by its file name.
+    QCOMPARE(window.songText(), QStringLiteral("Test Singer \u2013 Golden Song"));
+    player.stop();
     QCOMPARE(snapshot(root), before);
 }
 
@@ -166,12 +173,11 @@ void TestLibraryView::keyboardFilteringSelectionRefreshAndFocus()
     window.setShowErrorDialogs(false);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* view = window.libraryView();
 
-    for (QPushButton* button : view->findChildren<QPushButton*>())
+    for (QAbstractButton* button : window.findChildren<QAbstractButton*>())
         QCOMPARE(button->focusPolicy(), Qt::NoFocus);
-    QCOMPARE(window.findButton()->focusPolicy(), Qt::NoFocus);
+    QCOMPARE(window.focusWidget(), view->searchBox());
 
     QTest::keyClicks(view->searchBox(), QStringLiteral("Shared Singer"));
     QTRY_COMPARE_WITH_TIMEOUT(view->songResultCount(), 2, 2000);
@@ -195,13 +201,46 @@ void TestLibraryView::keyboardFilteringSelectionRefreshAndFocus()
     view->resultsList()->clearSelection();
     view->resultsList()->setCurrentIndex({});
     QTest::keyClick(view->searchBox(), Qt::Key_Return);
-    QCOMPARE(player.state(), KaraokePlayer::State::Ready);
-    QVERIFY(!window.libraryVisible());
-
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QVERIFY(window.lyricsVisible());
+    QTest::keyClick(&window, Qt::Key_Escape);
     QVERIFY(window.libraryVisible());
+
+    // Escape in the search box only clears it; the song carries on.
     QTest::keyClick(view->searchBox(), Qt::Key_Escape);
-    QVERIFY(!window.libraryVisible());
+    QVERIFY(view->searchBox()->text().isEmpty());
+    QVERIFY(window.libraryVisible());
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    player.stop();
+}
+
+void TestLibraryView::dialogsReturnFocusToSearch()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    writeSmallPair(root, 1, QStringLiteral("Focus Singer"), QStringLiteral("Focus Song"));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    QSignalSpy ready(&controller, &LibraryController::libraryReady);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(ready.count() >= 1, 5000);
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCOMPARE(window.focusWidget(), window.libraryView()->searchBox());
+
+    // A problem message closes back to the search box, ready for typing.
+    const QString broken = temporary.filePath(QStringLiteral("Broken.mp3"));
+    QVERIFY(testmedia::writeFile(broken, QByteArray(2000, '\x5a')));
+    QVERIFY(!window.openSong(broken));
+    QMessageBox* box = nullptr;
+    QTRY_VERIFY((box = window.findChild<QMessageBox*>()) != nullptr);
+    window.setFocus();
+    box->done(QMessageBox::Ok);
+    QCOMPARE(window.focusWidget(), window.libraryView()->searchBox());
 }
 
 void TestLibraryView::emptySearchAndResultCap()
@@ -545,7 +584,6 @@ void TestLibraryView::missingRootMessageAndStayOnLibrary()
     MainWindow window(&player, &settings, &controller);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QTest::mouseClick(window.findButton(), Qt::LeftButton);
     LibraryView* view = window.libraryView();
     view->searchBox()->setText(QStringLiteral("Missing Singer"));
     QTRY_COMPARE_WITH_TIMEOUT(view->songResultCount(), 1, 2000);

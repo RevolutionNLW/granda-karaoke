@@ -2,6 +2,7 @@
 
 #include "LibraryController.h"
 #include "LyricsView.h"
+#include "ui/Theme.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -150,7 +151,7 @@ MetadataReviewDialog::MetadataReviewDialog(LibraryController* controller, QWidge
     , m_controller(controller)
 {
     setWindowTitle(QStringLiteral("Library Maintenance — Song Names"));
-    resize(1200, 760);
+    resize(theme::px(1200), theme::px(760));
 
     m_filter = new QComboBox(this);
     for (const FilterChoice& choice : kFilters)
@@ -174,10 +175,14 @@ MetadataReviewDialog::MetadataReviewDialog(LibraryController* controller, QWidge
     m_table->verticalHeader()->hide();
     m_table->horizontalHeader()->setStretchLastSection(false);
     m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
-    m_table->setColumnWidth(0, 160);
-    m_table->setColumnWidth(1, 220);
-    m_table->setColumnWidth(2, 130);
-    m_table->setColumnWidth(3, 120);
+    const auto sizeColumns = [this] {
+        m_table->setColumnWidth(0, theme::px(160));
+        m_table->setColumnWidth(1, theme::px(220));
+        m_table->setColumnWidth(2, theme::px(130));
+        m_table->setColumnWidth(3, theme::px(120));
+    };
+    sizeColumns();
+    connect(theme::notifier(), &theme::Notifier::changed, this, sizeColumns);
 
     m_detail = new QTextBrowser(this);
     m_artistEdit = new QLineEdit(this);
@@ -204,7 +209,7 @@ MetadataReviewDialog::MetadataReviewDialog(LibraryController* controller, QWidge
     m_previewLabel->setWordWrap(true);
     m_previewView = new LyricsView(this);
     m_previewView->unsetCursor();
-    m_previewView->setFixedSize(300, 216);
+    theme::setFixedSize(m_previewView, 300, 216);
     auto* previewButtons = new QVBoxLayout;
     previewButtons->addWidget(m_playPreview);
     previewButtons->addWidget(m_stopPreview);

@@ -4,7 +4,11 @@
 #include "library/MetadataOverrideStore.h"
 
 #include <QObject>
+#include <QPointer>
 #include <QThread>
+
+#include <functional>
+#include <optional>
 
 #include <memory>
 
@@ -41,6 +45,8 @@ public:
     bool isRootConnected() const;
     bool isScanning() const { return m_scanning; }
     bool scannerPaused() const;
+    // Cheap to ask often: the song count is remembered until the catalogue
+    // changes (it is asked on every scan progress update).
     QString statusText() const;
 
     QList<CatalogueSearchRow> search(const QString& text, int limit,
@@ -49,6 +55,21 @@ public:
     // The main library's order, for browsing and search results alike. A user
     // preference, remembered in the user-state store (not the catalogue).
     LibrarySort librarySort() const { return m_sort; }
+    // Application settings, kept in the user-state store beside play history
+    // (never in the catalogue). False/empty when there is no user-state store.
+    bool hasPreferences() const { return m_userState != nullptr; }
+    QString preference(const QString& key) const;
+    bool setPreference(const QString& key, const QString& value);
+    bool setPreferences(const QList<QPair<QString, QString>>& values);
+    QString databasePath() const;
+    QString userStatePath() const;
+    // When the active music folder was last fully scanned (0 if never).
+    qint64 lastScanCompletedMs() const;
+    // Title-screen text as a JSON file (for moving it between computers).
+    // Refused while the library is being scanned, and for files inside a
+    // music folder. Returns a short summary, or false with the reason.
+    bool exportTitleScreens(const QString& path, QString* summary, QString* error);
+    bool importTitleScreens(const QString& path, QString* summary, QString* error);
     void setLibrarySort(LibrarySort sort);
     // Counts one sung play of a song version (never for previews). The play
     // is kept in the user-state store under the song's content identity (the
@@ -92,6 +113,15 @@ public:
     QList<ReviewRow> reviewList(ReviewFilter filter, const QString& text, int limit = 500,
                                 QString* error = nullptr) const;
     qint64 reviewCount(ReviewFilter filter, QString* error = nullptr) const;
+    // The name-quality counts, worked out on a worker thread (never the
+    // interface's): reviewSummaryReady() brings them. Remembered until the
+    // catalogue changes; asking again while they are being counted starts
+    // nothing new, and a count made before a change is never delivered.
+    void requestReviewSummary();
+    std::optional<ReviewSummary> cachedReviewSummary() const { return m_reviewSummary; }
+    bool isCountingReviewSummary() const { return m_summaryRunning; }
+    using ReviewSummaryReader = std::function<std::optional<ReviewSummary>(const QString& databasePath)>;
+    void setReviewSummaryReader(ReviewSummaryReader reader) { m_summaryReader = std::move(reader); }
     QVariantMap reviewDetail(qint64 songId, QString* error = nullptr) const;
     void setPlaybackActive(bool active);
     bool setManualOverride(qint64 songId, const std::optional<QString>& artist,
@@ -112,6 +142,11 @@ signals:
     void catalogueChanged();
     void progressChanged(const QString& phase, qint64 done, qint64 total);
     void libraryReady();
+    // A song's play count or last-played time is now in the library.
+    void playStatsChanged(qint64 songId);
+    void reviewSummaryReady(const ReviewSummary& summary);
+    // The counts could not be worked out (asking again tries once more).
+    void reviewSummaryFailed();
     void scanFinished(const QVariantMap& summary);
     void scanRequested(const QString& rootPath);
     void metadataReprocessRequested();
@@ -124,6 +159,8 @@ private slots:
 
 private:
     void invalidateBrowseCache();
+    void startReviewSummary();
+    void finishReviewSummary(const std::optional<ReviewSummary>& summary, quint64 generation);
     void startScan(const QString& rootPath);
     void startPendingWork();
 
@@ -159,4 +196,10 @@ private:
     qint64 m_done = 0;
     qint64 m_total = -1;
     bool m_rootWasConnected = false;
+    mutable qint64 m_songCount = -1;  // -1: not known (see statusText)
+    std::optional<ReviewSummary> m_reviewSummary;
+    quint64 m_summaryGeneration = 0;
+    bool m_summaryRunning = false;
+    bool m_summaryWanted = false;
+    ReviewSummaryReader m_summaryReader;
 };

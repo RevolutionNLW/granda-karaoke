@@ -11,10 +11,12 @@ class LibraryController;
 class PlaylistPlayback;
 class PlaylistStore;
 class QComboBox;
+class QHBoxLayout;
 class QLabel;
 class QListWidget;
 class QMimeData;
 class QPushButton;
+class QTabBar;
 
 class PlaylistView : public QWidget {
     Q_OBJECT
@@ -54,6 +56,19 @@ public:
     QPushButton* moveDownButton() const { return m_moveDownButton; }
     QPushButton* removeButton() const { return m_removeButton; }
     QPushButton* autoplayButton() const { return m_autoplayButton; }
+    // Autoplay is shown with the player controls; the view keeps it in step
+    // with the playlist store.
+    QPushButton* takeAutoplayButton();
+    QTabBar* playlistTabs() const { return m_tabs; }
+    // Asking before a song is removed can be turned off (Settings); deleting
+    // a whole playlist always asks.
+    void setConfirmRemove(bool confirm) { m_confirmRemove = confirm; }
+    // Shows the next (1) or previous (-1) playlist, if there is one.
+    void showAdjacentPlaylist(int step);
+    // The pane in use shows its selection in gold; the other keeps its
+    // selection, shown quietly.
+    void setActive(bool active);
+    bool isActive() const { return m_active; }
 
 public slots:
     void refresh();
@@ -63,6 +78,8 @@ signals:
     void playRequested(PlaylistEntry entry, bool autoplay);
     void displayedPlaylistChanged(bool available);
     void backRequested();
+    // The playlist pane was used with the mouse (tabs, buttons, a drop).
+    void interacted();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -82,12 +99,18 @@ private:
     QString displayText(const PlaylistEntry& entry) const;
     std::optional<QString> askForName(const QString& title,
                                       const QString& currentName = {});
+    void setMessageText(const QString& text);
     void showStoreError(const QString& fallback, const QString& detail = {});
 
     PlaylistStore* m_store;
     LibraryController* m_libraryController;
     PlaylistPlayback* m_playback;
     QComboBox* m_chooser;
+    QTabBar* m_tabs;
+    QLabel* m_countLabel;
+    QWidget* m_columnHeader;
+    bool m_active = false;
+    bool m_confirmRemove = true;
     QLabel* m_message;
     QListWidget* m_items;
     QPushButton* m_newButton;
@@ -98,6 +121,7 @@ private:
     QPushButton* m_moveDownButton;
     QPushButton* m_removeButton;
     QPushButton* m_autoplayButton;
+    QHBoxLayout* m_autoplayRow;
     NamePrompt m_namePrompt;
     DeleteConfirmation m_deleteConfirmation;
     RemoveConfirmation m_removeConfirmation;

@@ -53,6 +53,14 @@ public:
     void stop();   // Stops and resets audio and lyrics to the beginning.
     void setKeySemitones(int semitones);
     void setTempoPercent(int percent);
+    // The sound output to use, by the name the system shows for it (see
+    // AudioOutputs.h); empty = the system default. A song already loaded
+    // keeps its output: the change applies from the next song.
+    void setAudioOutput(const QString& name);
+    QString audioOutput() const { return m_outputName; }
+    // Loudness of the music, 0-100% (100% = the song as recorded).
+    void setVolumePercent(int percent);
+    int volumePercent() const { return m_volumePercent; }
 
     State state() const { return m_state; }
     bool hasSong() const { return m_song.isValid(); }
@@ -112,6 +120,9 @@ private:
     void emitFrameIfChanged();
 
     QString m_audioSinkName;
+    QString m_outputName;
+    bool m_outputChanged = false;
+    int m_volumePercent = 100;
     GstElement* m_pipeline = nullptr;
     GstElement* m_pitchElement = nullptr; // Borrowed from the audio-filter bin.
     QTimer m_timer;

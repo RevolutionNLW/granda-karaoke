@@ -12,6 +12,7 @@ Q_LOGGING_CATEGORY(lcApp, "fks.app")
 Q_LOGGING_CATEGORY(lcPlayer, "fks.player")
 Q_LOGGING_CATEGORY(lcCdg, "fks.cdg")
 Q_LOGGING_CATEGORY(lcUi, "fks.ui")
+Q_LOGGING_CATEGORY(lcTiming, "fks.timing", QtWarningMsg)
 
 namespace {
 

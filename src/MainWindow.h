@@ -4,9 +4,17 @@
 #include "SongSettings.h"
 #include "platform/DisplaySleepBlocker.h"
 
+#include <QHash>
+#include <QPointer>
 #include <QWidget>
 
+#include <functional>
+#include <memory>
+
+class AppPreferences;
 class LyricsView;
+class QAction;
+class SettingsDialog;
 class LibraryController;
 class LibraryView;
 class MetadataReviewDialog;
@@ -17,8 +25,10 @@ struct PlaylistEntry;
 class QStackedWidget;
 class QLabel;
 class QPushButton;
+class QToolButton;
 
-// The main controls: Open Song, Play/Resume, Pause, Stop and the song status.
+// The home screen (player bar, library search, song library and playlists)
+// and the fullscreen lyrics page that it switches to while a song plays.
 class MainWindow : public QWidget {
     Q_OBJECT
 
@@ -26,6 +36,7 @@ public:
     explicit MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
                         LibraryController* libraryController = nullptr,
                         PlaylistStore* playlistStore = nullptr,
+                        AppPreferences* preferences = nullptr,
                         QWidget* parent = nullptr);
     ~MainWindow() override;
 
@@ -38,9 +49,8 @@ public:
     bool libraryVisible() const;
     bool displaySleepBlocked() const { return m_displaySleepBlocker.isActive(); }
     QPushButton* exitButton() const { return m_exitButton; }
-    QPushButton* openButton() const { return m_openButton; }
-    QPushButton* findButton() const { return m_findButton; }
-    QPushButton* playlistsButton() const { return m_playlistsButton; }
+    QPushButton* lyricsButton() const { return m_lyricsButton; }
+    QToolButton* settingsButton() const { return m_settingsButton; }
     QPushButton* playButton() const { return m_playButton; }
     QPushButton* pauseButton() const { return m_pauseButton; }
     QPushButton* stopButton() const { return m_stopButton; }
@@ -70,15 +80,44 @@ public:
     // When false, problems are shown only in the status line (used by tests).
     void setShowErrorDialogs(bool show) { m_showErrorDialogs = show; }
 
+    AppPreferences* preferences() const { return m_preferences; }
+    // The action behind a configurable shortcut (see ui/Shortcuts.h).
+    QAction* shortcutAction(const QString& id) const { return m_actions.value(id); }
+    SettingsDialog* openSettings();
+    // Where the program keeps its files, for Settings > Advanced (label, path).
+    void setDataLocations(QList<QPair<QString, QString>> locations)
+    {
+        m_dataLocations = std::move(locations);
+    }
+    // Replaces the Exit confirmation question (tests); returns true to exit.
+    void setExitConfirmation(std::function<bool()> confirm) { m_exitConfirmation = std::move(confirm); }
+
 protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void installShortcuts();
+    void runAction(const QString& id);
+    void applyPreference(const QString& key);
+    void applyDisplaySleep();
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void changeEvent(QEvent* event) override;
 
 private:
     bool loadSong(const QString& path);
+    QWidget* buildPlayerBar();
     void chooseSong();
-    void showLibrary();
+    // A song is playing or paused for singing (not a maintenance preview).
+    bool songActive() const;
+    // Keyboard focus for the home screen: the search box when there is one.
+    void focusHome();
+    // Which of the library and the playlist is in use (shows its selection
+    // strongly).
+    void setPlaylistInUse(bool playlist);
+    // "Artist – Song" for the song loaded, from the library when it is known.
+    QString songTitle();
+    // Focus after a dialog or menu closes: the window on the lyrics page,
+    // otherwise the home screen's.
+    void restoreFocus();
     void singLibrarySong(qint64 songId);
     void playPlaylistItem(PlaylistEntry entry, bool autoplay);
     void onPlay();
@@ -95,6 +134,13 @@ private:
     void showError(const QString& message);
     void setPreviewing(bool previewing);
 
+    std::unique_ptr<AppPreferences> m_ownPreferences;
+    AppPreferences* m_preferences;
+    QHash<QString, QAction*> m_actions;
+    QPointer<SettingsDialog> m_settings;
+    QList<QPair<QString, QString>> m_dataLocations;
+    std::function<bool()> m_exitConfirmation;
+    bool m_exitConfirmed = false;
     KaraokePlayer* m_player;
     ISongSettingsStore* m_settingsStore;
     LibraryController* m_libraryController;
@@ -102,18 +148,15 @@ private:
     PlaylistPlayback* m_playlistPlayback;
     DisplaySleepBlocker m_displaySleepBlocker;
     QStackedWidget* m_pages;
-    QWidget* m_controls;
+    QWidget* m_home;
     LyricsView* m_lyrics;
     LibraryView* m_library = nullptr;
     PlaylistView* m_playlistView = nullptr;
     MetadataReviewDialog* m_review = nullptr;
-    QWidget* m_libraryPage = nullptr;
     QLabel* m_songLabel;
     QLabel* m_statusLabel;
-    QLabel* m_hintLabel;
-    QPushButton* m_openButton;
-    QPushButton* m_findButton;
-    QPushButton* m_playlistsButton;
+    QPushButton* m_lyricsButton;
+    QToolButton* m_settingsButton;
     QPushButton* m_playButton;
     QPushButton* m_pauseButton;
     QPushButton* m_stopButton;
@@ -137,4 +180,10 @@ private:
     // A start is counted once its audio position first advances, so a start
     // that fails before any sound is never a play.
     bool m_playStartPending = false;
+    // The home-screen widget that had the keyboard before the lyrics opened.
+    QPointer<QWidget> m_homeFocus;
+    // songTitle() is looked up once per song, not on every position update.
+    QString m_title;
+    QString m_titlePath;
+    qint64 m_titleSongId = -1;
 };
