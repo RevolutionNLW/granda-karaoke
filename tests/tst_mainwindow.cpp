@@ -5,6 +5,7 @@
 
 #include "LyricsView.h"
 #include "MainWindow.h"
+#include "SettingsDialog.h"
 #include "BusTestPlayer.h"
 #include "SongSettings.h"
 #include "TestMedia.h"
@@ -18,6 +19,7 @@
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QToolButton>
+#include <QAction>
 #include <QtTest>
 
 using State = KaraokePlayer::State;
@@ -55,7 +57,7 @@ private slots:
     void modalDialogKeysStayInDialog_data();
     void modalDialogKeysStayInDialog();
     void exitStopsAndCloses();
-    void exitButtonOnlyInFullScreen();
+    void noExitButtonOnTheMainScreen();
     void displaySleepFollowsPlayerStates();
     void displaySleepReleasedOnDestruction();
 
@@ -278,7 +280,6 @@ void TestMainWindow::keysNeverClickButtons()
     const QList<QAbstractButton*> buttons = m_window->findChildren<QAbstractButton*>();
     QVERIFY(buttons.contains(m_window->lyricsButton()));
     QVERIFY(buttons.contains(m_window->settingsButton()));
-    QVERIFY(buttons.contains(m_window->exitButton()));
     for (QAbstractButton* button : buttons) {
         QCOMPARE(button->focusPolicy(), Qt::NoFocus);
         clicks.push_back(std::make_unique<QSignalSpy>(button, &QAbstractButton::clicked));
@@ -669,41 +670,61 @@ void TestMainWindow::exitStopsAndCloses()
 {
     startPlaying();
     QTest::keyClick(m_window->windowHandle(), Qt::Key_Escape);
-    QTest::mouseClick(m_window->exitButton(), Qt::LeftButton);
+    // Settings > General > Quit Application.
+    SettingsDialog* settings = m_window->openSettings();
+    settings->showPage(QStringLiteral("General"));
+    QPushButton* quit = nullptr;
+    for (QPushButton* button : settings->findChildren<QPushButton*>()) {
+        if (button->text() == QStringLiteral("Quit Application"))
+            quit = button;
+    }
+    QVERIFY(quit);
+    QTest::mouseClick(quit, Qt::LeftButton);
+    QTRY_VERIFY(!m_window->isVisible());
     QCOMPARE(m_player->state(), State::Stopped);
     QCOMPARE(m_player->positionMs(), 0);
-    QVERIFY(!m_window->isVisible());
     QVERIFY(!m_window->displaySleepBlocked());
 }
 
-void TestMainWindow::exitButtonOnlyInFullScreen()
+void TestMainWindow::noExitButtonOnTheMainScreen()
 {
-    // Full screen has no window close button, so Exit is shown there.
+    // The window's close button, the Exit shortcut and Settings close the
+    // program; the main screen has no Exit button, in full screen or not.
+    const auto exitButtons = [this] {
+        int count = 0;
+        for (QAbstractButton* button : m_window->findChildren<QAbstractButton*>()) {
+            const QString text = button->text().remove(QLatin1Char('&'));
+            if (text.compare(QStringLiteral("Exit"), Qt::CaseInsensitive) == 0
+                || text.compare(QStringLiteral("Quit"), Qt::CaseInsensitive) == 0)
+                ++count;
+        }
+        return count;
+    };
     QVERIFY(m_window->isFullScreen());
-    QVERIFY(m_window->exitButton()->isVisible());
-    const QSize smallest = m_window->minimumSizeHint();
-    // A window closes with its own close button; Exit is not shown.
+    QCOMPARE(exitButtons(), 0);
     m_window->showNormal();
     QTRY_VERIFY(!m_window->isFullScreen());
-    QVERIFY(!m_window->exitButton()->isVisible());
-    // Its smallest size does not change, so going full screen never resizes it.
-    QCOMPARE(m_window->minimumSizeHint(), smallest);
+    QCOMPARE(exitButtons(), 0);
     QVERIFY(m_window->lyricsButton()->isVisible());
     QVERIFY(m_window->settingsButton()->isVisible());
-    // The Exit shortcut stays available either way.
-    QVERIFY(m_window->shortcutAction(QStringLiteral("app.exit")));
-    // Playing a song fills the screen, and Exit is back on the controls.
+
+    // Full screen still leads back to the controls with Escape.
     startPlaying();
     QTRY_VERIFY(m_window->isFullScreen());
+    QVERIFY(m_window->lyricsVisible());
     QTest::keyClick(m_window->windowHandle(), Qt::Key_Escape);
     QVERIFY(!m_window->lyricsVisible());
-    QVERIFY(m_window->exitButton()->isVisible());
-    // Closing the window the ordinary way still stops and closes.
-    m_window->showNormal();
-    QTRY_VERIFY(!m_window->isFullScreen());
-    QVERIFY(m_window->close());
+    QCOMPARE(m_player->state(), State::Playing);
+    QTest::keyClick(m_window->windowHandle(), Qt::Key_Return);
+    QVERIFY(m_window->lyricsVisible());
+    QTest::keyClick(m_window->windowHandle(), Qt::Key_Escape);
+
+    // The Exit shortcut closes the program.
+    QAction* exit = m_window->shortcutAction(QStringLiteral("app.exit"));
+    QVERIFY(exit);
+    exit->trigger();
+    QTRY_VERIFY(!m_window->isVisible());
     QCOMPARE(m_player->state(), State::Stopped);
-    QVERIFY(!m_window->isVisible());
 }
 
 void TestMainWindow::displaySleepFollowsPlayerStates()

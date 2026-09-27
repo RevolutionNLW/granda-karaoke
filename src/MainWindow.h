@@ -23,7 +23,6 @@ class PlaylistStore;
 class PlaylistView;
 struct PlaylistEntry;
 class QStackedWidget;
-class QHBoxLayout;
 class QLabel;
 class QPushButton;
 class QToolButton;
@@ -49,7 +48,6 @@ public:
     bool lyricsVisible() const;
     bool libraryVisible() const;
     bool displaySleepBlocked() const { return m_displaySleepBlocker.isActive(); }
-    QPushButton* exitButton() const { return m_exitButton; }
     QPushButton* lyricsButton() const { return m_lyricsButton; }
     QToolButton* settingsButton() const { return m_settingsButton; }
     QPushButton* playButton() const { return m_playButton; }
@@ -102,8 +100,6 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void changeEvent(QEvent* event) override;
-    // Exit in full screen only, without changing the window's smallest size.
-    void updateExitButton();
 
 private:
     bool loadSong(const QString& path);
@@ -171,9 +167,7 @@ private:
     QPushButton* m_tempoDownButton;
     QPushButton* m_tempoUpButton;
     QPushButton* m_tempoResetButton;
-    QPushButton* m_exitButton;
-    QWidget* m_nowPlaying = nullptr;
-    QHBoxLayout* m_topRow = nullptr;
+
     QString m_songIdentity;
     bool m_identityWarningLogged = false;
     QString m_errorText;

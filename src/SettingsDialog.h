@@ -41,6 +41,8 @@ public:
         QList<QPair<QString, QString>> dataLocations;
         std::function<void()> openSongFile;
         std::function<void()> openNeedsReview;
+        // Closes the program (asking first if the user chose so).
+        std::function<void()> quit;
     };
     // Asked before a shortcut is moved from one action to another; returns
     // true to move it (tests replace the question).

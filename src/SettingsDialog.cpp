@@ -356,6 +356,14 @@ QWidget* SettingsDialog::buildGeneral()
                                    "Takes effect the next time it starts."), page);
     addSection(layout, QStringLiteral("Leaving"), page);
     flag(QStringLiteral("Ask before exiting"), pref::ConfirmExit, false);
+    auto* quit = makeButton(QStringLiteral("Quit Application"), page, QStringLiteral("ghostButton"));
+    connect(quit, &QPushButton::clicked, this, [this] {
+        accept();
+        if (m_context.quit)
+            m_context.quit();
+    });
+    layout->addWidget(quit, 0, Qt::AlignLeft);
+    addHint(layout, QStringLiteral("Closes Frankie's Karaoke Studio, as the window's close button does."), page);
 
     layout->addStretch();
     auto* restore = makeButton(QStringLiteral("Restore General Defaults"), page, QStringLiteral("ghostButton"));

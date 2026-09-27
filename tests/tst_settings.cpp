@@ -681,22 +681,41 @@ void TestSettings::exitCanAskFirst()
         ++asked;
         return answer;
     });
-    window.exitButton()->click();
+    window.shortcutAction(QStringLiteral("app.exit"))->trigger();
     QCOMPARE(asked, 0);  // off by default
     QVERIFY(!window.isVisible());
 
     window.show();
     player.play();
     window.preferences()->setFlag(pref::ConfirmExit, true);
-    window.exitButton()->click();
+    window.shortcutAction(QStringLiteral("app.exit"))->trigger();
     QCOMPARE(asked, 1);
     QVERIFY(window.isVisible());
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
     answer = true;
-    window.exitButton()->click();
+    window.shortcutAction(QStringLiteral("app.exit"))->trigger();
     QCOMPARE(asked, 2);
     QVERIFY(!window.isVisible());
     QCOMPARE(player.state(), KaraokePlayer::State::Stopped);
+
+    // Settings > General > Quit Application asks the same way.
+    window.show();
+    answer = false;
+    const auto quit = [&window] {
+        SettingsDialog* dialog = window.openSettings();
+        dialog->showPage(QStringLiteral("General"));
+        QPushButton* button = buttonWithText(dialog, QStringLiteral("Quit Application"));
+        QVERIFY(button);
+        button->click();
+        QTRY_VERIFY(!dialog->isVisible());
+    };
+    quit();
+    QTRY_COMPARE(asked, 3);
+    QVERIFY(window.isVisible());
+    answer = true;
+    quit();
+    QTRY_COMPARE(asked, 4);
+    QTRY_VERIFY(!window.isVisible());
 }
 
 void TestSettings::lyricsCanStayUpAtTheEndOfASong()
