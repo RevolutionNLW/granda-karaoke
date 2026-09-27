@@ -147,7 +147,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
         workspace->setStretchFactor(1, 2);
         workspace->setSizes({600, 400});
         // Enough room for several rows on each side at the smallest size.
-        theme::setMinimumHeight(workspace, 300);
+        theme::setMinimumHeight(workspace, 270);
         connect(theme::notifier(), &theme::Notifier::changed, workspace, [workspace] {
             workspace->setHandleWidth(theme::px(12));
         });
@@ -160,6 +160,8 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     }
 
     connect(m_exitButton, &QPushButton::clicked, this, &QWidget::close);
+    updateExitButton();
+    connect(theme::notifier(), &theme::Notifier::changed, this, &MainWindow::updateExitButton);
     connect(m_lyricsButton, &QPushButton::clicked, this, [this] {
         if (songActive())
             showLyrics();
@@ -276,6 +278,7 @@ QWidget* MainWindow::buildPlayerBar()
     auto* appTitle = makeLabel(QStringLiteral("Frankie's Karaoke Studio"), bar,
                                QStringLiteral("appTitle"));
     auto* nowPlaying = new QFrame(bar);
+    m_nowPlaying = nowPlaying;
     nowPlaying->setObjectName(QStringLiteral("nowPlaying"));
     auto* nowCaption = makeLabel(QStringLiteral("NOW PLAYING:"), nowPlaying,
                                  QStringLiteral("nowPlayingCaption"));
@@ -291,6 +294,7 @@ QWidget* MainWindow::buildPlayerBar()
     nowLayout->addWidget(m_statusLabel, 2);
 
     auto* topRow = new QHBoxLayout;
+    m_topRow = topRow;
     topRow->setSpacing(10);
     topRow->addWidget(brandMark);
     topRow->addWidget(appTitle);
@@ -372,7 +376,8 @@ QWidget* MainWindow::buildPlayerBar()
     separator(controlRow);
     controlRow->addLayout(tempoRow);
     controlRow->addStretch();
-    // Lyrics, Settings and Exit sit at the top right, beside Now Playing.
+    // Lyrics, Settings (and Exit, in full screen) sit at the top right,
+    // beside Now Playing.
     topRow->addWidget(m_lyricsButton);
     topRow->addWidget(m_settingsButton);
     topRow->addWidget(m_exitButton);
@@ -704,6 +709,8 @@ void MainWindow::closeEvent(QCloseEvent* event)
 void MainWindow::changeEvent(QEvent* event)
 {
     QWidget::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange)
+        updateExitButton();
     if (event->type() == QEvent::ActivationChange && isActiveWindow()) {
         QWidget* focused = QApplication::focusWidget();
         if (lyricsVisible()) {
@@ -713,6 +720,21 @@ void MainWindow::changeEvent(QEvent* event)
             focusHome();
         }
     }
+}
+
+void MainWindow::updateExitButton()
+{
+    // Exit is shown only in full screen, which has no window close button; a
+    // window closes with its own.
+    const bool fullScreen = windowState() & Qt::WindowFullScreen;
+    // While it is hidden, Now Playing keeps its room, so the window's smallest
+    // size is the same either way: a window at exactly that size would
+    // otherwise be resized, and drop out of full screen, as Exit appeared.
+    if (m_nowPlaying && m_topRow) {
+        const int room = fullScreen ? 0 : m_exitButton->sizeHint().width() + m_topRow->spacing();
+        m_nowPlaying->setMinimumWidth(m_nowPlaying->minimumSizeHint().width() + room);
+    }
+    m_exitButton->setVisible(fullScreen);
 }
 
 MetadataReviewDialog* MainWindow::openMetadataReview()

@@ -2,6 +2,7 @@
 
 #include "LibraryController.h"
 #include "LyricsView.h"
+#include "ui/Controls.h"
 #include "ui/Theme.h"
 
 #include <QCheckBox>
@@ -153,7 +154,7 @@ MetadataReviewDialog::MetadataReviewDialog(LibraryController* controller, QWidge
     setWindowTitle(QStringLiteral("Library Maintenance — Song Names"));
     resize(theme::px(1200), theme::px(760));
 
-    m_filter = new QComboBox(this);
+    m_filter = new ui::ComboBox(this);
     for (const FilterChoice& choice : kFilters)
         m_filter->addItem(QString::fromLatin1(choice.label), int(choice.filter));
     m_search = new QLineEdit(this);

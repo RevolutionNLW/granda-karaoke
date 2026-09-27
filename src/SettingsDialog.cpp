@@ -8,6 +8,7 @@
 #include "Logging.h"
 #include "SongSettings.h"
 #include "playlist/PlaylistStore.h"
+#include "ui/Controls.h"
 #include "ui/Shortcuts.h"
 #include "ui/Theme.h"
 
@@ -85,7 +86,7 @@ QPushButton* makeButton(const QString& text, QWidget* parent, const QString& obj
 void addSection(QVBoxLayout* layout, const QString& title, QWidget* parent)
 {
     if (layout->count() > 0)
-        theme::addSpacing(layout, 14);
+        theme::addSpacing(layout, 18);
     layout->addWidget(makeLabel(title, parent, QStringLiteral("settingsSection")));
 }
 
@@ -343,6 +344,7 @@ QWidget* SettingsDialog::buildGeneral()
     };
 
     addSection(layout, QStringLiteral("Starting up"), page);
+    flag(QStringLiteral("Show the splash screen"), pref::ShowSplash, true);
     flag(QStringLiteral("Start in full screen"), pref::StartFullscreen, true);
     QCheckBox* remember = flag(QStringLiteral("Remember the window's size and position"),
                                pref::RememberWindow, true);
@@ -358,7 +360,8 @@ QWidget* SettingsDialog::buildGeneral()
     layout->addStretch();
     auto* restore = makeButton(QStringLiteral("Restore General Defaults"), page, QStringLiteral("ghostButton"));
     connect(restore, &QPushButton::clicked, this, [prefs] {
-        for (const QString& key : {pref::StartFullscreen, pref::RememberWindow, pref::ConfirmExit})
+        for (const QString& key : {pref::ShowSplash, pref::StartFullscreen, pref::RememberWindow,
+                                   pref::ConfirmExit})
             prefs->reset(key);
     });
     layout->addWidget(restore, 0, Qt::AlignLeft);
@@ -477,7 +480,7 @@ QWidget* SettingsDialog::buildPlayback()
 
     addSection(layout, QStringLiteral("Autoplay"), page);
     QHBoxLayout* autoplayRow = addRow(layout, QStringLiteral("When the program starts"), page);
-    auto* autoplay = new QComboBox(page);
+    auto* autoplay = new ui::ComboBox(page);
     autoplay->addItem(QStringLiteral("Keep it as it was"), QStringLiteral("remember"));
     autoplay->addItem(QStringLiteral("Turn Autoplay on"), QStringLiteral("on"));
     autoplay->addItem(QStringLiteral("Turn Autoplay off"), QStringLiteral("off"));
@@ -626,7 +629,7 @@ QWidget* SettingsDialog::buildLibrary()
 
     addSection(layout, QStringLiteral("Order of songs"), page);
     QHBoxLayout* sortRow = addRow(layout, QStringLiteral("Library order"), page);
-    m_sortChoice = new QComboBox(page);
+    m_sortChoice = new ui::ComboBox(page);
     for (const LibrarySort sort : {LibrarySort::ArtistAsc, LibrarySort::ArtistDesc,
                                    LibrarySort::TitleAsc, LibrarySort::TitleDesc,
                                    LibrarySort::MostPlayed, LibrarySort::RecentlyPlayed,
@@ -708,7 +711,7 @@ QWidget* SettingsDialog::buildPlaylists()
 
     addSection(layout, QStringLiteral("Starting up"), page);
     QHBoxLayout* startRow = addRow(layout, QStringLiteral("Playlist shown when the program starts"), page);
-    auto* startup = new QComboBox(page);
+    auto* startup = new ui::ComboBox(page);
     startRow->addWidget(startup);
     connect(startup, &QComboBox::activated, prefs, [prefs, startup] {
         const QString value = startup->currentData().toString();
@@ -783,6 +786,7 @@ QWidget* SettingsDialog::buildShortcuts()
     m_shortcutList->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_shortcutList->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_shortcutList->header()->setSectionsClickable(false);
+    ui::extendHeaderOverScrollBar(m_shortcutList);
     theme::setMinimumHeight(m_shortcutList, 260);
     layout->addWidget(m_shortcutList, 1);
 
@@ -862,7 +866,7 @@ void SettingsDialog::refreshShortcutList()
     for (const auto& [title, key] : fixed) {
         if (!matches({title, key, QStringLiteral("Built in")}))
             continue;
-        auto* item = new QTreeWidgetItem(m_shortcutList, {title, key + QStringLiteral("   • Built in")});
+        auto* item = new QTreeWidgetItem(m_shortcutList, {title, key + QStringLiteral("  (built in)")});
         item->setFlags(Qt::ItemIsEnabled);
         item->setForeground(1, theme::color::textMuted);
     }
@@ -1076,7 +1080,7 @@ QWidget* SettingsDialog::buildAudio()
 
     addSection(layout, QStringLiteral("Sound output"), page);
     QHBoxLayout* outputRow = addRow(layout, QStringLiteral("Play the music through"), page);
-    auto* output = new QComboBox(page);
+    auto* output = new ui::ComboBox(page);
     output->setObjectName(QStringLiteral("audioOutput"));
     theme::setMinimumWidth(output, 240);
     auto* refresh = makeButton(QStringLiteral("Refresh"), page, QStringLiteral("linkButton"));
@@ -1156,6 +1160,8 @@ QWidget* SettingsDialog::buildAudio()
     volume->setSingleStep(5);
     volume->setPageStep(10);
     theme::setMinimumWidth(volume, 220);
+    // Room for the whole knob at every scale.
+    theme::setMinimumHeight(volume, 22);
     auto* volumeValue = makeLabel(QString(), page, QStringLiteral("settingValue"));
     volumeValue->setWordWrap(false);
     volumeValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);

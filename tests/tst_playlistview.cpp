@@ -18,6 +18,7 @@
 #include <QDropEvent>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFrame>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
@@ -254,6 +255,7 @@ private slots:
     void homeScreenEnterNeverChangesTheSong();
     void presentationFollowsPaneInUseAndPlayback();
     void onlyThePaneInUsePaintsItsSelectionGold();
+    void panesStayReadableOnALaptopScreenAtEveryScale();
     void playbackMarkerTracksActualState();
     void movingPastViewportKeepsSelectionFullyVisible();
     void stopAndBusErrorNeverAutoplayWithSuccessors();
@@ -2047,6 +2049,85 @@ void TestPlaylistView::onlyThePaneInUsePaintsItsSelectionGold()
     items->setFocus(Qt::TabFocusReason);
     QTRY_VERIFY(view->isActive());
     expectPaint(false);
+}
+
+void TestPlaylistView::panesStayReadableOnALaptopScreenAtEveryScale()
+{
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    prepareLibrary(temporary, controller);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    const QString longName = QStringLiteral("Saturday Sing-Along With The Whole Family");
+    for (const QString& name : {QStringLiteral("Friday Night"), QStringLiteral("Country"),
+                                QStringLiteral("Favourites"), longName, QStringLiteral("Christmas")})
+        QVERIFY(playlists.createPlaylist(name));
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* tabs = window.playlistView()->findChild<QTabBar*>(QStringLiteral("playlistTabs"));
+    QVERIFY(tabs);
+    QCOMPARE(tabs->count(), 5);
+    QTreeView* results = window.libraryView()->resultsList();
+    QHeaderView* header = results->header();
+
+    // Where a widget with this name sits in the window.
+    const auto placeIn = [&window](QWidget* pane, const QString& name) {
+        QWidget* widget = pane->findChild<QWidget*>(name);
+        return widget ? QRect(widget->mapTo(&window, QPoint(0, 0)), widget->size()) : QRect();
+    };
+    for (const int percent : {80, 100, 110, 125, 150}) {
+        theme::setScalePercent(percent);
+        const QString at = QStringLiteral("at %1%").arg(percent);
+        // A 1366x768 laptop, with room left for the taskbar and title bar.
+        QVERIFY2(window.minimumSizeHint().width() <= 1366, qPrintable(at));
+        QVERIFY2(window.minimumSizeHint().height() <= 705, qPrintable(at + QStringLiteral(" %1").arg(window.minimumSizeHint().height())));
+        window.resize(1366, 705);
+        QCoreApplication::processEvents();
+
+        // Short playlist names are never cut; a long one is cut, not the others.
+        const QFontMetrics metrics(tabs->font());
+        for (int tab = 0; tab < tabs->count(); ++tab) {
+            const QString name = tabs->tabText(tab);
+            if (name == longName) {
+                QVERIFY2(tabs->tabRect(tab).width() <= theme::px(200), qPrintable(at));
+                QCOMPARE(tabs->tabToolTip(tab), longName);
+            } else {
+                QVERIFY2(tabs->tabRect(tab).width() >= metrics.horizontalAdvance(name) + theme::px(20),
+                         qPrintable(at + QStringLiteral(" ") + name));
+            }
+        }
+
+        // The two panes' titles and bottom buttons line up across the window.
+        LibraryView* library = window.libraryView();
+        PlaylistView* list = window.playlistView();
+        QVERIFY2(qAbs(placeIn(library, QStringLiteral("paneTitle")).center().y()
+                      - placeIn(list, QStringLiteral("paneTitle")).center().y()) <= 1, qPrintable(at));
+        QCOMPARE(placeIn(library, QStringLiteral("paneFooter")).bottom(),
+                 placeIn(list, QStringLiteral("paneFooter")).bottom());
+
+        // Artist and Song keep the most room; Label and Disc ID stay usable.
+        const int artist = header->sectionSize(LibraryResultsModel::ArtistColumn);
+        const int song = header->sectionSize(LibraryResultsModel::SongColumn);
+        const int label = header->sectionSize(LibraryResultsModel::LabelColumn);
+        const int disc = header->sectionSize(LibraryResultsModel::DiscColumn);
+        QVERIFY2(artist >= label && song >= label, qPrintable(at));
+        QVERIFY2(disc >= theme::px(104) && label >= theme::px(100), qPrintable(at));
+
+        // The scroll bar starts under the column captions, not beside them.
+        auto* corner = results->findChild<QFrame*>(QStringLiteral("headerCorner"));
+        QVERIFY(corner);
+        QCOMPARE(corner->maximumHeight(), header->height());
+    }
+    theme::setScalePercent(100);
+    // In a wide window the Label column has room for a whole label name.
+    window.resize(1920, 1080);
+    QCoreApplication::processEvents();
+    QVERIFY(header->sectionSize(LibraryResultsModel::LabelColumn)
+            >= QFontMetrics(results->font()).horizontalAdvance(QStringLiteral("Essential Karaoke")) + 24);
 }
 
 void TestPlaylistView::playbackMarkerTracksActualState()

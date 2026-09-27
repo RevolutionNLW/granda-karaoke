@@ -5,10 +5,12 @@
 #include <QBoxLayout>
 #include <QFont>
 #include <QLayout>
+#include <QPainter>
 #include <QPalette>
 #include <QProxyStyle>
 #include <QRegularExpression>
 #include <QStyleFactory>
+#include <QStyleOption>
 #include <QWidget>
 
 #include <algorithm>
@@ -116,6 +118,11 @@ QComboBox {
     padding: 5px 10px;
 }
 QComboBox:hover { border-color: #43474e; }
+QComboBox:disabled { color: #5c5a56; background: #1f2125; border-color: #292b30; }
+/* The arrow is a chevron painted by ui::ComboBox. */
+QComboBox::drop-down { width: 26px; border: none; background: transparent; }
+QComboBox::down-arrow { image: none; }
+
 QComboBox QAbstractItemView {
     background: #212328;
     color: #ece8e1;
@@ -170,7 +177,14 @@ QTabBar::tab:hover { background: #24272c; color: #ece8e1; }
 QTabBar::tab:selected {
     background: #3a3226; color: #eaa244; border-color: #5e4c33;
 }
-QTabBar QToolButton { background: #26292e; border: 1px solid #34373d; border-radius: 4px; padding: 0px; }
+QTabBar::scroller { width: 52px; }
+QTabBar QToolButton {
+    background: #26292e; border: 1px solid #34373d; border-radius: 6px; padding: 0px; margin: 2px 1px;
+}
+QTabBar QToolButton:disabled { background: #1f2125; border-color: #292b30; }
+
+/* Continues a table's column-header strip over its scroll bar. */
+QFrame#headerCorner { background: #1f2226; border: none; border-bottom: 1px solid #2a2d32; }
 
 QSplitter::handle { background: transparent; }
 QSplitter::handle:hover { background: #2a2d32; }
@@ -208,7 +222,7 @@ QListWidget#settingsNav::item { padding: 8px 12px; border-radius: 6px; margin: 1
 QListWidget#settingsNav::item:hover { background: #26292e; color: #ece8e1; }
 QListWidget#settingsNav::item:selected { background: #3a3226; color: #eaa244; }
 #settingsTitle { font-size: 20px; font-weight: 700; color: #f5f1ea; }
-#settingsSection { font-size: 12px; font-weight: 700; color: #eaa244; padding-top: 4px; }
+#settingsSection { font-size: 12px; font-weight: 700; color: #eaa244; }
 #settingsHint { color: #8d8982; font-size: 12px; }
 #settingsPath { color: #c9c5be; font-size: 12px; background: #16171a; border: 1px solid #2a2d32;
                 border-radius: 6px; padding: 6px 8px; }
@@ -229,6 +243,36 @@ QSlider::handle:horizontal {
 )";
 
 int g_scalePercent = 100;
+
+} // namespace
+
+void paintChevron(QPainter* painter, const QRect& rect, Qt::ArrowType direction, bool enabled)
+{
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing);
+    const qreal side = qMin<qreal>(qMin(rect.width(), rect.height()), px(10));
+    const QPointF c = QRectF(rect).center();
+    const qreal a = side / 2;
+    const qreal b = side / 4;
+    // The three points of a '>' pointing right, turned to face `direction`.
+    QPointF points[3] = {{-b, -a}, {b, 0}, {-b, a}};
+    for (QPointF& point : points) {
+        switch (direction) {
+        case Qt::DownArrow: point = QPointF(point.y(), point.x()); break;
+        case Qt::UpArrow: point = QPointF(point.y(), -point.x()); break;
+        case Qt::LeftArrow: point = QPointF(-point.x(), point.y()); break;
+        default: break;
+        }
+        point += c;
+    }
+    painter->setPen(QPen(enabled ? QColor(0xb9, 0xb5, 0xae) : QColor(0x4c, 0x4a, 0x47),
+                         qMax<qreal>(1.4, side * 0.16), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter->setBrush(Qt::NoBrush);
+    painter->drawPolyline(points, 3);
+    painter->restore();
+}
+
+namespace {
 
 // Fusion, with the standard icon and check-box sizes kept at the interface
 // scale (the style sheet scales everything else).
@@ -255,6 +299,84 @@ public:
         default:
             return value;
         }
+    }
+
+    // Check boxes, radio buttons and arrows in the application's own look,
+    // drawn as vectors so they stay sharp at every scale.
+    void drawPrimitive(PrimitiveElement element, const QStyleOption* option, QPainter* painter,
+                       const QWidget* widget) const override
+    {
+        const bool enabled = option->state & State_Enabled;
+        switch (element) {
+        case PE_IndicatorCheckBox:
+        case PE_IndicatorRadioButton:
+            drawIndicator(element == PE_IndicatorRadioButton, option, painter);
+            return;
+        case PE_IndicatorArrowDown:
+            paintChevron(painter, option->rect, Qt::DownArrow, enabled);
+            return;
+        case PE_IndicatorArrowUp:
+            paintChevron(painter, option->rect, Qt::UpArrow, enabled);
+            return;
+        case PE_IndicatorArrowLeft:
+            paintChevron(painter, option->rect, Qt::LeftArrow, enabled);
+            return;
+        case PE_IndicatorArrowRight:
+            paintChevron(painter, option->rect, Qt::RightArrow, enabled);
+            return;
+        default:
+            QProxyStyle::drawPrimitive(element, option, painter, widget);
+        }
+    }
+
+private:
+    static void drawIndicator(bool radio, const QStyleOption* option, QPainter* painter)
+    {
+        const bool enabled = option->state & State_Enabled;
+        const bool on = option->state & (State_On | State_NoChange);
+        const bool hover = enabled && (option->state & State_MouseOver);
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        const qreal side = qMin(option->rect.width(), option->rect.height());
+        QRectF box(0, 0, side, side);
+        box.moveCenter(QRectF(option->rect).center());
+        box.adjust(0.5, 0.5, -0.5, -0.5);
+        QColor fill = on ? color::accent : QColor(0x14, 0x15, 0x18);
+        QColor edge = on ? color::accent : (hover ? QColor(0x5a, 0x5e, 0x66) : QColor(0x46, 0x4a, 0x52));
+        if (!enabled) {
+            fill = on ? QColor(0x4a, 0x40, 0x31) : QColor(0x1a, 0x1b, 0x1e);
+            edge = on ? QColor(0x4a, 0x40, 0x31) : QColor(0x2e, 0x30, 0x35);
+        }
+        const QColor mark = enabled ? color::onAccent : QColor(0x8a, 0x86, 0x7f);
+        painter->setPen(QPen(edge, 1.0));
+        painter->setBrush(fill);
+        if (radio) {
+            painter->drawEllipse(box);
+            if (on) {
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(mark);
+                const qreal dot = side * 0.18;
+                painter->drawEllipse(box.center(), dot, dot);
+            }
+        } else {
+            painter->drawRoundedRect(box, side * 0.22, side * 0.22);
+            const QPen stroke(mark, qMax<qreal>(1.5, side * 0.13), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            if (option->state & State_NoChange) {
+                painter->setPen(stroke);
+                painter->drawLine(QPointF(box.left() + side * 0.28, box.center().y()),
+                                  QPointF(box.right() - side * 0.28, box.center().y()));
+            } else if (on) {
+                painter->setPen(stroke);
+                painter->setBrush(Qt::NoBrush);
+                const QPointF points[] = {
+                    {box.left() + side * 0.26, box.top() + side * 0.52},
+                    {box.left() + side * 0.43, box.top() + side * 0.68},
+                    {box.left() + side * 0.74, box.top() + side * 0.34},
+                };
+                painter->drawPolyline(points, 3);
+            }
+        }
+        painter->restore();
     }
 };
 bool g_compactRows = false;

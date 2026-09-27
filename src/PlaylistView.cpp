@@ -141,6 +141,28 @@ private:
     QFont m_mono;
 };
 
+// The playlist tabs. A short name is always shown whole; a long one is cut
+// short (the full name is its tool tip), and the tabs scroll when there are
+// more than fit, rather than every name shrinking to a letter or two.
+class PlaylistTabBar final : public QTabBar {
+public:
+    using QTabBar::QTabBar;
+
+protected:
+    QSize tabSizeHint(int index) const override
+    {
+        QSize size = QTabBar::tabSizeHint(index);
+        size.setWidth(qMin(size.width(), theme::px(200)));
+        return size;
+    }
+    QSize minimumTabSizeHint(int index) const override
+    {
+        QSize size = tabSizeHint(index);
+        size.setWidth(qMin(size.width(), theme::px(140)));
+        return size;
+    }
+};
+
 // Column captions above the playlist rows, lined up with them.
 class PlaylistHeader final : public QWidget {
 public:
@@ -339,6 +361,8 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     pane->setObjectName(QStringLiteral("pane"));
     auto* title = new QLabel(QStringLiteral("Frankie's Playlists"), pane);
     title->setObjectName(QStringLiteral("paneTitle"));
+    // The same height as the library pane's title row, so the two line up.
+    theme::setFixedHeight(title, 26);
     m_countLabel = new QLabel(pane);
     m_countLabel->setObjectName(QStringLiteral("paneCount"));
 
@@ -347,7 +371,7 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     m_chooser->setObjectName(QStringLiteral("playlistChooser"));
     m_chooser->setFocusPolicy(Qt::NoFocus);
     m_chooser->hide();
-    m_tabs = new QTabBar(pane);
+    m_tabs = new PlaylistTabBar(pane);
     m_tabs->setObjectName(QStringLiteral("playlistTabs"));
     m_tabs->setFocusPolicy(Qt::NoFocus);
     m_tabs->setDrawBase(false);
@@ -537,6 +561,9 @@ void PlaylistView::setActive(bool active)
 QPushButton* PlaylistView::takeAutoplayButton()
 {
     m_autoplayRow->removeWidget(m_autoplayButton);
+    // The empty row must not leave a gap under the playlist's buttons.
+    m_autoplayRow->setContentsMargins(0, 0, 0, 0);
+    m_autoplayRow->setProperty("fksLayoutMargins", QVariant::fromValue(QMargins()));
     return m_autoplayButton;
 }
 

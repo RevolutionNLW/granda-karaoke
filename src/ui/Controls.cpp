@@ -2,15 +2,18 @@
 
 #include "ui/Theme.h"
 
+#include <QEvent>
+#include <QFrame>
+#include <QHeaderView>
 #include <QIconEngine>
 #include <QPainter>
 #include <QPainterPath>
 #include <QStyleOptionButton>
+#include <QStyleOptionComboBox>
 #include <QStylePainter>
+#include <QTreeView>
 
 namespace ui {
-
-namespace {
 
 void drawGlyph(QPainter& p, Glyph glyph, const QRectF& box, const QColor& color)
 {
@@ -24,17 +27,13 @@ void drawGlyph(QPainter& p, Glyph glyph, const QRectF& box, const QColor& color)
 
     switch (glyph) {
     case Glyph::App: {
-        // A beamed pair of notes.
+        // A stage microphone: a solid head in its cradle, on a short stand.
         p.setBrush(color);
-        p.drawEllipse(QRectF(at(0.18, 0.66), at(0.42, 0.86)));
-        p.drawEllipse(QRectF(at(0.58, 0.56), at(0.82, 0.76)));
+        p.drawRoundedRect(QRectF(at(0.37, 0.08), at(0.63, 0.52)), s * 0.13, s * 0.13);
         p.setBrush(Qt::NoBrush);
-        p.drawLine(at(0.40, 0.76), at(0.40, 0.22));
-        p.drawLine(at(0.80, 0.66), at(0.80, 0.14));
-        QPen beam = pen;
-        beam.setWidthF(pen.widthF() * 1.8);
-        p.setPen(beam);
-        p.drawLine(at(0.40, 0.24), at(0.80, 0.16));
+        p.drawArc(QRectF(at(0.25, 0.16), at(0.75, 0.66)), 180 * 16, 180 * 16);
+        p.drawLine(at(0.50, 0.66), at(0.50, 0.84));
+        p.drawLine(at(0.34, 0.86), at(0.66, 0.86));
         break;
     }
     case Glyph::Play: {
@@ -80,6 +79,8 @@ void drawGlyph(QPainter& p, Glyph glyph, const QRectF& box, const QColor& color)
     }
 }
 
+namespace {
+
 class GlyphEngine final : public QIconEngine {
 public:
     GlyphEngine(Glyph glyph, QColor color) : m_glyph(glyph), m_color(std::move(color)) {}
@@ -117,7 +118,47 @@ private:
     QColor m_color;
 };
 
+// The piece of header strip above a table's vertical scroll bar; it keeps
+// the header's height.
+class HeaderCorner final : public QFrame {
+public:
+    explicit HeaderCorner(QHeaderView* header)
+        : m_header(header)
+    {
+        setObjectName(QStringLiteral("headerCorner"));
+        setFixedHeight(header->sizeHint().height());
+        header->installEventFilter(this);
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (watched == m_header && (event->type() == QEvent::Resize || event->type() == QEvent::Show))
+            setFixedHeight(m_header->isVisible() ? m_header->height() : 0);
+        return false;
+    }
+
+private:
+    QHeaderView* m_header;
+};
+
 } // namespace
+
+void ComboBox::paintEvent(QPaintEvent* event)
+{
+    QComboBox::paintEvent(event);
+    QStyleOptionComboBox option;
+    initStyleOption(&option);
+    QPainter painter(this);
+    theme::paintChevron(&painter,
+                        style()->subControlRect(QStyle::CC_ComboBox, &option, QStyle::SC_ComboBoxArrow, this),
+                        Qt::DownArrow, isEnabled());
+}
+
+void extendHeaderOverScrollBar(QTreeView* view)
+{
+    view->addScrollBarWidget(new HeaderCorner(view->header()), Qt::AlignTop);
+}
 
 QIcon glyphIcon(Glyph glyph, const QColor& color)
 {

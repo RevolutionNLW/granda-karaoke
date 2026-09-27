@@ -4,6 +4,7 @@
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
 #include "LibraryView.h"
+#include "MetadataReviewDialog.h"
 #include "MainWindow.h"
 #include "PlaylistView.h"
 #include "AudioOutputs.h"
@@ -190,6 +191,7 @@ private slots:
     void everySettingSurvivesARestart();
     void volumeAppliesLiveAndOutputWaitsForTheNextSong();
     void settingsPagesAreOrganised();
+    void everyVisibleDropDownShowsItsArrow();
     void titleScreenFilesNeverGoInsideTheMusicFolder();
     void folderContainmentComparesWholeFolders();
     void conflictAsksExactlyOnceAndCancelChangesNothing();
@@ -945,6 +947,7 @@ void TestSettings::everySettingSurvivesARestart()
     const QString cataloguePath = temporary.filePath(QStringLiteral("app/library.sqlite"));
     const QList<QPair<QString, QString>> chosen = {
         {pref::ScalePercent, QStringLiteral("120")}, {pref::StartFullscreen, QStringLiteral("0")},
+        {pref::ShowSplash, QStringLiteral("0")},
         {pref::ConfirmExit, QStringLiteral("1")}, {pref::CompactRows, QStringLiteral("1")},
         {pref::AlternateRows, QStringLiteral("0")}, {pref::ShowLabelColumn, QStringLiteral("0")},
         {pref::ShowPlaysColumn, QStringLiteral("0")}, {pref::AutoplayAtStartup, QStringLiteral("off")},
@@ -1074,6 +1077,13 @@ void TestSettings::settingsPagesAreOrganised()
     QVERIFY(!remember->isEnabled());
     checkBox(QStringLiteral("Start in full screen"))->click();
     QVERIFY(remember->isEnabled());
+    // The splash screen is shown unless turned off.
+    QCheckBox* splash = checkBox(QStringLiteral("Show the splash screen"));
+    QVERIFY(splash);
+    QVERIFY(splash->isChecked());
+    QVERIFY(window.preferences()->flag(pref::ShowSplash, true));
+    splash->click();
+    QVERIFY(!window.preferences()->flag(pref::ShowSplash, true));
 
     // File locations are on Advanced only; the forget button too.
     const auto pageText = [dialog](const QString& page) {
@@ -1097,6 +1107,36 @@ void TestSettings::settingsPagesAreOrganised()
     QVERIFY(advanced.contains(temporary.filePath(QStringLiteral("app/playlists.sqlite"))));
     QVERIFY(advanced.contains(QStringLiteral("Forget Every Song's Key and Tempo")));
     QVERIFY(pageText(QStringLiteral("Appearance")).contains(QStringLiteral("Theme")));
+}
+
+void TestSettings::everyVisibleDropDownShowsItsArrow()
+{
+    // The style sheet leaves the arrow to ui::ComboBox, so every drop-down a
+    // user can see must be one.
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller);
+    window.show();
+    SettingsDialog* dialog = window.openSettings();
+    for (const QString& page : dialog->pageNames())
+        dialog->showPage(page);
+    QWidget* review = window.openMetadataReview();
+    QVERIFY(review);
+    int checked = 0;
+    for (QWidget* root : {static_cast<QWidget*>(&window), static_cast<QWidget*>(dialog), review}) {
+        for (QComboBox* box : root->findChildren<QComboBox*>()) {
+            if (box->objectName() == QLatin1String("playlistChooser"))
+                continue;  // never shown: the playlist tabs stand for it
+            QVERIFY2(qobject_cast<ui::ComboBox*>(box),
+                     qPrintable(QStringLiteral("%1 in %2").arg(box->objectName(), root->objectName())));
+            ++checked;
+        }
+    }
+    QVERIFY(checked >= 6);
+    review->close();
+    dialog->close();
 }
 
 void TestSettings::titleScreenFilesNeverGoInsideTheMusicFolder()

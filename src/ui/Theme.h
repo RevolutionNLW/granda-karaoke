@@ -7,6 +7,8 @@
 class QAbstractButton;
 class QApplication;
 class QBoxLayout;
+class QPainter;
+class QRect;
 class QWidget;
 
 // The application's look: a dark charcoal desktop theme with a restrained
@@ -37,6 +39,9 @@ inline const QColor secondaryText{0xa9, 0xa5, 0x9e};
 QString dangerStyle();
 
 void apply(QApplication& app);
+
+// The application's arrow: a thin chevron centred in `rect`.
+void paintChevron(QPainter* painter, const QRect& rect, Qt::ArrowType direction, bool enabled);
 
 // ---- Interface scale -----------------------------------------------------
 // The whole interface (text, rows, buttons, icons, spacing) can be scaled

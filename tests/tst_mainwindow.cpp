@@ -55,6 +55,7 @@ private slots:
     void modalDialogKeysStayInDialog_data();
     void modalDialogKeysStayInDialog();
     void exitStopsAndCloses();
+    void exitButtonOnlyInFullScreen();
     void displaySleepFollowsPlayerStates();
     void displaySleepReleasedOnDestruction();
 
@@ -673,6 +674,36 @@ void TestMainWindow::exitStopsAndCloses()
     QCOMPARE(m_player->positionMs(), 0);
     QVERIFY(!m_window->isVisible());
     QVERIFY(!m_window->displaySleepBlocked());
+}
+
+void TestMainWindow::exitButtonOnlyInFullScreen()
+{
+    // Full screen has no window close button, so Exit is shown there.
+    QVERIFY(m_window->isFullScreen());
+    QVERIFY(m_window->exitButton()->isVisible());
+    const QSize smallest = m_window->minimumSizeHint();
+    // A window closes with its own close button; Exit is not shown.
+    m_window->showNormal();
+    QTRY_VERIFY(!m_window->isFullScreen());
+    QVERIFY(!m_window->exitButton()->isVisible());
+    // Its smallest size does not change, so going full screen never resizes it.
+    QCOMPARE(m_window->minimumSizeHint(), smallest);
+    QVERIFY(m_window->lyricsButton()->isVisible());
+    QVERIFY(m_window->settingsButton()->isVisible());
+    // The Exit shortcut stays available either way.
+    QVERIFY(m_window->shortcutAction(QStringLiteral("app.exit")));
+    // Playing a song fills the screen, and Exit is back on the controls.
+    startPlaying();
+    QTRY_VERIFY(m_window->isFullScreen());
+    QTest::keyClick(m_window->windowHandle(), Qt::Key_Escape);
+    QVERIFY(!m_window->lyricsVisible());
+    QVERIFY(m_window->exitButton()->isVisible());
+    // Closing the window the ordinary way still stops and closes.
+    m_window->showNormal();
+    QTRY_VERIFY(!m_window->isFullScreen());
+    QVERIFY(m_window->close());
+    QCOMPARE(m_player->state(), State::Stopped);
+    QVERIFY(!m_window->isVisible());
 }
 
 void TestMainWindow::displaySleepFollowsPlayerStates()

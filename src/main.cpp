@@ -8,10 +8,12 @@
 #include "library/KnownLibraryRoots.h"
 #include "playlist/PlaylistStore.h"
 #include "ui/Controls.h"
+#include "ui/Splash.h"
 #include "ui/Theme.h"
 
 #include <QApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QScreen>
@@ -21,6 +23,8 @@
 
 int main(int argc, char* argv[])
 {
+    QElapsedTimer launch;
+    launch.start();
     QApplication app(argc, argv);
     QApplication::setOrganizationName(QStringLiteral("Granda"));
     QApplication::setApplicationName(QStringLiteral("FrankiesKaraokeStudio"));
@@ -105,6 +109,10 @@ int main(int argc, char* argv[])
             {QStringLiteral("Key and Tempo memory (song-settings.json)"), settingsPath},
             {QStringLiteral("Log file"), logFile},
         });
+        // The splash covers the finished window as it first appears, then
+        // dissolves into it; the window works underneath all the while.
+        if (settings.flag(pref::ShowSplash, true))
+            new ui::SplashOverlay(&window, launch.elapsed());
         const QRect screen = window.screen() ? window.screen()->availableGeometry() : QRect();
         window.resize(QSize(theme::px(1280), theme::px(800))
                           .boundedTo(screen.isValid() ? screen.size() : QSize(4000, 4000)));
@@ -117,6 +125,7 @@ int main(int argc, char* argv[])
             window.setWindowState(window.windowState() & ~Qt::WindowFullScreen);
             window.show();
         }
+        qCInfo(lcApp) << "Main window shown" << launch.elapsed() << "ms after launch";
         libraryController.startConfiguredScan();
 
         // Optional: a song path on the command line is opened at start-up.

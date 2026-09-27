@@ -132,6 +132,8 @@ add_library(fks_core STATIC
     src/ui/ElidedLabel.h
     src/ui/Shortcuts.cpp
     src/ui/Shortcuts.h
+    src/ui/Splash.cpp
+    src/ui/Splash.h
     src/ui/Theme.cpp
     src/ui/Theme.h
 )

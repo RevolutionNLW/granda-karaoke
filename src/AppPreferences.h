@@ -13,6 +13,7 @@ class PlaylistStore;
 namespace pref {
 inline const QString ScalePercent = QStringLiteral("ui.scalePercent");
 inline const QString StartFullscreen = QStringLiteral("ui.startFullscreen");
+inline const QString ShowSplash = QStringLiteral("ui.showSplash");
 inline const QString RememberWindow = QStringLiteral("ui.rememberWindow");
 inline const QString WindowGeometry = QStringLiteral("ui.windowGeometry");
 inline const QString ConfirmExit = QStringLiteral("ui.confirmExit");

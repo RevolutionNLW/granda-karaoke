@@ -24,6 +24,7 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <functional>
 
 namespace {
@@ -123,6 +124,8 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
 
     auto* title = new QLabel(QStringLiteral("Local Song Library"), pane);
     title->setObjectName(QStringLiteral("paneTitle"));
+    // The same height as the playlist pane's title row, so the two line up.
+    theme::setFixedHeight(title, 26);
     m_statusLabel = new QLabel(pane);
     m_statusLabel->setObjectName(QStringLiteral("paneStatus"));
     m_statusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -165,7 +168,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                            QLineEdit::LeadingPosition);
     m_searchBox->installEventFilter(this);
 
-    m_sortBox = new QComboBox(m_searchBar);
+    m_sortBox = new ui::ComboBox(m_searchBar);
     m_sortBox->setObjectName(QStringLiteral("librarySort"));
     m_sortBox->setFocusPolicy(Qt::NoFocus);
     m_sortBox->setToolTip(QStringLiteral("Order of the songs"));
@@ -234,6 +237,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     columns->setSectionResizeMode(LibraryResultsModel::PlaysColumn, QHeaderView::Fixed);
     // Artist first, as people look for songs by singer.
     columns->moveSection(columns->visualIndex(LibraryResultsModel::ArtistColumn), 0);
+    ui::extendHeaderOverScrollBar(m_results);
     // Clicking a song keeps the keyboard with the search box (never the
     // playlist), so Up/Down/Enter always act on the library.
     m_results->viewport()->installEventFilter(this);
@@ -338,8 +342,14 @@ void LibraryView::applyColumnWidths()
 {
     QHeaderView* columns = m_results->header();
     columns->setMinimumSectionSize(theme::px(40));
-    columns->resizeSection(LibraryResultsModel::LabelColumn, theme::px(120));
-    columns->resizeSection(LibraryResultsModel::DiscColumn, theme::px(124));
+    // Label and Disc ID take a share of the width, within limits, so they stay
+    // readable in a wide window and leave Artist and Song room in a narrow one.
+    const int width = m_results->viewport()->width();
+    const auto share = [width](int percent, int least, int most) {
+        return std::clamp(width * percent / 100, theme::px(least), theme::px(most));
+    };
+    columns->resizeSection(LibraryResultsModel::LabelColumn, share(18, 100, 180));
+    columns->resizeSection(LibraryResultsModel::DiscColumn, share(15, 106, 140));
     columns->resizeSection(LibraryResultsModel::PlaysColumn, theme::px(64));
 }
 
@@ -475,6 +485,8 @@ void LibraryView::refreshSearch()
 
 bool LibraryView::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_results->viewport() && event->type() == QEvent::Resize)
+        applyColumnWidths();
     if (watched == m_results->viewport() && event->type() == QEvent::MouseButtonPress
         && m_searchBox->isEnabled())
         m_searchBox->setFocus(Qt::MouseFocusReason);
