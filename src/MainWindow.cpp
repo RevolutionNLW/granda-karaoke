@@ -3,6 +3,7 @@
 #include "Logging.h"
 #include "LibraryController.h"
 #include "LibraryView.h"
+#include "MetadataReviewDialog.h"
 #include "LyricsView.h"
 #include "PlaylistView.h"
 #include "SongPair.h"
@@ -20,6 +21,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
+#include <QShortcut>
 #include <QStandardPaths>
 #include <QStackedWidget>
 #include <QVBoxLayout>
@@ -201,6 +203,12 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
 
     connect(m_exitButton, &QPushButton::clicked, this, &QWidget::close);
     connect(m_findButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
+    if (m_libraryController) {
+        // Maintenance only: no button on the singer's screens.
+        auto* review = new QShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M), this);
+        review->setContext(Qt::WindowShortcut);
+        connect(review, &QShortcut::activated, this, [this] { openMetadataReview(); });
+    }
     connect(m_playlistsButton, &QPushButton::clicked, this, &MainWindow::showLibrary);
     connect(m_openButton, &QPushButton::clicked, this, &MainWindow::chooseSong);
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
@@ -226,6 +234,15 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
             m_playlistPlayback, &PlaylistPlayback::onPlayerStateChanged);
     connect(m_player, &KaraokePlayer::errorOccurred, this, &MainWindow::onError);
     connect(m_player, &KaraokePlayer::positionChanged, this, &MainWindow::updateControls);
+    connect(m_player, &KaraokePlayer::positionChanged, this, [this](qint64 positionMs) {
+        if (!m_playStartPending || positionMs <= 0
+            || m_player->state() != KaraokePlayer::State::Playing)
+            return;
+        m_playStartPending = false;
+        if (!m_previewing && m_libraryController)
+            m_libraryController->recordPlay(m_playSongId, m_songIdentity, m_player->song().mp3Path,
+                                            m_player->song().cdgPath);
+    });
     connect(m_player, &KaraokePlayer::settingsChanged, this, &MainWindow::updateControls);
     connect(m_player, &KaraokePlayer::frameChanged, m_lyrics, &LyricsView::setFrame);
     connect(m_lyrics, &LyricsView::controlsRequested, this, &MainWindow::hideLyrics);
@@ -272,7 +289,8 @@ void MainWindow::keyPressEvent(QKeyEvent* event)
             hideLyrics();
         } else if (!lyricsVisible() && isEnterKey(event)) {
             const auto state = m_player->state();
-            if (state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused)
+            if (!m_previewing
+                && (state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused))
                 showLyrics();
         }
     }
@@ -296,6 +314,90 @@ void MainWindow::changeEvent(QEvent* event)
         else if (QApplication::focusWidget() != this)
             setFocus(Qt::OtherFocusReason);
     }
+}
+
+MetadataReviewDialog* MainWindow::openMetadataReview()
+{
+    if (!m_libraryController)
+        return nullptr;
+    if (!m_review) {
+        m_review = new MetadataReviewDialog(m_libraryController, this);
+        m_review->setPreviewAvailable(true);
+        connect(m_review, &MetadataReviewDialog::previewRequested, this, [this](qint64 songId) {
+            QString error;
+            if (!previewSong(songId, &error) && m_review)
+                m_review->showPreviewMessage(error);
+        });
+        connect(m_review, &MetadataReviewDialog::previewStopRequested,
+                this, &MainWindow::stopPreview);
+        // Closing the maintenance screen ends its preview.
+        connect(m_review, &QDialog::finished, this, &MainWindow::stopPreview);
+        connect(m_player, &KaraokePlayer::frameChanged, m_review, [this](const QImage& frame) {
+            if (m_previewing)
+                m_review->showPreviewFrame(frame);
+        });
+    }
+    m_review->refresh();
+    m_review->show();
+    m_review->raise();
+    m_review->activateWindow();
+    return m_review;
+}
+
+bool MainWindow::previewSong(qint64 songId, QString* error)
+{
+    m_playlistPlayback->cancelPendingAutoplay();
+    const auto fail = [error](const QString& message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (!m_libraryController)
+        return fail(QStringLiteral("The song library is unavailable."));
+    QString lookupError;
+    const PlaybackPaths paths = m_libraryController->playbackPathsForAny(songId, &lookupError);
+    if (!paths.playable() || !QFileInfo::exists(paths.mp3Path)
+        || !QFileInfo::exists(paths.graphicsPath)) {
+        qCWarning(lcUi).noquote() << "Preview song is unavailable:" << lookupError << paths.reason;
+        return fail(QStringLiteral("This song can't be played right now (is its music drive connected?)."));
+    }
+    if (!loadSong(paths.mp3Path))
+        return fail(QStringLiteral("This song could not be opened."));
+    // Set after loading: stopping the previous song must not end the preview.
+    // The song is known, but a preview never counts as a play.
+    m_playSongId = songId;
+    m_playlistPlayback->clear();
+    setPreviewing(true);
+    m_player->play();
+    if (m_player->state() == KaraokePlayer::State::Error) {
+        setPreviewing(false);
+        return fail(QStringLiteral("This song could not be played."));
+    }
+    return true;
+}
+
+void MainWindow::stopPreview()
+{
+    if (!m_previewing)
+        return;
+    m_playlistPlayback->cancelPendingAutoplay();
+    m_player->stop();
+    setPreviewing(false);
+}
+
+void MainWindow::setPreviewing(bool previewing)
+{
+    if (m_previewing == previewing)
+        return;
+    m_previewing = previewing;
+    updateControls();
+    if (!m_review)
+        return;
+    const SongPair& song = m_player->song();
+    m_review->setPreviewState(previewing, previewing
+        ? QFileInfo(song.mp3Path).completeBaseName() : QString());
+    if (previewing)
+        m_review->showPreviewFrame(m_player->currentFrame());
 }
 
 void MainWindow::showLibrary()
@@ -327,8 +429,10 @@ void MainWindow::singLibrarySong(qint64 songId)
         m_libraryController->requestRefreshScan();
         return;
     }
-    if (loadSong(paths.mp3Path))
+    if (loadSong(paths.mp3Path)) {
+        m_playSongId = songId;
         m_playlistPlayback->clear();
+    }
 }
 
 void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
@@ -375,6 +479,7 @@ void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
         m_playlistPlayback->clear();
         return;
     }
+    m_playSongId = resolution.songId;
     m_playlistPlayback->startedFromPlaylist(entry.playlistId, entry.itemId);
     m_player->play();
 }
@@ -402,6 +507,9 @@ bool MainWindow::openSong(const QString& path)
 {
     if (!loadSong(path))
         return false;
+    // A file opened directly counts as its catalogue song when it is one.
+    if (m_libraryController)
+        m_playSongId = m_libraryController->songIdForMp3File(m_player->song().mp3Path);
     m_playlistPlayback->clear();
     return true;
 }
@@ -409,6 +517,9 @@ bool MainWindow::openSong(const QString& path)
 bool MainWindow::loadSong(const QString& path)
 {
     qCInfo(lcUi) << "Opening" << path;
+    // Any other song ends a preview. It is stopped first, so a replacement
+    // that turns out to be unplayable cannot leave the preview running unseen.
+    stopPreview();
     hideLyrics();
     m_errorText.clear();
 
@@ -432,6 +543,9 @@ bool MainWindow::loadSong(const QString& path)
         return false; // load() reports its own errors.
     }
 
+    // A new song is loaded; the caller names its catalogue song, if any. (A
+    // rejected load keeps the previous song, and with it the previous id.)
+    m_playSongId = 0;
     m_songIdentity = songIdentity(result.pair);
     m_identityWarningLogged = false;
     if (m_songIdentity.isEmpty()) {
@@ -447,6 +561,7 @@ bool MainWindow::loadSong(const QString& path)
 
 void MainWindow::onPlay()
 {
+    setPreviewing(false);  // the main Play button is normal singing
     m_playlistPlayback->cancelPendingAutoplay();
     m_errorText.clear();
     m_player->play();
@@ -481,7 +596,8 @@ void MainWindow::changeTempo(int delta)
 
 void MainWindow::persistCurrentSettings()
 {
-    if (!m_player->hasSong())
+    // A preview never writes Key/Tempo memory.
+    if (!m_player->hasSong() || m_previewing)
         return;
     if (m_songIdentity.isEmpty()) {
         if (!m_identityWarningLogged) {
@@ -496,6 +612,8 @@ void MainWindow::persistCurrentSettings()
 
 void MainWindow::showLyrics()
 {
+    if (m_previewing)
+        return;  // a preview's lyrics stay in the maintenance screen
     m_lyrics->setFrame(m_player->currentFrame());
     // Re-entering fullscreen after the user leaves it is the one intentional
     // window-state change: Play/Enter must always fill the screen.
@@ -513,6 +631,16 @@ void MainWindow::hideLyrics()
 
 void MainWindow::onStateChanged(KaraokePlayer::State state)
 {
+    // A play counts once per start from the beginning (not on resume after
+    // Pause, never for a maintenance preview), when its audio first advances.
+    const KaraokePlayer::State previous = m_lastPlayerState;
+    m_lastPlayerState = state;
+    if (state == KaraokePlayer::State::Playing) {
+        if (previous != KaraokePlayer::State::Paused && previous != KaraokePlayer::State::Playing)
+            m_playStartPending = !m_previewing && m_playSongId != 0 && m_libraryController;
+    } else if (state != KaraokePlayer::State::Paused) {
+        m_playStartPending = false;
+    }
     if (m_libraryController) {
         m_libraryController->setPlaybackActive(
             state == KaraokePlayer::State::Playing || state == KaraokePlayer::State::Paused);
@@ -521,12 +649,15 @@ void MainWindow::onStateChanged(KaraokePlayer::State state)
     m_displaySleepBlocker.setActive(state == KaraokePlayer::State::Playing);
     switch (state) {
     case KaraokePlayer::State::Playing:
-        showLyrics();
+        // A preview's lyrics stay in the maintenance screen.
+        if (!m_previewing)
+            showLyrics();
         break;
     case KaraokePlayer::State::Stopped:
     case KaraokePlayer::State::Finished:
     case KaraokePlayer::State::Error:
     case KaraokePlayer::State::Empty:
+        setPreviewing(false);
         hideLyrics();
         break;
     default:
@@ -623,10 +754,12 @@ void MainWindow::updateControls()
     const int tempo = hasSong ? m_player->tempoPercent() : 100;
     m_keyValueLabel->setText(key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key));
     m_tempoValueLabel->setText(QStringLiteral("%1%").arg(tempo));
-    m_keyDownButton->setEnabled(hasSong && key > kMinKey);
-    m_keyUpButton->setEnabled(hasSong && key < kMaxKey);
-    m_keyResetButton->setEnabled(hasSong);
-    m_tempoDownButton->setEnabled(hasSong && tempo > kMinTempo);
-    m_tempoUpButton->setEnabled(hasSong && tempo < kMaxTempo);
-    m_tempoResetButton->setEnabled(hasSong);
+    // Key/Tempo belong to singing, not to a maintenance preview.
+    const bool adjustable = hasSong && !m_previewing;
+    m_keyDownButton->setEnabled(adjustable && key > kMinKey);
+    m_keyUpButton->setEnabled(adjustable && key < kMaxKey);
+    m_keyResetButton->setEnabled(adjustable);
+    m_tempoDownButton->setEnabled(adjustable && tempo > kMinTempo);
+    m_tempoUpButton->setEnabled(adjustable && tempo < kMaxTempo);
+    m_tempoResetButton->setEnabled(adjustable);
 }

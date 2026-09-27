@@ -73,6 +73,7 @@ private slots:
     void identityUsesContentNotPathOrName();
     void identityIgnoresMp3Metadata();
     void identityHashesCompleteCdg();
+    void identityValueIsStable();
     void bogusTagHeadersStillProduceIdentity();
     void storePersistsAndResets();
     void concurrentStoresMergeEntries();
@@ -141,6 +142,20 @@ void TestSongSettings::identityIgnoresMp3Metadata()
     const QString firstId = songIdentity(first);
     QVERIFY(!firstId.isEmpty());
     QCOMPARE(firstId, songIdentity(second));
+}
+
+void TestSongSettings::identityValueIsStable()
+{
+    // Remembered Key/Tempo settings are keyed by this exact value. It must never
+    // change for the same content, whatever code computes it.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const SongPair pair = writePair(dir.filePath("golden"), "Golden", 'g', 'h');
+    QByteArray tagged = QByteArray("ID3\x03\0\0\0\0\0\x0a", 10) + QByteArray(10, 't')
+        + QByteArray(140000, 'g') + QByteArray("TAG", 3) + QByteArray(125, 'v');
+    QVERIFY(writeBytes(pair.mp3Path, tagged));
+    QCOMPARE(songIdentity(pair), QStringLiteral(
+                 "v1:5f7c7698cf5a2a3713d706014cab600d0f8684a667d30b46ba9b3166cf333b61"));
 }
 
 void TestSongSettings::identityHashesCompleteCdg()

@@ -199,7 +199,7 @@ private slots:
     void scanQueriesAndReadOnly();
     void incrementalAndMissing();
     void guardsAndNewerSchema();
-    void migratesSchemaV3ToV4AndPreservesData();
+    void migratesSchemaV3ToV5AndPreservesData();
     void cancelAndResume();
     void pauseResumeAndCancelWhilePaused();
     void activeRootFiltersSearchAndPlayback();
@@ -320,16 +320,28 @@ void TestCatalogue::guardsAndNewerSchema()
 
     const QString corrupt = temporary.filePath(QStringLiteral("corrupt.sqlite"));
     writeFile(corrupt, QByteArray("definitely not sqlite"));
-    Catalogue recovered(corrupt);
+    // Callers that do not own the catalogue never set a damaged file aside.
+    Catalogue untouched(corrupt);
     error.clear();
-    QVERIFY2(recovered.open(&error), qPrintable(error));
+    QVERIFY(!untouched.open(&error));
+    QVERIFY2(error.contains(QStringLiteral("left untouched")), qPrintable(error));
+    error.clear();
+    QVERIFY(!untouched.open(&error, {temporary.filePath(QStringLiteral("music"))}));
+    QVERIFY2(error.contains(QStringLiteral("left untouched")), qPrintable(error));
+    QVERIFY(QDir(temporary.path()).entryList({QStringLiteral("corrupt.sqlite.corrupt-*")},
+                                             QDir::Files).isEmpty());
+    // The owner may, once the file is proved outside every known root.
+    Catalogue recovered(corrupt);
+    recovered.setCorruptionRecoveryAllowed(true);
+    error.clear();
+    QVERIFY2(recovered.open(&error, {temporary.filePath(QStringLiteral("music"))}), qPrintable(error));
     QCOMPARE(recovered.stats(&error).value(QStringLiteral("songs")).toLongLong(), 0LL);
     const QStringList quarantined = QDir(temporary.path()).entryList(
         {QStringLiteral("corrupt.sqlite.corrupt-*")}, QDir::Files);
     QCOMPARE(quarantined.size(), 1);
 }
 
-void TestCatalogue::migratesSchemaV3ToV4AndPreservesData()
+void TestCatalogue::migratesSchemaV3ToV5AndPreservesData()
 {
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
@@ -389,7 +401,7 @@ void TestCatalogue::migratesSchemaV3ToV4AndPreservesData()
         QVERIFY(database.open());
         QSqlQuery query(database);
         QVERIFY(query.exec(QStringLiteral("PRAGMA user_version")) && query.next());
-        QCOMPARE(query.value(0).toInt(), 4);
+        QCOMPARE(query.value(0).toInt(), 5);
         QVERIFY(query.exec(QStringLiteral(
             "SELECT count(*) FROM sqlite_master WHERE type='index' "
             "AND name='idx_sources_mp3_file'")) && query.next());

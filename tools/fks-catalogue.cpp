@@ -1,7 +1,11 @@
 #include "library/Catalogue.h"
 #include "library/CatalogueTools.h"
+#include "library/KnownLibraryRoots.h"
 #include "library/LibraryScanner.h"
 #include "library/MetadataResolver.h"
+#include "library/MetadataOverrideStore.h"
+#include "library/TitleScreenText.h"
+#include "ocr/PlatformTitleScreenOcr.h"
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -23,7 +27,12 @@ int usage(const QString& message = {})
     err << "Usage:\n"
            "  fks-catalogue --db <path> scan <root> [--no-tags] [--limit-seconds N]\n"
            "  fks-catalogue --db <path> stats\n"
-           "  fks-catalogue --db <path> resolve\n"
+           "  fks-catalogue --db <path> resolve [--overrides <path>]\n"
+           "  fks-catalogue --db <path> reprocess [--overrides <path>] [--no-content-matching] [--title-screens]\n"
+           "  fks-catalogue --db <path> title-screens-export <file.json>\n"
+           "  fks-catalogue --db <path> title-screens-import <file.json>\n"
+           "  fks-catalogue --db <path> metadata-stats\n"
+           "  fks-catalogue --db <path> compare --baseline <other.sqlite>\n"
            "  fks-catalogue --db <path> reparse\n"
            "  fks-catalogue --db <path> evaluate --gold <gold.tsv>\n"
            "  fks-catalogue --db <path> evaluate-tags [--limit N]\n"
@@ -45,9 +54,21 @@ int main(int argc, char* argv[])
     const QString databasePath = args.at(dbOption + 1);
     args.removeAt(dbOption + 1);
     args.removeAt(dbOption);
+    QString overridesPath;
+    const int overridesOption = args.indexOf(QStringLiteral("--overrides"));
+    if (overridesOption >= 0) {
+        if (overridesOption + 1 >= args.size())
+            return usage(QStringLiteral("--overrides requires a path"));
+        overridesPath = args.at(overridesOption + 1);
+        args.removeAt(overridesOption + 1);
+        args.removeAt(overridesOption);
+    }
     if (args.isEmpty())
         return usage();
     const QString command = args.takeFirst();
+    // Music folders the application has been given. No database under one of
+    // them is opened, whatever the database itself records.
+    const QStringList knownRoots = KnownLibraryRoots::load();
 
     if (command == QLatin1String("scan")) {
         if (args.isEmpty())
@@ -72,7 +93,8 @@ int main(int argc, char* argv[])
         }
         if (!args.isEmpty())
             return usage(QStringLiteral("Unexpected scan arguments"));
-        LibraryScanner scanner(databasePath);
+        LibraryScanner scanner(databasePath, {}, overridesPath);
+        scanner.setKnownRoots(knownRoots);
         scanner.setOptions(options);
         int result = 0;
         QElapsedTimer progressTimer;
@@ -94,9 +116,57 @@ int main(int argc, char* argv[])
         return result;
     }
 
+    if (command == QLatin1String("reprocess")) {
+        // The same background job as the app's Reprocess Metadata action: a
+        // database-only resolve, content matching for connected roots (reads
+        // candidate files read-only), then a final resolve.
+        ScanOptions options;
+        const int noContent = args.indexOf(QStringLiteral("--no-content-matching"));
+        if (noContent >= 0) {
+            options.identifyDuplicates = false;
+            args.removeAt(noContent);
+        }
+        std::shared_ptr<TitleScreenOcrEngine> engine;
+        const int titleScreens = args.indexOf(QStringLiteral("--title-screens"));
+        if (titleScreens >= 0) {
+            args.removeAt(titleScreens);
+            engine = createPlatformTitleScreenOcr();
+            if (!engine) {
+                QTextStream(stderr) << "No local OCR engine on this platform; only imported "
+                                       "title-screen results will be matched\n";
+            }
+            options.readTitleScreens = true;
+        }
+        if (!args.isEmpty())
+            return usage(QStringLiteral("Unexpected reprocess arguments"));
+        LibraryScanner scanner(databasePath, {}, overridesPath);
+        scanner.setKnownRoots(knownRoots);
+        scanner.setOptions(options);
+        scanner.setTitleScreenOcr(engine);
+        int result = 0;
+        QElapsedTimer progressTimer;
+        QObject::connect(&scanner, &LibraryScanner::progress,
+                         [&progressTimer](const QString& phase, qint64 done, qint64 total, const QString& path) {
+            if (progressTimer.isValid() && progressTimer.elapsed() < 2000)
+                return;
+            progressTimer.restart();
+            QTextStream(stderr) << phase << ' ' << done << '/' << total
+                                << (path.isEmpty() ? QString() : QStringLiteral(" ") + path) << '\n';
+        });
+        QObject::connect(&scanner, &LibraryScanner::finished,
+                         [&](const QVariantMap& summary) { printJson(summary); });
+        QObject::connect(&scanner, &LibraryScanner::failed, [&](const QString& message) {
+            QTextStream(stderr) << "Reprocess failed: " << message << '\n';
+            result = 1;
+        });
+        scanner.prepareScan();
+        scanner.reprocessMetadata();
+        return result;
+    }
+
     Catalogue catalogue(databasePath);
     QString error;
-    if (!catalogue.open(&error)) {
+    if (!catalogue.open(&error, knownRoots)) {
         QTextStream(stderr) << error << '\n';
         return 1;
     }
@@ -111,10 +181,52 @@ int main(int argc, char* argv[])
             QTextStream(stderr) << error << '\n';
             return 1;
         }
+        if (!overridesPath.isEmpty()) {
+            QStringList roots = knownRoots;
+            for (const CatalogueRoot& root : catalogue.roots(&error))
+                roots.append(root.path);
+            MetadataOverrideStore store(overridesPath);
+            if (!error.isEmpty() || !store.open(&error, roots)
+                || !catalogue.applyManualOverrides(store.all(&error), &error)) {
+                QTextStream(stderr) << error << '\n';
+                return 1;
+            }
+        }
         QVariantMap output;
         output.insert(QStringLiteral("elapsedMs"), timer.elapsed());
         output.insert(QStringLiteral("stats"), catalogue.stats(&error));
         printJson(output);
+    } else if (command == QLatin1String("title-screens-export")
+               || command == QLatin1String("title-screens-import")) {
+        if (args.size() != 1)
+            return usage(QStringLiteral("%1 requires one file").arg(command));
+        const bool exporting = command == QLatin1String("title-screens-export");
+        const QVariantMap output = exporting
+            ? CatalogueTools::exportTitleScreens(catalogue, args.first(), &error)
+            : CatalogueTools::importTitleScreens(catalogue, args.first(), &error);
+        if (!error.isEmpty()) {
+            QTextStream(stderr) << error << '\n';
+            return 1;
+        }
+        printJson(output);
+    } else if (command == QLatin1String("metadata-stats")) {
+        if (!args.isEmpty())
+            return usage(QStringLiteral("Unexpected metadata-stats arguments"));
+        printJson(catalogue.metadataStats(&error));
+    } else if (command == QLatin1String("compare")) {
+        const int baselineOption = args.indexOf(QStringLiteral("--baseline"));
+        if (baselineOption < 0 || baselineOption + 1 >= args.size())
+            return usage(QStringLiteral("compare requires --baseline <other.sqlite>"));
+        const QString baseline = args.at(baselineOption + 1);
+        args.removeAt(baselineOption + 1);
+        args.removeAt(baselineOption);
+        if (!args.isEmpty())
+            return usage(QStringLiteral("Unexpected compare arguments"));
+        if (!Catalogue::storageIsSafe(baseline, {}, knownRoots, &error)) {
+            QTextStream(stderr) << error << '\n';
+            return 1;
+        }
+        printJson(catalogue.compareMetadata(baseline, 10, &error));
     } else if (command == QLatin1String("reparse")) {
         if (!args.isEmpty())
             return usage(QStringLiteral("Unexpected reparse arguments"));
@@ -162,6 +274,8 @@ int main(int argc, char* argv[])
             value.insert(QStringLiteral("track"), row.track);
             value.insert(QStringLiteral("playable"), row.playable);
             value.insert(QStringLiteral("confidence"), row.confidence);
+            value.insert(QStringLiteral("label"), row.label);
+            value.insert(QStringLiteral("series"), row.series);
             rows.append(value);
         }
         printJson(rows);

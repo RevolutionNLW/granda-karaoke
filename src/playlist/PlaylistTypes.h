@@ -11,6 +11,7 @@ struct SongRef {
     int track = 0;
     QString rootPath;
     QString mp3RelPath;
+    QString label;  // karaoke label, informational only (not stored in playlists)
 };
 
 struct PlaylistInfo {

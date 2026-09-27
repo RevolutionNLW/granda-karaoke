@@ -1,9 +1,17 @@
 #include "library/LibraryScanner.h"
 
 #include "library/Catalogue.h"
+#include "library/CatalogueTools.h"
+#include "library/ContentIdentity.h"
 #include "library/FilenameParser.h"
 #include "library/Id3Reader.h"
 #include "library/MetadataResolver.h"
+#include "library/MetadataOverrideStore.h"
+#include "library/SidecarParser.h"
+#include "library/TitleScreenText.h"
+#include "library/UserStateStore.h"
+#include "cdg/CdgDecoder.h"
+#include "cdg/CdgTitleFrames.h"
 #include "library/ZipDirectory.h"
 
 #include <QDateTime>
@@ -15,6 +23,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
+#include <QMutexLocker>
 #include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -151,6 +161,13 @@ struct FileRow {
     bool present = false;
 };
 
+constexpr qint64 kMaximumSidecarBytes = 64 * 1024;
+
+bool rootOfflineNowIn(const QVariantMap& counts)
+{
+    return counts.value(QStringLiteral("rootOffline")).toBool();
+}
+
 QString foldedPairKey(const QString& directory, const QString& stem)
 {
     return directory.toCaseFolded() + QChar(0x1f) + stem.toCaseFolded();
@@ -158,11 +175,270 @@ QString foldedPairKey(const QString& directory, const QString& stem)
 
 } // namespace
 
-LibraryScanner::LibraryScanner(QString databasePath, QString cacheDirectory, QObject* parent)
+LibraryScanner::LibraryScanner(QString databasePath, QString cacheDirectory,
+                               QString overrideStorePath, QObject* parent)
     : QObject(parent)
     , m_databasePath(std::move(databasePath))
     , m_cacheDirectory(std::move(cacheDirectory))
+    , m_overrideStorePath(std::move(overrideStorePath))
 {
+}
+
+bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
+                                    const QString& phase, QString* error,
+                                    bool* cancelled)
+{
+    MetadataResolver::Options options;
+    options.shouldStop = [this] { return !waitWhilePaused(); };
+    options.progress = [this, &phase](qint64 done, qint64 total) {
+        reportProgress(phase, done, total, QString(), true);
+    };
+    const MetadataResolver::Status status = MetadataResolver::resolve(
+        catalogue, rootId, options, error);
+    if (cancelled)
+        *cancelled = status == MetadataResolver::Status::Cancelled;
+    if (status == MetadataResolver::Status::Failed)
+        return false;
+    if (status == MetadataResolver::Status::Cancelled)
+        return true;
+    if (m_overrideStorePath.isEmpty())
+        return true;
+    // Corrections are user-owned and live outside the catalogue. If their store
+    // is unreadable the catalogue keeps the corrections it already mirrors, and
+    // the scan itself must not fail because of it.
+    QString syncError;
+    QStringList roots = m_knownRoots;
+    for (const CatalogueRoot& root : catalogue.roots(&syncError))
+        roots.append(root.path);
+    // The worker never replaces a damaged store: it just leaves the
+    // catalogue's mirror alone, and the application re-seeds the store.
+    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+    MetadataOverrideStore store(m_overrideStorePath);
+    QList<MetadataOverride> overrides;
+    if (syncError.isEmpty() && store.open(&syncError, roots, false))
+        overrides = store.all(&syncError);
+    if (syncError.isEmpty() && overrides.isEmpty() && catalogue.hasTrustedMirror(&syncError))
+        syncError = QStringLiteral("the override store is empty but the catalogue holds "
+                                   "corrections; keeping them");
+    if (!syncError.isEmpty()) {
+        qWarning().noquote() << "Manual metadata corrections were not synchronised:"
+                             << syncError;
+        return true;
+    }
+    if (!catalogue.applyManualOverrides(overrides, error))
+        return false;
+    return true;
+}
+
+void LibraryScanner::reconcilePlayHistory(Catalogue& catalogue, QVariantMap& counts)
+{
+    // Play history is user state kept outside the catalogue. Every scan
+    // rebuilds the catalogue's copy: first for songs whose files are where
+    // they were last seen (no file reads), then, for songs that moved or were
+    // renamed, by comparing content identities of same-size candidates. Each
+    // candidate is read (read-only) at most once per scan.
+    if (m_userStatePath.isEmpty())
+        return;
+    QString error;
+    QStringList roots = m_knownRoots;
+    for (const CatalogueRoot& root : catalogue.roots(&error))
+        roots.append(root.path);
+    UserStateStore store(m_userStatePath);
+    QList<PlayHistoryEntry> unmatched;
+    {
+        QMutexLocker lock(&UserStateStore::synchronisation());
+        if (!error.isEmpty() || !store.open(&error, roots, false)) {
+            qWarning().noquote() << "Play history was not reconnected:" << error;
+            return;
+        }
+        const QList<PlayHistoryEntry> history = store.playHistory(&error);
+        if (!error.isEmpty() || !catalogue.rebuildPlayProjection(history, &unmatched, &error)) {
+            qWarning().noquote() << "Play history was not reconnected:" << error;
+            return;
+        }
+    }
+
+    QMap<QPair<qint64, qint64>, QList<PlayHistoryEntry>> bySize;
+    for (const PlayHistoryEntry& entry : std::as_const(unmatched)) {
+        if (entry.mp3Size > 0 && entry.cdgSize > 0)
+            bySize[{entry.mp3Size, entry.cdgSize}].append(entry);
+    }
+    struct Found {
+        PlayHistoryEntry snapshot;
+        Catalogue::PlayCandidate candidate;
+    };
+    QList<Found> found;
+    for (auto group = bySize.cbegin(); group != bySize.cend(); ++group) {
+        QHash<QString, QList<PlayHistoryEntry>> byIdentity;
+        for (const PlayHistoryEntry& entry : group.value())
+            byIdentity[entry.identity].append(entry);
+        for (const Catalogue::PlayCandidate& candidate :
+             catalogue.playCandidates(group.key().first, group.key().second, &error)) {
+            if (!waitWhilePaused())
+                return;
+            const QDir root(candidate.rootPath);
+            m_sourceFileReads += 2;
+            const QString identity = contentIdentity(root.filePath(candidate.mp3RelPath),
+                                                     root.filePath(candidate.cdgRelPath));
+            for (const PlayHistoryEntry& entry : byIdentity.value(identity))
+                found.append({entry, candidate});
+        }
+    }
+
+    qint64 relinked = 0;
+    QMutexLocker lock(&UserStateStore::synchronisation());
+    QSet<QString> located;
+    for (const Found& match : std::as_const(found)) {
+        // Newer plays may have arrived while files were being read.
+        const PlayHistoryEntry current = store.playHistoryFor(match.snapshot.identity, &error);
+        if (!error.isEmpty() || current.identity.isEmpty()) {
+            error.clear();
+            continue;
+        }
+        // Identical copies share the history, as they share Key/Tempo.
+        if (!catalogue.setPlayStats(match.candidate.songId, {current.playCount, current.lastPlayedMs}, &error))
+            qWarning().noquote() << "Play history was not reconnected:" << error;
+        if (located.contains(current.identity))
+            continue;
+        located.insert(current.identity);
+        ++relinked;
+        PlayHistoryEntry moved = current;
+        moved.rootPath = match.candidate.rootPath;
+        moved.mp3RelPath = match.candidate.mp3RelPath;
+        if (!store.updateLocation(moved, match.snapshot, &error))
+            qWarning().noquote() << "Play history location was not updated:" << error;
+    }
+    counts.insert(QStringLiteral("playHistoryRelinked"), relinked);
+}
+
+void LibraryScanner::reprocessMetadata()
+{
+    m_sourceFileReads = 0;
+    m_scanTimer.start();
+    m_progressTimer.invalidate();
+    QVariantMap summary;
+    QString error;
+    if (!waitWhilePaused()) {
+        summary.insert(QStringLiteral("status"), QStringLiteral("cancelled"));
+        summary.insert(QStringLiteral("sourceFileReads"), qulonglong(m_sourceFileReads));
+        emit finished(summary);
+        return;
+    }
+    Catalogue catalogue(m_databasePath, m_cacheDirectory);
+    if (!catalogue.open(&error, m_knownRoots)) {
+        emit failed(error);
+        return;
+    }
+    // Stored raw file names are parsed again (database only) when the parser
+    // rules have changed since they were last parsed.
+    if (catalogue.catalogueMeta(QStringLiteral("parser_version"), &error).toInt()
+            < kFilenameParserVersion
+        && error.isEmpty()) {
+        qint64 reparsed = 0;
+        if (!CatalogueTools::reparseStoredNames(catalogue, &reparsed, &error)) {
+            emit failed(error);
+            return;
+        }
+        summary.insert(QStringLiteral("reparsedNames"), reparsed);
+    }
+    if (!error.isEmpty()) {
+        emit failed(error);
+        return;
+    }
+    bool cancelled = false;
+    if (!resolveAndSync(catalogue, -1, QStringLiteral("metadata_reprocess"),
+                        &error, &cancelled)) {
+        emit failed(error);
+        return;
+    }
+    // Track lists and content matching read the music drive (read-only). They
+    // run for connected roots only, pause during playback and resume from
+    // their per-file caches; the cheap resolve above already refreshed the
+    // library, so it stays searchable throughout.
+    QVariantMap counts;
+    bool matched = false;
+    if (!cancelled) {
+        const QList<CatalogueRoot> roots = catalogue.roots(&error);
+        if (!error.isEmpty()) {
+            emit failed(error);
+            return;
+        }
+        for (const CatalogueRoot& root : roots) {
+            if (shouldStop() || !QFileInfo(root.path).isDir())
+                continue;
+            counts.remove(QStringLiteral("rootOffline"));
+            if (!readSidecars(catalogue, root.id, root.path, counts, &error)) {
+                emit failed(error);
+                return;
+            }
+            if (counts.value(QStringLiteral("sidecarsRead")).toLongLong() > 0
+                && !resolveAndSync(catalogue, -1, QStringLiteral("metadata_reprocess"),
+                                   &error, &cancelled)) {
+                emit failed(error);
+                return;
+            }
+            if (cancelled || rootOfflineNowIn(counts))
+                break;
+            if (!m_options.identifyDuplicates)
+                continue;
+            if (!identifyDuplicates(catalogue, root.id, root.path, counts, &error)) {
+                emit failed(error);
+                return;
+            }
+            matched = true;
+        }
+        cancelled = shouldStop();
+    }
+    if (matched && !cancelled) {
+        emit libraryReady();
+        if (!resolveAndSync(catalogue, -1, QStringLiteral("metadata_reprocess"),
+                            &error, &cancelled)) {
+            emit failed(error);
+            return;
+        }
+    }
+    // Title screens are read only for songs that are still unresolved after
+    // every cheaper stage, so this runs after the resolve above.
+    bool readScreens = false;
+    const bool titleScreens = m_titleScreensRequested.exchange(false) || m_options.readTitleScreens;
+    if (!cancelled && titleScreens) {
+        const QList<CatalogueRoot> roots = catalogue.roots(&error);
+        if (!error.isEmpty()) {
+            emit failed(error);
+            return;
+        }
+        for (const CatalogueRoot& root : roots) {
+            if (shouldStop() || !QFileInfo(root.path).isDir())
+                continue;
+            counts.remove(QStringLiteral("rootOffline"));
+            if (!readTitleScreens(catalogue, root.id, root.path, counts, &error)) {
+                emit failed(error);
+                return;
+            }
+            readScreens = true;
+        }
+        cancelled = shouldStop();
+    }
+    if (readScreens && !cancelled) {
+        if (!resolveAndSync(catalogue, -1, QStringLiteral("metadata_reprocess"),
+                            &error, &cancelled)) {
+            emit failed(error);
+            return;
+        }
+        emit libraryReady();
+    }
+    summary.insert(QStringLiteral("counts"), counts);
+    summary.insert(QStringLiteral("status"), cancelled ? QStringLiteral("cancelled")
+                                                        : QStringLiteral("completed"));
+    summary.insert(QStringLiteral("sourceFileReads"), qulonglong(m_sourceFileReads));
+    summary.insert(QStringLiteral("stats"), catalogue.metadataStats(&error));
+    if (!error.isEmpty()) {
+        emit failed(error);
+        return;
+    }
+    if (!cancelled)
+        emit libraryReady();
+    emit finished(summary);
 }
 
 void LibraryScanner::requestCancel()
@@ -174,6 +450,32 @@ bool LibraryScanner::shouldStop() const
 {
     return m_cancelled.load()
         || (m_options.limitSeconds > 0 && m_scanTimer.elapsed() >= qint64(m_options.limitSeconds) * 1000);
+}
+
+bool LibraryScanner::pauseOutsideTransaction(QSqlDatabase& database) const
+{
+    // Never sleep through playback while holding the write lock: other
+    // connections (such as a correction saved from the review screen) must
+    // be able to write meanwhile.
+    if (m_paused.load() && !m_cancelled.load()) {
+        // If the batch cannot be committed, stop rather than sleep holding
+        // the lock; if a new batch cannot start, stop rather than continue
+        // outside a transaction. Either way the next scan resumes the work.
+        if (!database.commit()) {
+            qWarning().noquote() << "Library scan stopped: could not commit before pausing:"
+                                 << database.lastError().text();
+            database.rollback();
+            return false;
+        }
+        const bool resume = waitWhilePaused();
+        if (!database.transaction()) {
+            qWarning().noquote() << "Library scan stopped: could not resume its batch:"
+                                 << database.lastError().text();
+            return false;
+        }
+        return resume;
+    }
+    return !shouldStop();
 }
 
 bool LibraryScanner::waitWhilePaused() const
@@ -213,7 +515,8 @@ void LibraryScanner::scan(const QString& requestedRoot)
         return;
     }
     Catalogue catalogue(m_databasePath, m_cacheDirectory);
-    if (!catalogue.open(&error, {rootPath}) || !catalogue.addRoot(rootPath, nullptr, &error)) {
+    if (!catalogue.open(&error, m_knownRoots + QStringList{rootPath})
+        || !catalogue.addRoot(rootPath, nullptr, &error)) {
         emit failed(error);
         return;
     }
@@ -260,22 +563,58 @@ void LibraryScanner::scan(const QString& requestedRoot)
         ok = phase(QStringLiteral("zip_directories"), [&] { return readZipDirectories(catalogue, rootId, rootPath, counts, &error); });
     if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
         ok = phase(QStringLiteral("pairing"), [&] { return pairSources(catalogue, rootId, counts, &error); });
+    if (ok && !shouldStop() && !rootOfflineNow()) {
+        // Pairing parsed every current file name with today's rules.
+        QSqlQuery parserVersion(database);
+        parserVersion.prepare(QStringLiteral(
+            "INSERT INTO catalogue_meta(key,value) VALUES('parser_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"));
+        parserVersion.addBindValue(kFilenameParserVersion);
+        parserVersion.exec();
+    }
     if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused()) {
-        ok = phase(QStringLiteral("metadata"), [&] { return MetadataResolver::resolve(catalogue, rootId, &error); });
+        ok = phase(QStringLiteral("metadata"), [&] {
+            return resolveAndSync(catalogue, rootId, QStringLiteral("metadata"), &error);
+        });
         if (ok)
             emit libraryReady();
     }
+    if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
+        ok = phase(QStringLiteral("sidecars"), [&] {
+            return readSidecars(catalogue, rootId, rootPath, counts, &error);
+        });
     if (ok && !shouldStop() && !rootOfflineNow() && m_options.readTags && waitWhilePaused())
         ok = phase(QStringLiteral("tags"), [&] { return enrichTags(catalogue, rootId, rootPath, counts, &error); });
-    if (ok && !shouldStop() && !rootOfflineNow() && m_options.readTags && waitWhilePaused()) {
-        ok = phase(QStringLiteral("metadata_after_tags"), [&] { return MetadataResolver::resolve(catalogue, rootId, &error); });
+    // Tags and track lists are both evidence, so the library is refreshed with
+    // them before content matching decides which songs still need a name.
+    if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused()) {
+        ok = phase(QStringLiteral("metadata_after_tags"), [&] {
+            return resolveAndSync(catalogue, rootId,
+                                  QStringLiteral("metadata_after_tags"), &error);
+        });
         if (ok)
             emit libraryReady();
     }
     if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
         ok = phase(QStringLiteral("duplicates"), [&] { return mergeZipDuplicates(catalogue, rootId, rootPath, counts, &error); });
+    if (ok && !shouldStop() && !rootOfflineNow() && m_options.identifyDuplicates
+        && waitWhilePaused())
+        ok = phase(QStringLiteral("content_matching"), [&] {
+            return identifyDuplicates(catalogue, rootId, rootPath, counts, &error);
+        });
+    // Cached title-screen readings reconnect by content (a rebuilt catalogue,
+    // moved files); nothing is recognised during a scan.
     if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
-        ok = MetadataResolver::resolve(catalogue, rootId, &error);
+        ok = phase(QStringLiteral("title_screen_cache"), [&] {
+            return readTitleScreens(catalogue, rootId, rootPath, counts, &error, false);
+        });
+    if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
+        ok = resolveAndSync(catalogue, rootId, QStringLiteral("metadata"), &error);
+    if (ok && !shouldStop() && !rootOfflineNow() && waitWhilePaused())
+        ok = phase(QStringLiteral("play_history"), [&] {
+            reconcilePlayHistory(catalogue, counts);
+            return true;
+        });
 
     const bool rootOffline = rootOfflineNow();
     if (rootOffline) {
@@ -351,11 +690,14 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
         "raw_tags_json=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.raw_tags_json END,"
         "crc32=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.crc32 END,"
         "sha256=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.sha256 END,"
+        "quick_sha256=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.quick_sha256 END,"
+        "content_sha256=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.content_sha256 END,"
+        "cdg_packets=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.cdg_packets END,"
         "zip_status=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.zip_status END,"
         "zip_detail=CASE WHEN files.size<>excluded.size OR files.mtime_ms<>excluded.mtime_ms THEN NULL ELSE files.zip_detail END"));
 
     while (!directories.isEmpty()) {
-        if (!waitWhilePaused()) {
+        if (!pauseOutsideTransaction(database)) {
             complete = false;
             break;
         }
@@ -369,7 +711,7 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
             break;
         }
         const QString directoryPath = directories.takeLast();
-        if (!waitWhilePaused()) {
+        if (!pauseOutsideTransaction(database)) {
             complete = false;
             break;
         }
@@ -389,7 +731,7 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
                               QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot,
                               QDirIterator::NoIteratorFlags);
         while (true) {
-            if (!waitWhilePaused()) {
+            if (!pauseOutsideTransaction(database)) {
                 complete = false;
                 break;
             }
@@ -465,7 +807,7 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
         }
     }
     if (complete) {
-        if (!waitWhilePaused()) {
+        if (!pauseOutsideTransaction(database)) {
             complete = false;
         } else if (!QFileInfo(rootPath).isDir()) {
             complete = false;
@@ -531,7 +873,7 @@ bool LibraryScanner::readZipDirectories(Catalogue& catalogue, qint64 rootId,
     for (const auto& zip : zips) {
         if (shouldStop())
             break;
-        if (!waitWhilePaused())
+        if (!pauseOutsideTransaction(database))
             break;
         ++m_sourceFileReads;
         const ZipDirectoryResult result = readZipDirectory(QDir(rootPath).filePath(zip.second));
@@ -635,7 +977,7 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     for (auto it = mp3s.cbegin(); it != mp3s.cend(); ++it) {
         if (shouldStop())
             break;
-        if (!waitWhilePaused())
+        if (!pauseOutsideTransaction(database))
             break;
         const FileRow mp3 = it.value();
         const bool hasCdg = cdgs.contains(it.key());
@@ -819,7 +1161,7 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     counts.insert(QStringLiteral("zipPairs"), zipPairs);
     counts.insert(QStringLiteral("nestedZips"), nested);
     reportProgress(QStringLiteral("pairing"), loosePairs + zipPairs, loosePairs + zipPairs, QString(), true);
-    return true;
+    return catalogue.ensureSongRows(rootId, error);
 }
 
 bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
@@ -849,7 +1191,7 @@ bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
     for (const auto& file : files) {
         if (shouldStop())
             break;
-        if (!waitWhilePaused())
+        if (!pauseOutsideTransaction(database))
             break;
         ++m_sourceFileReads;
         const QString path = QDir(rootPath).filePath(file.second);
@@ -988,5 +1330,444 @@ bool LibraryScanner::mergeZipDuplicates(Catalogue& catalogue, qint64 rootId,
     }
     counts.insert(QStringLiteral("zipDuplicatesMerged"), merged);
     reportProgress(QStringLiteral("duplicates"), merged, merged, QString(), true);
+    return true;
+}
+
+bool LibraryScanner::identifyDuplicates(Catalogue& catalogue, qint64 rootId,
+                                        const QString& rootPath, QVariantMap& counts,
+                                        QString* error)
+{
+    // Weakly named songs are compared with well-named songs whose CDG has
+    // exactly the same size. The size only groups files; identity is proven
+    // later by the resolver from complete content digests. Work is linear:
+    // each file gets a cheap quick digest once, full digests are computed
+    // only inside quick-digest collisions, and every digest is cached per
+    // file (so an interrupted pass resumes without reading anything twice).
+    // Each digest is saved on its own; no transaction is held while a file
+    // is read or while playback pauses the work.
+    QSqlDatabase database = catalogue.database();
+    // Digests made under an older definition of the drawing-packet count are
+    // recomputed (only the few files that were ever fully hashed).
+    if (catalogue.catalogueMeta(QStringLiteral("content_digest_version")).toInt() < kContentDigestVersion) {
+        QSqlQuery reset(database);
+        QSqlQuery version(database);
+        version.prepare(QStringLiteral(
+            "INSERT INTO catalogue_meta(key,value) VALUES('content_digest_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"));
+        version.addBindValue(kContentDigestVersion);
+        if (!reset.exec(QStringLiteral(
+                "UPDATE files SET content_sha256=NULL,cdg_packets=NULL WHERE kind='cdg' "
+                "AND content_sha256 IS NOT NULL")) || !version.exec()) {
+            *error = queryError(reset, QStringLiteral("Could not reset content digests"));
+            return false;
+        }
+    }
+    struct Member {
+        qint64 cdg = 0;
+        qint64 mp3 = 0;
+        QString cdgPath;
+        QString mp3Path;
+        bool weak = false;
+        QByteArray quick;
+        QByteArray content;
+    };
+    // Every playable pair whose song is weak or strong, grouped by CDG size,
+    // keeping only sizes that hold at least one of each.
+    QSqlQuery members(database);
+    members.prepare(QStringLiteral(
+        "SELECT g.size,g.id,g.rel_path,g.quick_sha256,g.content_sha256,m.id,m.rel_path,"
+        "so.base_confidence IN ('unresolved','low') FROM songs so "
+        "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+        "JOIN files g ON g.id=s.graphics_file_id JOIN files m ON m.id=s.mp3_file_id "
+        "WHERE s.root_id=? AND g.present=1 AND m.present=1 AND g.size>0 "
+        "AND so.base_confidence IN ('unresolved','low','medium','high') "
+        "AND g.size IN (SELECT tg.size FROM songs tso "
+        "JOIN sources ts ON ts.song_id=tso.id AND ts.kind='loose_cdg' "
+        "JOIN files tg ON tg.id=ts.graphics_file_id "
+        "WHERE ts.root_id=? AND tg.present=1 AND tso.base_confidence IN ('unresolved','low') "
+        "INTERSECT SELECT dg.size FROM songs dso "
+        "JOIN sources ds ON ds.song_id=dso.id AND ds.kind='loose_cdg' "
+        "JOIN files dg ON dg.id=ds.graphics_file_id "
+        "WHERE ds.root_id=? AND dg.present=1 AND dso.base_confidence IN ('high','medium')) "
+        "ORDER BY g.size,g.id"));
+    members.addBindValue(rootId);
+    members.addBindValue(rootId);
+    members.addBindValue(rootId);
+    if (!members.exec()) {
+        *error = queryError(members, QStringLiteral("Could not list duplicate candidates"));
+        return false;
+    }
+    QMap<qint64, QList<Member>> bySize;
+    qint64 memberCount = 0;
+    while (members.next()) {
+        Member member;
+        member.cdg = members.value(1).toLongLong();
+        member.cdgPath = members.value(2).toString();
+        member.quick = members.value(3).toByteArray();
+        member.content = members.value(4).toByteArray();
+        member.mp3 = members.value(5).toLongLong();
+        member.mp3Path = members.value(6).toString();
+        member.weak = members.value(7).toBool();
+        bySize[members.value(0).toLongLong()].append(member);
+        ++memberCount;
+    }
+    members.finish();
+
+    qint64 digestsComputed = 0;
+    bool stopped = false;
+    // Returns false only for a database failure. An unreadable file leaves
+    // an empty digest: that file is skipped and retried by a later pass.
+    auto compute = [&](qint64 fileId, const QString& relPath, const char* column, bool isCdg,
+                       QByteArray* digest) -> bool {
+        digest->clear();
+        if (!waitWhilePaused()) {
+            stopped = true;
+            return true;
+        }
+        const QString path = QDir(rootPath).filePath(relPath);
+        ++m_sourceFileReads;
+        qint64 packets = -1;
+        const bool quick = qstrcmp(column, "quick_sha256") == 0;
+        const bool ok = quick ? quickFileDigest(path, digest)
+            : isCdg ? cdgContentDigest(path, digest, &packets)
+                    : mp3AudioDigest(path, digest);
+        if (!ok) {
+            digest->clear();
+            if (rootGone(rootPath, counts))
+                stopped = true;
+            return true;
+        }
+        ++digestsComputed;
+        QSqlQuery store(database);
+        if (packets >= 0) {
+            store.prepare(QStringLiteral("UPDATE files SET %1=?,cdg_packets=? WHERE id=?")
+                              .arg(QLatin1String(column)));
+            store.addBindValue(*digest);
+            store.addBindValue(packets);
+        } else {
+            store.prepare(QStringLiteral("UPDATE files SET %1=? WHERE id=?").arg(QLatin1String(column)));
+            store.addBindValue(*digest);
+        }
+        store.addBindValue(fileId);
+        if (!store.exec()) {
+            *error = queryError(store, QStringLiteral("Could not store content digest"));
+            return false;
+        }
+        return true;
+    };
+    auto cachedMp3 = [&](qint64 fileId, QByteArray* digest) {
+        QSqlQuery query(database);
+        query.prepare(QStringLiteral("SELECT content_sha256 FROM files WHERE id=?"));
+        query.addBindValue(fileId);
+        *digest = query.exec() && query.next() ? query.value(0).toByteArray() : QByteArray();
+    };
+
+    qint64 done = 0;
+    qint64 proven = 0;
+    for (auto group = bySize.begin(); group != bySize.end() && !stopped && !shouldStop(); ++group) {
+        QList<Member>& list = group.value();
+        for (Member& member : list) {
+            if (member.quick.isEmpty()
+                && !compute(member.cdg, member.cdgPath, "quick_sha256", true, &member.quick))
+                return false;
+            ++done;
+            reportProgress(QStringLiteral("content_matching"), done, memberCount, member.cdgPath);
+            if (stopped || shouldStop())
+                break;
+        }
+        QHash<QByteArray, QList<int>> byQuick;
+        for (int i = 0; i < list.size(); ++i) {
+            if (!list.at(i).quick.isEmpty())
+                byQuick[list.at(i).quick].append(i);
+        }
+        for (const QList<int>& same : std::as_const(byQuick)) {
+            bool weak = false;
+            bool strong = false;
+            for (int i : same)
+                (list.at(i).weak ? weak : strong) = true;
+            if (!weak || !strong)
+                continue;
+            QHash<QByteArray, QList<int>> byContent;
+            for (int i : same) {
+                Member& member = list[i];
+                if (member.content.isEmpty()
+                    && !compute(member.cdg, member.cdgPath, "content_sha256", true, &member.content))
+                    return false;
+                if (stopped || shouldStop())
+                    break;
+                if (!member.content.isEmpty())
+                    byContent[member.content].append(i);
+            }
+            for (const QList<int>& identical : std::as_const(byContent)) {
+                bool hasWeak = false;
+                bool hasStrong = false;
+                for (int i : identical)
+                    (list.at(i).weak ? hasWeak : hasStrong) = true;
+                if (!hasWeak || !hasStrong)
+                    continue;
+                ++proven;
+                for (int i : identical) {
+                    QByteArray audio;
+                    cachedMp3(list.at(i).mp3, &audio);
+                    if (audio.isEmpty()
+                        && !compute(list.at(i).mp3, list.at(i).mp3Path, "content_sha256", false, &audio))
+                        return false;
+                    if (stopped || shouldStop())
+                        break;
+                }
+            }
+        }
+    }
+    counts.insert(QStringLiteral("contentCandidateFiles"), memberCount);
+    counts.insert(QStringLiteral("contentDigestsComputed"), digestsComputed);
+    counts.insert(QStringLiteral("contentIdenticalCdgGroups"), proven);
+    reportProgress(QStringLiteral("content_matching"), done, memberCount, QString(), true);
+    return true;
+}
+
+bool LibraryScanner::readSidecars(Catalogue& catalogue, qint64 rootId, const QString& rootPath,
+                                  QVariantMap& counts, QString* error)
+{
+    // Small text files that sit in a folder with songs may be disc track
+    // lists. Each is read once (read-only) and re-read only when it changes.
+    QSqlDatabase database = catalogue.database();
+    QSqlQuery list(database);
+    list.prepare(QStringLiteral(
+        "SELECT f.id,f.rel_path,f.size,f.mtime_ms FROM files f "
+        "LEFT JOIN sidecar_files sf ON sf.file_id=f.id "
+        "WHERE f.root_id=? AND f.present=1 AND f.kind='other' AND lower(f.ext)='txt' "
+        "AND f.size>0 AND f.size<=? "
+        "AND (sf.file_id IS NULL OR sf.size<>f.size OR sf.mtime_ms<>f.mtime_ms) "
+        "AND EXISTS(SELECT 1 FROM files m WHERE m.root_id=f.root_id AND m.rel_dir=f.rel_dir "
+        "AND m.kind='mp3' AND m.present=1) ORDER BY f.id"));
+    list.addBindValue(rootId);
+    list.addBindValue(kMaximumSidecarBytes);
+    if (!list.exec()) {
+        *error = queryError(list, QStringLiteral("Could not list track-list files"));
+        return false;
+    }
+    struct Text { qint64 id; QString relPath; qint64 size; qint64 mtime; };
+    QList<Text> texts;
+    while (list.next())
+        texts.append({list.value(0).toLongLong(), list.value(1).toString(),
+                      list.value(2).toLongLong(), list.value(3).toLongLong()});
+    list.finish();
+    qint64 recognised = 0;
+    qint64 done = 0;
+    for (const Text& text : std::as_const(texts)) {
+        if (shouldStop() || !waitWhilePaused())
+            break;
+        ++m_sourceFileReads;
+        QFile file(QDir(rootPath).filePath(text.relPath));
+        if (!file.open(QIODevice::ReadOnly)) {
+            if (rootGone(rootPath, counts))
+                break;
+            continue;
+        }
+        const QByteArray contents = file.read(kMaximumSidecarBytes + 1);
+        file.close();
+        const SidecarTrackList parsed = parseTrackListSidecar(contents);
+        if (!database.transaction()) {
+            *error = QStringLiteral("Could not begin track-list update: %1").arg(database.lastError().text());
+            return false;
+        }
+        QSqlQuery clear(database);
+        clear.prepare(QStringLiteral("DELETE FROM sidecar_entries WHERE file_id=?"));
+        clear.addBindValue(text.id);
+        QSqlQuery state(database);
+        state.prepare(QStringLiteral(
+            "INSERT INTO sidecar_files(file_id,size,mtime_ms,state,disc_id,detail) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET size=excluded.size,mtime_ms=excluded.mtime_ms,"
+            "state=excluded.state,disc_id=excluded.disc_id,detail=excluded.detail"));
+        state.addBindValue(text.id);
+        state.addBindValue(text.size);
+        state.addBindValue(text.mtime);
+        state.addBindValue(parsed.recognised ? QStringLiteral("track_list") : QStringLiteral("ignored"));
+        state.addBindValue(parsed.discId.isEmpty() ? QVariant() : QVariant(parsed.discId));
+        state.addBindValue(parsed.reason.isEmpty() ? QVariant() : QVariant(parsed.reason));
+        bool ok = clear.exec() && state.exec();
+        QSqlQuery insert(database);
+        insert.prepare(QStringLiteral(
+            "INSERT INTO sidecar_entries(file_id,disc_id,track,fields_json,line) VALUES(?,?,?,?,?)"));
+        for (const SidecarEntry& entry : parsed.entries) {
+            if (!ok)
+                break;
+            insert.bindValue(0, text.id);
+            insert.bindValue(1, entry.discId);
+            insert.bindValue(2, entry.track);
+            insert.bindValue(3, QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(entry.fields))
+                                                     .toJson(QJsonDocument::Compact)));
+            insert.bindValue(4, entry.line);
+            ok = insert.exec();
+        }
+        if (!ok || !database.commit()) {
+            database.rollback();
+            *error = QStringLiteral("Could not store track list: %1").arg(database.lastError().text());
+            return false;
+        }
+        recognised += parsed.recognised ? 1 : 0;
+        ++done;
+        reportProgress(QStringLiteral("sidecars"), done, texts.size(), text.relPath);
+    }
+    counts.insert(QStringLiteral("sidecarsRead"), done);
+    counts.insert(QStringLiteral("sidecarTrackLists"), recognised);
+    return true;
+}
+
+bool LibraryScanner::readTitleScreens(Catalogue& catalogue, qint64 rootId,
+                                      const QString& rootPath, QVariantMap& counts,
+                                      QString* error, bool recogniseNew)
+{
+    // Songs that are still unresolved are identified by the text their CDG
+    // shows at the start. Results are cached by CDG content (quick digest and
+    // size) in the enrichment cache, which outlives the catalogue, so a song
+    // is read and recognised once, and imported results from another
+    // computer match without any recognition here. Without recogniseNew
+    // (every scan) only CDGs of a size with a cached reading are fingerprinted
+    // to reconnect them; nothing is recognised.
+    QSqlDatabase database = catalogue.database();
+    const QString engine = recogniseNew && m_titleScreenOcr ? m_titleScreenOcr->name() : QString();
+    QSqlQuery anyImported(database);
+    if (!anyImported.exec(QStringLiteral("SELECT EXISTS(SELECT 1 FROM enrich.title_screens)"))
+        || !anyImported.next()) {
+        *error = queryError(anyImported, QStringLiteral("Could not inspect title screens"));
+        return false;
+    }
+    const bool haveResults = anyImported.value(0).toBool();
+    anyImported.finish();
+    if (engine.isEmpty() && !haveResults)
+        return true;
+    QSqlQuery targets(database);
+    targets.prepare(QStringLiteral(
+        "SELECT g.id,g.rel_path,g.size,g.quick_sha256 FROM songs so "
+        "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+        "JOIN files g ON g.id=s.graphics_file_id "
+        "WHERE s.root_id=? AND g.present=1 AND g.size>0 AND so.auto_confidence='unresolved' "
+        "AND (g.quick_sha256 IS NULL OR NOT EXISTS(SELECT 1 FROM enrich.title_screens t "
+        "WHERE t.cdg_quick_sha256=g.quick_sha256 AND t.cdg_size=g.size "
+        "AND (t.engine=? OR ?=''))) "
+        // Without recognition, only an unfingerprinted CDG of a cached size can match.
+        "AND (?<>'' OR (g.quick_sha256 IS NULL AND g.size IN (SELECT cdg_size FROM enrich.title_screens))) "
+        "ORDER BY g.rel_dir,g.id"));
+    targets.addBindValue(rootId);
+    targets.addBindValue(engine);
+    targets.addBindValue(engine);
+    targets.addBindValue(engine);
+    if (!targets.exec()) {
+        *error = queryError(targets, QStringLiteral("Could not list title-screen targets"));
+        return false;
+    }
+    struct Target { qint64 id; QString relPath; qint64 size; QByteArray quick; };
+    QList<Target> list;
+    while (targets.next())
+        list.append({targets.value(0).toLongLong(), targets.value(1).toString(),
+                     targets.value(2).toLongLong(), targets.value(3).toByteArray()});
+    targets.finish();
+    qint64 done = 0;
+    qint64 recognised = 0;
+    qint64 withoutTitleScreen = 0;
+    for (Target target : std::as_const(list)) {
+        if (shouldStop() || !waitWhilePaused())
+            break;
+        const QString path = QDir(rootPath).filePath(target.relPath);
+        if (target.quick.isEmpty()) {
+            ++m_sourceFileReads;
+            if (!quickFileDigest(path, &target.quick)) {
+                if (rootGone(rootPath, counts))
+                    break;
+                continue;
+            }
+            QSqlQuery store(database);
+            store.prepare(QStringLiteral("UPDATE files SET quick_sha256=? WHERE id=?"));
+            store.addBindValue(target.quick);
+            store.addBindValue(target.id);
+            if (!store.exec()) {
+                *error = queryError(store, QStringLiteral("Could not store content digest"));
+                return false;
+            }
+        }
+        if (engine.isEmpty())
+            continue;  // imported results are matched by the digest alone
+        QSqlQuery known(database);
+        known.prepare(QStringLiteral(
+            "SELECT 1 FROM enrich.title_screens WHERE cdg_quick_sha256=? AND cdg_size=? AND engine=?"));
+        known.addBindValue(target.quick);
+        known.addBindValue(target.size);
+        known.addBindValue(engine);
+        if (known.exec() && known.next())
+            continue;  // an identical CDG elsewhere was already read
+        known.finish();
+        ++m_sourceFileReads;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            if (rootGone(rootPath, counts))
+                break;
+            continue;
+        }
+        const QByteArray bytes = file.readAll();
+        const bool readOk = file.error() == QFileDevice::NoError;
+        file.close();
+        if (!readOk) {
+            if (rootGone(rootPath, counts))
+                break;
+            continue;
+        }
+        const auto* first = reinterpret_cast<const std::uint8_t*>(bytes.constData());
+        const std::vector<std::uint8_t> stream(first, first + bytes.size());
+        const std::vector<cdg::TitleFrame> frames = cdg::findTitleFrames(stream);
+        QJsonArray framesJson;
+        QString status = frames.empty() ? QStringLiteral("no_title_frame") : QStringLiteral("ok");
+        for (const cdg::TitleFrame& frame : frames) {
+            if (shouldStop())
+                break;
+            QList<OcrLine> lines;
+            QString ocrError;
+            if (!m_titleScreenOcr->recognise(frame.pixels, cdg::CdgDecoder::kWidth,
+                                             cdg::CdgDecoder::kHeight, &lines, &ocrError)) {
+                status = QStringLiteral("ocr_failed");
+                qWarning().noquote() << "Title-screen recognition failed:" << ocrError
+                                     << target.relPath;
+                break;
+            }
+            QJsonArray linesJson;
+            for (const OcrLine& line : std::as_const(lines)) {
+                QJsonObject item;
+                item.insert(QStringLiteral("text"), line.text);
+                item.insert(QStringLiteral("confidence"), line.confidence);
+                item.insert(QStringLiteral("box"), QJsonArray{line.x, line.y, line.width, line.height});
+                linesJson.append(item);
+            }
+            QJsonObject frameJson;
+            frameJson.insert(QStringLiteral("timeMs"), frame.timeMs);
+            frameJson.insert(QStringLiteral("lines"), linesJson);
+            framesJson.append(frameJson);
+        }
+        if (shouldStop())
+            break;
+        if (status == QLatin1String("ocr_failed"))
+            continue;  // not cached: a later pass retries it
+        QSqlQuery store(database);
+        store.prepare(QStringLiteral(
+            "INSERT OR REPLACE INTO enrich.title_screens(cdg_quick_sha256,cdg_size,engine,status,"
+            "frames_json,created_at) VALUES(?,?,?,?,?,?)"));
+        store.addBindValue(target.quick);
+        store.addBindValue(target.size);
+        store.addBindValue(engine);
+        store.addBindValue(status);
+        store.addBindValue(QString::fromUtf8(QJsonDocument(framesJson).toJson(QJsonDocument::Compact)));
+        store.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        if (!store.exec()) {
+            *error = queryError(store, QStringLiteral("Could not store title-screen text"));
+            return false;
+        }
+        ++done;
+        recognised += frames.empty() ? 0 : 1;
+        withoutTitleScreen += frames.empty() ? 1 : 0;
+        reportProgress(QStringLiteral("title_screens"), done, list.size(), target.relPath);
+    }
+    counts.insert(QStringLiteral("titleScreenTargets"), list.size());
+    counts.insert(QStringLiteral("titleScreensRead"), done);
+    counts.insert(QStringLiteral("titleScreensWithFrames"), recognised);
+    counts.insert(QStringLiteral("titleScreensWithoutFrame"), withoutTitleScreen);
     return true;
 }

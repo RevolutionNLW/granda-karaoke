@@ -50,7 +50,7 @@ QString folderDisc(const QStringList& parts)
     // Folder IDs are deliberately conservative: a compact letter/number ID,
     // the observed "SF Gold N" family, "Vol N", or a numeric disc folder.
     static const QRegularExpression compact(
-        QStringLiteral(R"(^\s*([A-Za-z]{1,8})[\s-]*(\d{1,6})\s*$)"));
+        QStringLiteral(R"(^\s*([A-Za-z]{1,8})[\s-]*(\d{1,6})[\s-]*$)"));
     static const QRegularExpression gold(
         QStringLiteral(R"(^\s*([A-Za-z]{1,4})\s+Gold\s+(\d{1,4})\s*$)"),
         QRegularExpression::CaseInsensitiveOption);
@@ -89,14 +89,67 @@ QString fallbackFolder(const QStringList& parts)
 QStringList splitFields(const QString& text)
 {
     QStringList result;
-    const QStringList pieces = text.split(QRegularExpression(QStringLiteral(R"(\s+-\s+)")),
-                                          Qt::SkipEmptyParts);
+    // " - " is the usual separator. "--" between two names is one as well,
+    // with or without spaces ("Act Naturally--Buck Owens"); "8--3" is not.
+    QStringList pieces;
+    static const QRegularExpression letter(QStringLiteral(R"(\p{L})"),
+                                           QRegularExpression::UseUnicodePropertiesOption);
+    // " - " inside brackets belongs to the name: "(Remix - Radio Version)".
+    QStringList spaced;
+    int depth = 0;
+    qsizetype start = 0;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        const QChar c = text.at(i);
+        if (c == QLatin1Char('(') || c == QLatin1Char('['))
+            ++depth;
+        else if ((c == QLatin1Char(')') || c == QLatin1Char(']')) && depth > 0)
+            --depth;
+        else if (depth == 0 && c == QLatin1Char('-') && i > 0 && i + 1 < text.size()
+                 && text.at(i - 1).isSpace() && text.at(i + 1).isSpace()) {
+            spaced.append(text.mid(start, i - start));
+            start = i + 1;
+        }
+    }
+    spaced.append(text.mid(start));
+    // A truncated name can leave a bracket open ("(Theme From The Legend O -
+    // Pat Benatar"): then the brackets say nothing and every " - " separates.
+    if (depth > 0)
+        spaced = text.split(QRegularExpression(QStringLiteral(R"(\s+-\s+)")), Qt::SkipEmptyParts);
+    for (const QString& rawPiece : std::as_const(spaced)) {
+        const QString piece = rawPiece.trimmed();
+        if (piece.isEmpty())
+            continue;
+        const QStringList parts = piece.split(QRegularExpression(QStringLiteral(R"(\s*-{2,}\s*)")),
+                                              Qt::SkipEmptyParts);
+        bool allNamed = parts.size() > 1;
+        for (const QString& part : parts)
+            allNamed = allNamed && part.contains(letter);
+        if (allNamed)
+            pieces.append(parts);
+        else
+            pieces.append(piece);
+    }
     for (const QString& piece : pieces) {
         const QString field = collapseWhitespace(piece);
         if (!field.isEmpty())
             result.append(field);
     }
     return result;
+}
+
+bool underscoresSeparateFields(const QString& stem)
+{
+    if (!stem.contains(QLatin1Char(' ')) || !stem.contains(QLatin1Char('_'))
+        || stem.contains(QRegularExpression(QStringLiteral(R"(_-_|_-\s|\s-_)"))))
+        return false;
+    if (stem.count(QLatin1Char('_')) > 4)
+        return false;
+    // "Guns_N_Roses" or "Don_t" use underscores inside a name: a one- or
+    // two-letter word touching an underscore is a word fragment, not a field.
+    static const QRegularExpression fragment(
+        QStringLiteral(R"((?<![\p{L}\p{N}])\p{L}{1,2}_|_\p{L}{1,2}(?![\p{L}\p{N}])|__|^_|_$)"),
+        QRegularExpression::UseUnicodePropertiesOption);
+    return !fragment.match(stem.trimmed()).hasMatch();
 }
 
 void setDisc(ParsedName& parsed, const QString& disc, const QString& source)
@@ -108,13 +161,47 @@ void setDisc(ParsedName& parsed, const QString& disc, const QString& source)
 
 } // namespace
 
+namespace {
+ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
+                            const QString& cleaned);
+} // namespace
+
 ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
 {
+    const QString stem = QFileInfo(fileName).completeBaseName();
+    // An underscore normally stands for a space ("Cliff_Richard_-_Thank_You").
+    ParsedName parsed = parseCleanedName(relativeDir, stem,
+                                         QString(stem).replace(QLatin1Char('_'), QLatin1Char(' ')));
+    // A name that uses spaces between words but has no second name field may
+    // use underscores as its field separator ("ZOOM004-01_24 HOURS FROM
+    // TULSA_GENE PITNEY", "MRH62-11 - Kasabian_underdog"). When " - " already
+    // gives two names, an underscore is part of a name ("Newton John_Travolta").
+    if (parsed.fields.size() <= 1 && underscoresSeparateFields(stem)) {
+        const ParsedName separated = parseCleanedName(
+            relativeDir, stem, QString(stem).replace(QLatin1Char('_'), QStringLiteral(" - ")));
+        if (separated.fields.size() == 2) {
+            // Only a heuristic: the resolver shows this split only with strong
+            // order evidence, and otherwise keeps the name whole.
+            ParsedName result = separated;
+            result.underscoreSplit = true;
+            static const QRegularExpression afterCode(QStringLiteral(R"(^[^_]*\d_)"));
+            result.underscoreAfterCode = afterCode.match(stem).hasMatch()
+                && !result.discId.isEmpty();
+            result.unsplit = parsed.fields.isEmpty() ? QString() : parsed.fields.first();
+            return result;
+        }
+    }
+    return parsed;
+}
+
+namespace {
+
+ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
+                            const QString& cleaned)
+{
     ParsedName parsed;
-    parsed.stem = QFileInfo(fileName).completeBaseName();
-    parsed.cleaned = parsed.stem;
-    parsed.cleaned.replace(QLatin1Char('_'), QLatin1Char(' '));
-    parsed.cleaned = collapseWhitespace(parsed.cleaned);
+    parsed.stem = stem;
+    parsed.cleaned = collapseWhitespace(cleaned);
 
     const QStringList directories = folderParts(relativeDir);
     const QString fromFolder = folderDisc(directories);
@@ -149,7 +236,7 @@ ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
         }
     }
     if (!parsed.discId.isEmpty()) {
-        remainder.remove(QRegularExpression(QStringLiteral(R"(^\s*-\s*)")));
+        remainder.remove(QRegularExpression(QStringLiteral(R"(^\s*-+\s*)")));
         remainder = collapseWhitespace(remainder);
         parsed.fields = splitFields(remainder);
         parsed.kind = parsed.fields.isEmpty() ? ParsedName::Kind::DiscTrackOnly
@@ -159,7 +246,9 @@ ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
 
     // A packed ID (EZH00807, PM00411) is only split when a folder corroborates
     // its series and numeric disc. Without that evidence it remains free text.
-    static const QRegularExpression packed(QStringLiteral(R"(^([A-Za-z]{2,8})(\d{2,6})(\d{2})$)"));
+    // A one-digit disc ("sgb301" in folder sgb3) and a space ("leg 12203" in
+    // folder LEG 122) are accepted only with that same folder corroboration.
+    static const QRegularExpression packed(QStringLiteral(R"(^([A-Za-z]{2,8}) ?(\d{1,6})(\d{2})$)"));
     match = packed.match(parsed.cleaned);
     if (match.hasMatch() && !fromFolder.isEmpty()) {
         const QString packedPrefix = match.captured(1).toUpper();
@@ -180,6 +269,24 @@ ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
         }
     }
 
+    // "14--16" inside folder EK14: the leading number repeats the folder's disc
+    // number, so the second number is the track. Without that folder it stays
+    // free text.
+    static const QRegularExpression discNumberTrack(
+        QStringLiteral(R"(^(\d{1,6})\s*-{1,2}\s*(\d{1,3})$)"));
+    match = discNumberTrack.match(parsed.cleaned);
+    if (match.hasMatch() && !fromFolder.isEmpty()) {
+        QString folderDigits = fromFolder;
+        folderDigits.remove(QRegularExpression(QStringLiteral(R"(\D)")));
+        if (!folderDigits.isEmpty()
+            && folderDigits.toULongLong() == match.captured(1).toULongLong()) {
+            setDisc(parsed, fromFolder, QStringLiteral("folder"));
+            parsed.track = match.captured(2).toInt();
+            parsed.kind = ParsedName::Kind::DiscTrackOnly;
+            return parsed;
+        }
+    }
+
     // Explicit Track and Vol labels are not filename disc prefixes.  Vol N may
     // still provide a disc when it is a folder name (handled above).
     static const QRegularExpression volumeTrack(
@@ -193,14 +300,30 @@ ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
         return parsed;
     }
 
+    // "Track 9", and "09 - Track 9" where the leading number repeats the track.
     static const QRegularExpression labelledTrack(
-        QStringLiteral(R"(^Track\s*-?\s*(\d{1,4})\s*$)"),
+        QStringLiteral(R"(^(?:(\d{1,4})\s*-\s*)?Track\s*-?\s*(\d{1,4})\s*$)"),
         QRegularExpression::CaseInsensitiveOption);
     match = labelledTrack.match(parsed.cleaned);
-    if (match.hasMatch()) {
-        parsed.track = match.captured(1).toInt();
+    if (match.hasMatch() && (match.captured(1).isEmpty()
+                             || match.captured(1).toInt() == match.captured(2).toInt())) {
+        parsed.track = match.captured(2).toInt();
         useFolder();
         parsed.kind = ParsedName::Kind::TrackOnly;
+        return parsed;
+    }
+
+    // "Track 5 MEET ME ON THE CORNER": a track label followed by a name.
+    static const QRegularExpression labelledTrackName(
+        QStringLiteral(R"(^Track\s*-?\s*(\d{1,4})\s+(\D.*)$)"),
+        QRegularExpression::CaseInsensitiveOption);
+    match = labelledTrackName.match(parsed.cleaned);
+    if (match.hasMatch()) {
+        parsed.track = match.captured(1).toInt();
+        parsed.fields = splitFields(match.captured(2));
+        useFolder();
+        parsed.kind = parsed.discId.isEmpty() ? ParsedName::Kind::TrackFields
+                                              : ParsedName::Kind::DiscTrackFields;
         return parsed;
     }
 
@@ -245,6 +368,8 @@ ParsedName parseSongName(const QString& relativeDir, const QString& fileName)
     return parsed;
 }
 
+} // namespace
+
 QJsonObject parsedNameJson(const ParsedName& parsed, const QString& rawPath,
                            const QString& rawFileName)
 {
@@ -259,6 +384,11 @@ QJsonObject parsedNameJson(const ParsedName& parsed, const QString& rawPath,
     result.insert(QStringLiteral("kind"), int(parsed.kind));
     result.insert(QStringLiteral("discSource"), parsed.discSource);
     result.insert(QStringLiteral("fallbackFolder"), parsed.fallbackFolder);
+    if (parsed.underscoreSplit) {
+        result.insert(QStringLiteral("underscoreSplit"), true);
+        result.insert(QStringLiteral("underscoreAfterCode"), parsed.underscoreAfterCode);
+        result.insert(QStringLiteral("unsplit"), parsed.unsplit);
+    }
     QJsonArray fields;
     for (const QString& field : parsed.fields)
         fields.append(field);

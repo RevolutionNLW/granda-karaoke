@@ -1,5 +1,6 @@
 #include "CdgTestData.h"
 #include "cdg/CdgDecoder.h"
+#include "cdg/CdgTitleFrames.h"
 
 #include <QtTest>
 
@@ -29,6 +30,7 @@ class TestCdgDecoder : public QObject {
     Q_OBJECT
 
 private slots:
+    void titleFramesComeBeforeTheFirstClear();
     void initialStateIsBlank();
     void graphicsPacketCount();
     void memoryPresetFillsScreen();
@@ -416,6 +418,27 @@ void TestCdgDecoder::renderUsesPalette()
     QCOMPARE(image[0], 0xFFFF8800u);
     QCOMPARE(image[stride * 215 + 299], 0xFFFF8800u);
     QCOMPARE(image[CdgDecoder::kWidth], 0xDEADBEEFu);  // padding untouched
+}
+
+void TestCdgDecoder::titleFramesComeBeforeTheFirstClear()
+{
+    const std::vector<std::uint8_t> data = testcdg::titleScreenStream(10);
+    const std::vector<cdg::TitleFrame> frames = cdg::findTitleFrames(data);
+    QCOMPARE(frames.size(), std::size_t(1));
+    // Stable for at least 0.7 s, and before the clear at 5 s (never the lyrics).
+    QVERIFY(frames.front().timeMs >= 700);
+    QVERIFY(frames.front().timeMs < 5000);
+    QCOMPARE(frames.front().pixels.size(),
+             std::size_t(cdg::CdgDecoder::kWidth * cdg::CdgDecoder::kHeight));
+    QVERIFY(frames.front().foregroundTiles >= 20);
+
+    // Blank, empty and truncated streams give nothing and never throw.
+    QVERIFY(cdg::findTitleFrames(testcdg::stream(3000, {{0, testcdg::memoryPreset(3)}})).empty());
+    QVERIFY(cdg::findTitleFrames({}).empty());
+    std::vector<std::uint8_t> truncated(data.begin(), data.begin() + 100);
+    QVERIFY(cdg::findTitleFrames(truncated).empty());
+    // Only the start of a long stream is decoded.
+    QVERIFY(cdg::findTitleFrames(data, 500).empty());
 }
 
 QTEST_APPLESS_MAIN(TestCdgDecoder)

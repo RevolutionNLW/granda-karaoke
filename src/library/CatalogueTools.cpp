@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
 
@@ -171,6 +172,19 @@ QVariantMap CatalogueTools::reparse(Catalogue& catalogue, QString* error)
     if (error && !error->isEmpty())
         return {};
 
+    qint64 reparsed = 0;
+    if (!reparseStoredNames(catalogue, &reparsed, error))
+        return {};
+    if (!MetadataResolver::resolve(catalogue, -1, error))
+        return {};
+    result.insert(QStringLiteral("reparsed"), reparsed);
+    result.insert(QStringLiteral("after"), kindDistribution(database, error));
+    return result;
+}
+
+bool CatalogueTools::reparseStoredNames(Catalogue& catalogue, qint64* count, QString* error)
+{
+    QSqlDatabase database = catalogue.database();
     QSqlQuery rows(database);
     if (!rows.exec(QStringLiteral(
             "SELECT s.id,s.parsed_json,COALESCE(f.rel_dir,''),"
@@ -178,7 +192,7 @@ QVariantMap CatalogueTools::reparse(Catalogue& catalogue, QString* error)
             "FROM sources s LEFT JOIN files f ON f.id=s.mp3_file_id ORDER BY s.id"))) {
         if (error)
             *error = queryError(rows, QStringLiteral("Could not load stored filenames"));
-        return {};
+        return false;
     }
     struct StoredName { qint64 id; QString rawPath; QString rawFileName; QString relDir; };
     QList<StoredName> names;
@@ -201,7 +215,7 @@ QVariantMap CatalogueTools::reparse(Catalogue& catalogue, QString* error)
         if (error)
             *error = QStringLiteral("Could not begin stored-name reparse: %1")
                          .arg(database.lastError().text());
-        return {};
+        return false;
     }
     QSqlQuery update(database);
     update.prepare(QStringLiteral("UPDATE sources SET parsed_json=? WHERE id=?"));
@@ -215,18 +229,150 @@ QVariantMap CatalogueTools::reparse(Catalogue& catalogue, QString* error)
             database.rollback();
             if (error)
                 *error = queryError(update, QStringLiteral("Could not store reparsed filename"));
-            return {};
+            return false;
         }
     }
     if (!database.commit()) {
         if (error)
             *error = QStringLiteral("Could not commit stored-name reparse: %1")
                          .arg(database.lastError().text());
+        return false;
+    }
+    QSqlQuery version(database);
+    version.prepare(QStringLiteral(
+        "INSERT INTO catalogue_meta(key,value) VALUES('parser_version',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"));
+    version.addBindValue(kFilenameParserVersion);
+    if (!version.exec()) {
+        if (error)
+            *error = queryError(version, QStringLiteral("Could not record parser version"));
+        return false;
+    }
+    if (count)
+        *count = names.size();
+    return true;
+}
+
+namespace {
+
+bool outsideLibraryRoots(Catalogue& catalogue, const QString& path, QString* error)
+{
+    QStringList roots;
+    for (const CatalogueRoot& root : catalogue.roots(error))
+        roots.append(root.path);
+    return Catalogue::storageIsSafe(path, {}, roots, error);
+}
+
+} // namespace
+
+QVariantMap CatalogueTools::exportTitleScreens(Catalogue& catalogue, const QString& path,
+                                               QString* error)
+{
+    if (!outsideLibraryRoots(catalogue, path, error))
+        return {};
+    QSqlQuery query(catalogue.database());
+    if (!query.exec(QStringLiteral(
+            "SELECT cdg_quick_sha256,cdg_size,engine,status,frames_json,created_at "
+            "FROM enrich.title_screens ORDER BY cdg_size,cdg_quick_sha256,engine"))) {
+        if (error)
+            *error = queryError(query, QStringLiteral("Could not read title screens"));
         return {};
     }
-    if (!MetadataResolver::resolve(catalogue, -1, error))
+    QJsonArray rows;
+    while (query.next()) {
+        QJsonObject row;
+        row.insert(QStringLiteral("cdgQuickSha256"), QString::fromLatin1(query.value(0).toByteArray().toHex()));
+        row.insert(QStringLiteral("cdgSize"), query.value(1).toLongLong());
+        row.insert(QStringLiteral("engine"), query.value(2).toString());
+        row.insert(QStringLiteral("status"), query.value(3).toString());
+        row.insert(QStringLiteral("frames"), QJsonDocument::fromJson(query.value(4).toByteArray()).array());
+        row.insert(QStringLiteral("createdAt"), query.value(5).toLongLong());
+        rows.append(row);
+    }
+    QJsonObject document;
+    document.insert(QStringLiteral("format"), QStringLiteral("fks-title-screens"));
+    document.insert(QStringLiteral("version"), 1);
+    document.insert(QStringLiteral("rows"), rows);
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)
+        || file.write(QJsonDocument(document).toJson(QJsonDocument::Compact)) < 0
+        || !file.commit()) {
+        if (error)
+            *error = QStringLiteral("Could not write %1: %2").arg(path, file.errorString());
         return {};
-    result.insert(QStringLiteral("reparsed"), names.size());
-    result.insert(QStringLiteral("after"), kindDistribution(database, error));
+    }
+    QVariantMap result;
+    result.insert(QStringLiteral("exported"), rows.size());
+    result.insert(QStringLiteral("path"), path);
+    return result;
+}
+
+QVariantMap CatalogueTools::importTitleScreens(Catalogue& catalogue, const QString& path,
+                                               QString* error)
+{
+    if (!outsideLibraryRoots(catalogue, path, error))
+        return {};
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error)
+            *error = QStringLiteral("Could not read %1: %2").arg(path, file.errorString());
+        return {};
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    const QJsonObject root = document.object();
+    if (parseError.error != QJsonParseError::NoError
+        || root.value(QStringLiteral("format")).toString() != QLatin1String("fks-title-screens")
+        || root.value(QStringLiteral("version")).toInt() != 1) {
+        if (error)
+            *error = QStringLiteral("Not a title-screen export (version 1): %1").arg(path);
+        return {};
+    }
+    QSqlDatabase database = catalogue.database();
+    if (!database.transaction()) {
+        if (error)
+            *error = QStringLiteral("Could not begin import: %1").arg(database.lastError().text());
+        return {};
+    }
+    QSqlQuery insert(database);
+    insert.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO enrich.title_screens(cdg_quick_sha256,cdg_size,engine,status,frames_json,"
+        "created_at) VALUES(?,?,?,?,?,?)"));
+    qint64 imported = 0;
+    qint64 skipped = 0;
+    for (const QJsonValue& value : root.value(QStringLiteral("rows")).toArray()) {
+        const QJsonObject row = value.toObject();
+        const QByteArray digest = QByteArray::fromHex(
+            row.value(QStringLiteral("cdgQuickSha256")).toString().toLatin1());
+        const qint64 size = row.value(QStringLiteral("cdgSize")).toInteger();
+        const QString engine = row.value(QStringLiteral("engine")).toString();
+        const QString status = row.value(QStringLiteral("status")).toString();
+        if (digest.size() != 32 || size <= 0 || engine.isEmpty() || status.isEmpty()) {
+            ++skipped;
+            continue;
+        }
+        insert.bindValue(0, digest);
+        insert.bindValue(1, size);
+        insert.bindValue(2, engine);
+        insert.bindValue(3, status);
+        insert.bindValue(4, QString::fromUtf8(QJsonDocument(row.value(QStringLiteral("frames")).toArray())
+                                                   .toJson(QJsonDocument::Compact)));
+        insert.bindValue(5, row.value(QStringLiteral("createdAt")).toInteger());
+        if (!insert.exec()) {
+            database.rollback();
+            if (error)
+                *error = queryError(insert, QStringLiteral("Could not import title screen"));
+            return {};
+        }
+        ++imported;
+    }
+    if (!database.commit()) {
+        if (error)
+            *error = QStringLiteral("Could not commit import: %1").arg(database.lastError().text());
+        return {};
+    }
+    QVariantMap result;
+    result.insert(QStringLiteral("imported"), imported);
+    result.insert(QStringLiteral("skipped"), skipped);
     return result;
 }

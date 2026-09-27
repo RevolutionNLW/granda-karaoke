@@ -9,6 +9,7 @@
 class LyricsView;
 class LibraryController;
 class LibraryView;
+class MetadataReviewDialog;
 class PlaylistPlayback;
 class PlaylistStore;
 class PlaylistView;
@@ -56,6 +57,15 @@ public:
     LibraryView* libraryView() const { return m_library; }
     PlaylistView* playlistView() const { return m_playlistView; }
     PlaylistPlayback* playlistPlayback() const { return m_playlistPlayback; }
+    // Library maintenance (song-name review and correction). Opened with
+    // Ctrl+Shift+M (Cmd+Shift+M on macOS); not part of the singer's screens.
+    MetadataReviewDialog* openMetadataReview();
+    // Plays a library song so it can be identified from the maintenance
+    // screen. A preview has no playlist context (so it never autoplays), shows
+    // its lyrics only in the maintenance screen and never stores Key/Tempo.
+    bool previewSong(qint64 songId, QString* error = nullptr);
+    void stopPreview();
+    bool isPreviewing() const { return m_previewing; }
 
     // When false, problems are shown only in the status line (used by tests).
     void setShowErrorDialogs(bool show) { m_showErrorDialogs = show; }
@@ -83,6 +93,7 @@ private:
     void onError(const QString& message);
     void updateControls();
     void showError(const QString& message);
+    void setPreviewing(bool previewing);
 
     KaraokePlayer* m_player;
     ISongSettingsStore* m_settingsStore;
@@ -95,6 +106,7 @@ private:
     LyricsView* m_lyrics;
     LibraryView* m_library = nullptr;
     PlaylistView* m_playlistView = nullptr;
+    MetadataReviewDialog* m_review = nullptr;
     QWidget* m_libraryPage = nullptr;
     QLabel* m_songLabel;
     QLabel* m_statusLabel;
@@ -118,4 +130,11 @@ private:
     bool m_identityWarningLogged = false;
     QString m_errorText;
     bool m_showErrorDialogs = true;
+    bool m_previewing = false;
+    // The catalogue song now loaded, for play statistics (0 when unknown).
+    qint64 m_playSongId = 0;
+    KaraokePlayer::State m_lastPlayerState = KaraokePlayer::State::Empty;
+    // A start is counted once its audio position first advances, so a start
+    // that fails before any sound is never a play.
+    bool m_playStartPending = false;
 };

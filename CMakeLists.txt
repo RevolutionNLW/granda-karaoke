@@ -25,6 +25,8 @@ endif()
 add_library(fks_cdg STATIC
     src/cdg/CdgDecoder.cpp
     src/cdg/CdgDecoder.h
+    src/cdg/CdgTitleFrames.cpp
+    src/cdg/CdgTitleFrames.h
 )
 target_include_directories(fks_cdg PUBLIC src)
 
@@ -35,6 +37,12 @@ add_library(fks_library STATIC
     src/library/Catalogue.h
     src/library/CatalogueTools.cpp
     src/library/CatalogueTools.h
+    src/library/ContentIdentity.cpp
+    src/library/ContentIdentity.h
+    src/library/KaraokeLabels.cpp
+    src/library/KnownLibraryRoots.cpp
+    src/library/UserStateStore.cpp
+    src/library/KaraokeLabels.h
     src/library/FilenameParser.cpp
     src/library/FilenameParser.h
     src/library/Id3Reader.cpp
@@ -43,11 +51,30 @@ add_library(fks_library STATIC
     src/library/LibraryScanner.h
     src/library/MetadataResolver.cpp
     src/library/MetadataResolver.h
+    src/library/MetadataOverrideStore.cpp
+    src/library/MetadataOverrideStore.h
+    src/library/SidecarParser.cpp
+    src/library/SidecarParser.h
+    src/library/TitleScreenText.cpp
+    src/library/TitleScreenText.h
     src/library/ZipDirectory.cpp
     src/library/ZipDirectory.h
 )
 target_include_directories(fks_library PUBLIC src)
-target_link_libraries(fks_library PUBLIC Qt6::Core Qt6::Sql)
+target_link_libraries(fks_library PUBLIC fks_cdg Qt6::Core Qt6::Sql)
+
+# Local title-screen OCR (Apple Vision on macOS). Platform code is isolated
+# here; other platforms build a stub that reports no engine.
+if(APPLE)
+    enable_language(OBJCXX)
+    add_library(fks_ocr STATIC src/ocr/PlatformTitleScreenOcr.h src/ocr/PlatformTitleScreenOcr_mac.mm)
+    set_source_files_properties(src/ocr/PlatformTitleScreenOcr_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(fks_ocr PUBLIC fks_library PRIVATE "-framework Vision" "-framework CoreGraphics" "-framework Foundation")
+else()
+    add_library(fks_ocr STATIC src/ocr/PlatformTitleScreenOcr.h src/ocr/PlatformTitleScreenOcr_none.cpp)
+    target_link_libraries(fks_ocr PUBLIC fks_library)
+endif()
+target_include_directories(fks_ocr PUBLIC src)
 
 # User-owned playlists live separately from the rebuildable song catalogue.
 # This target has no widgets or media-playback dependency.
@@ -60,7 +87,8 @@ target_include_directories(fks_playlist PUBLIC src)
 target_link_libraries(fks_playlist PUBLIC Qt6::Core Qt6::Sql PRIVATE fks_library)
 
 add_executable(fks-catalogue tools/fks-catalogue.cpp)
-target_link_libraries(fks-catalogue PRIVATE fks_library)
+# fks_ocr brings fks_library (and fks_cdg) with it.
+target_link_libraries(fks-catalogue PRIVATE fks_ocr)
 
 # Application core shared by the executable and the tests.
 add_library(fks_core STATIC
@@ -70,6 +98,8 @@ add_library(fks_core STATIC
     src/LibraryResultsModel.h
     src/LibraryView.cpp
     src/LibraryView.h
+    src/MetadataReviewDialog.cpp
+    src/MetadataReviewDialog.h
     src/PlaylistView.cpp
     src/PlaylistView.h
     src/Logging.cpp
@@ -90,7 +120,7 @@ add_library(fks_core STATIC
     src/MainWindow.h
 )
 target_include_directories(fks_core PUBLIC src)
-target_link_libraries(fks_core PUBLIC fks_cdg fks_library fks_playlist Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
+target_link_libraries(fks_core PUBLIC fks_ocr fks_playlist Qt6::Core Qt6::Gui Qt6::Widgets GStreamer::GStreamer)
 
 if(APPLE)
     target_link_libraries(fks_core PRIVATE "-framework IOKit" "-framework CoreFoundation")
@@ -105,7 +135,7 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
-foreach(_target fks_cdg fks_library fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
+foreach(_target fks_cdg fks_library fks_ocr fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
     if(MSVC)
         target_compile_options(${_target} PRIVATE /W4)
     else()

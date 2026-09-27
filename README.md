@@ -50,6 +50,89 @@ macOS, normally `~/Library/Application Support/Granda/FrankiesKaraokeStudio/`). 
 arguments for its command list. ZIP and MCG songs are catalogued, but ZIP-only songs and
 MCG songs are not playable yet. Playlists, queues and autoplay are not included.
 
+## Song Names (Milestone 5)
+
+The collection's file names and tags are inconsistent, so the app keeps its own clean
+interpretation of every song and never changes a song file. Each song has three layers:
+
+1. **Raw data** exactly as found: path, file name, folders, ID3 tags, ZIP members.
+2. **Automatic metadata** with a confidence (`high`, `medium`, `low`, `unresolved`),
+   where it came from, and the evidence behind it. The sources are the file name and
+   the folder/disc naming rules, ID3 tags (supporting only), disc track lists found
+   beside the songs (for example MP3+G Toolz "Folder Text Files"), identical copies
+   elsewhere in the collection (proven by complete CDG content, never by size), and
+   CDG title screens read with local text recognition.
+3. **Manual corrections**, which always win and are never overwritten by reprocessing.
+
+Each song also records its karaoke **label** and, where certain, **series** (for example
+Sunfly / Most Wanted, Legends, Zoom), separately from artist, title, disc and track, so
+versions of the same song from different labels stay distinct (`Johnny Cash | Ring Of Fire |
+Sunfly | SF123-04` and `... | Legends | LEG056-09`). A label comes from a disc code that
+belongs to one label, or for songs without a disc code from a top-level folder named after
+a label; when the two disagree, or the code is unknown, no label is given. Songs are never
+merged because their artist and title match.
+
+Unresolved songs stay playable and are shown as, for example, `Disc SGB39 - Track 02`.
+Search finds a song by its shown name and by its raw file name, folders, tags, disc and
+track (`3902`, `SGB39 02`), so old identifiers keep working.
+
+**Library maintenance** (for whoever looks after the collection, not the singer) opens with
+**Ctrl+Shift+M** (**Cmd+Shift+M** on macOS). It lists unresolved, low- or medium-confidence,
+conflicting and manually corrected songs, shows the evidence for each, lets you correct
+artist and title, and runs **Reprocess Metadata** in the background. Reprocessing only
+reads the catalogue, except for two slow steps that read the music drive read-only,
+resume where they stopped and pause while a song plays: comparing weakly named songs with
+same-size named copies, and (when ticked, macOS only for now) reading title screens.
+Title screens usually show the song title but not the singer, so a title is shown only
+when it matches a title already known in the collection; other readings stay searchable,
+and a single unverified reading is offered as **Detected title** (Use Detected Title copies
+it into the Title box; nothing is saved until Save Correction). **Play Preview** plays the
+selected song through the normal player, with its lyrics in the review window: a preview
+never starts playlist context or Autoplay, never counts as a play and never stores Key/Tempo.
+**Revert to Automatic** removes a correction.
+
+Title-screen results are stored by CDG content and can be moved to another computer
+(for example the Windows PC, which has no text recognition in this version):
+
+```bash
+build/fks-catalogue --db <mac library.sqlite> title-screens-export ~/title-screens.json
+fks-catalogue --db <windows library.sqlite> title-screens-import title-screens.json
+```
+
+**Trusted metadata.** A correction can set artist, title, label, series, disc and track;
+any value left unset stays automatic. The same store records metadata supplied when a song
+is added (origin `import`, for a future Add Song workflow: validate the MP3/CDG pair, save
+the clean metadata by file, then scan). Reprocessing and resolver upgrades never override a
+trusted value, and filename rules never reinterpret it.
+
+**One-time enrichment.** The legacy collection is treated as static. Track lists, duplicate
+matching and title-screen text are worked out once and cached by file size/mtime or content,
+so routine rescans re-read nothing that has not changed, and title screens are only read
+when explicitly requested. Reprocessing reuses those results. Raw title-screen readings are
+kept in `enrichment-cache.sqlite` beside the catalogue, so a rebuilt catalogue reconnects to
+them by CDG content (during an ordinary scan, without any text recognition).
+
+**Library order and play history.** The library's **Sort** control (Artist, Song, Most
+Played, Recently Played, Label) applies to browsing and search results. Plays are counted
+once, when a song's audio actually starts (library, playlist, Autoplay, or a song file that
+is in the catalogue; never a preview or a resume). Play history is kept per karaoke version
+by content identity, like Key/Tempo, in `user-state.sqlite` together with the chosen sort,
+so it survives rebuilding the catalogue and moving or renaming song files.
+
+Corrections, playlists and remembered Key/Tempo are not affected by name changes: songs
+are identified by file path (playlists) and by content (Key/Tempo). Corrections are
+stored in `metadata-overrides.sqlite` beside `playlists.sqlite`, so deleting or rebuilding
+`library.sqlite` loses nothing you entered. No database is ever opened inside a music
+folder: the music folders are also remembered in the application's settings, and every
+database path is checked against them before SQLite opens it.
+
+The first start after upgrading makes a consistent `library.sqlite.pre-v5-<timestamp>.bak`
+beside the catalogue and then updates the song names in the background. Milestone 4 builds
+refuse a v5 catalogue as newer than supported; restore that backup to go back.
+
+`fks-catalogue --db <path> metadata-stats` reports confidence and source counts, and
+`compare --baseline <other.sqlite>` compares two catalogues song by song.
+
 ## Layout
 
 | Path | Purpose |
@@ -58,7 +141,13 @@ MCG songs are not playable yet. Playlists, queues and autoplay are not included.
 | `src/KaraokePlayer.*` | GStreamer audio playback; drives the CDG decoder from the audio position |
 | `src/SongPair.*` | Finds the matching `.mp3`/`.cdg` companion and checks both are readable |
 | `src/SongSettings.*` | Content identity and atomic per-song Key/Tempo JSON storage |
-| `src/library/` | Catalogue, filename/tag parsing, metadata resolution and background scanning |
+| `src/library/` | Catalogue, filename/tag/track-list parsing, content identity, metadata resolution and background scanning |
+| `src/library/KaraokeLabels.*` | Conservative karaoke label/series identification |
+| `src/library/UserStateStore.*` | Play history and preferences (`user-state.sqlite`) |
+| `src/library/KnownLibraryRoots.*` | Music folders remembered outside the catalogue, for storage safety |
+| `src/cdg/CdgTitleFrames.*` | Finds title-screen frames at the start of a CD+G stream |
+| `src/ocr/` | Local title-screen text recognition (Apple Vision on macOS; none elsewhere yet) |
+| `src/MetadataReviewDialog.*` | Library maintenance: review, correct and reprocess song names |
 | `src/LibraryController.*` | Active music root, GUI catalogue connection and scanner-thread lifecycle |
 | `src/LibraryView.*` | Large-text search, results and folder setup page |
 | `src/MainWindow.*` | Single fullscreen window with controls (including Exit) and lyrics pages |

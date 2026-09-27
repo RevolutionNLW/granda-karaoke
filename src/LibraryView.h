@@ -7,6 +7,7 @@
 
 class LibraryController;
 class LibraryResultsModel;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QListView;
@@ -26,6 +27,7 @@ public:
     void setFolderChooser(FolderChooser chooser) { m_folderChooser = std::move(chooser); }
 
     QLineEdit* searchBox() const { return m_searchBox; }
+    QComboBox* sortBox() const { return m_sortBox; }
     QListView* resultsList() const { return m_results; }
     QPushButton* backButton() const { return m_backButton; }
     QPushButton* chooseFolderButton() const { return m_chooseFolderButton; }
@@ -68,6 +70,7 @@ private:
     QLabel* m_setupLabel;
     QPushButton* m_chooseFolderButton;
     QLineEdit* m_searchBox;
+    QComboBox* m_sortBox;
     QLabel* m_hintLabel;
     QListView* m_results;
     LibraryResultsModel* m_resultsModel;

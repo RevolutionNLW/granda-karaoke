@@ -76,4 +76,29 @@ inline std::vector<std::uint8_t> stream(std::size_t totalPackets, const std::map
     return data;
 }
 
+// A stream that shows a text-like title screen from the start (tiles drawn
+// in `firstColumn`.. on two rows), clears it at `clearSecond`, then draws a
+// lyric line. Different `firstColumn` values give different content.
+inline std::vector<std::uint8_t> titleScreenStream(std::uint8_t firstColumn, int clearSecond = 5,
+                                                   int totalSeconds = 12)
+{
+    std::map<std::size_t, Packet> packets;
+    packets[0] = loadColors(false, {0x000, 0xFFF, 0xF00, 0x0F0, 0x00F, 0xFF0, 0x0FF, 0xF0F});
+    packets[1] = memoryPreset(0);
+    std::array<std::uint8_t, 12> glyph{};
+    for (std::size_t i = 0; i < glyph.size(); ++i)
+        glyph[i] = (i % 2) ? 0x2A : 0x15;
+    std::size_t index = 2;
+    for (std::uint8_t row = 7; row <= 8; ++row) {
+        for (std::uint8_t column = firstColumn; column < firstColumn + 20; ++column)
+            packets[index++] = tile(0, 1, row, column, glyph);
+    }
+    const std::size_t clear = static_cast<std::size_t>(clearSecond) * 300;
+    packets[clear] = memoryPreset(0);
+    index = clear + 300;
+    for (std::uint8_t column = 5; column < 35; ++column)
+        packets[index++] = tile(0, 2, 14, column, glyph);
+    return stream(static_cast<std::size_t>(totalSeconds) * 300, packets);
+}
+
 } // namespace testcdg

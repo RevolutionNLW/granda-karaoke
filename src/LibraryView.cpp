@@ -3,6 +3,7 @@
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
 
+#include <QComboBox>
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QHBoxLayout>
@@ -149,6 +150,29 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_searchBox->setFont(searchFont);
     m_searchBox->installEventFilter(this);
 
+    // A small order choice beside the search box; it applies to browsing and
+    // to search results, and is remembered by the library.
+    m_sortBox = new QComboBox(m_searchPage);
+    m_sortBox->setObjectName(QStringLiteral("librarySort"));
+    m_sortBox->setFocusPolicy(Qt::NoFocus);
+    m_sortBox->setToolTip(QStringLiteral("Order of the songs"));
+    const std::pair<const char*, LibrarySort> sorts[] = {
+        {"Artist A \xE2\x86\x92 Z", LibrarySort::ArtistAsc},
+        {"Artist Z \xE2\x86\x92 A", LibrarySort::ArtistDesc},
+        {"Song A \xE2\x86\x92 Z", LibrarySort::TitleAsc},
+        {"Song Z \xE2\x86\x92 A", LibrarySort::TitleDesc},
+        {"Most Played", LibrarySort::MostPlayed},
+        {"Recently Played", LibrarySort::RecentlyPlayed},
+        {"Label A \xE2\x86\x92 Z", LibrarySort::LabelAsc},
+    };
+    for (const auto& [text, sort] : sorts)
+        m_sortBox->addItem(QString::fromUtf8(text), int(sort));
+    QFont sortFont = m_sortBox->font();
+    sortFont.setPointSize(16);
+    m_sortBox->setFont(sortFont);
+    if (m_controller)
+        m_sortBox->setCurrentIndex(m_sortBox->findData(int(m_controller->librarySort())));
+
     m_hintLabel = new QLabel(QStringLiteral("Type to search, or scroll to browse"),
                              m_searchPage);
     m_hintLabel->setAlignment(Qt::AlignCenter);
@@ -194,7 +218,10 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
 
     auto* searchLayout = new QVBoxLayout(m_searchPage);
     searchLayout->setSpacing(10);
-    searchLayout->addWidget(m_searchBox);
+    auto* searchRow = new QHBoxLayout;
+    searchRow->addWidget(m_searchBox, 1);
+    searchRow->addWidget(m_sortBox);
+    searchLayout->addLayout(searchRow);
     searchLayout->addWidget(m_hintLabel);
     searchLayout->addWidget(m_results, 1);
     searchLayout->addWidget(m_messageLabel);
@@ -218,6 +245,16 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         } else {
             m_debounce->start();
         }
+    });
+    connect(m_sortBox, &QComboBox::currentIndexChanged, this, [this] {
+        if (m_controller)
+            m_controller->setLibrarySort(static_cast<LibrarySort>(m_sortBox->currentData().toInt()));
+        // A new order starts at its top: the highlighted song is not followed.
+        m_results->selectionModel()->clear();
+        refreshSearch();
+        m_results->scrollToTop();
+        updateSelectionActions();
+        m_searchBox->setFocus(Qt::OtherFocusReason);
     });
     connect(m_results->selectionModel(), &QItemSelectionModel::currentChanged,
             this, [this] { updateSelectionActions(); });
