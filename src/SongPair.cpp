@@ -1,6 +1,7 @@
 #include "SongPair.h"
 
 #include "Logging.h"
+#include "library/Catalogue.h"
 
 #include <QDir>
 #include <QFile>
@@ -17,9 +18,11 @@ QString findCompanion(const QFileInfo& selected, const QString& wantedSuffix)
         const QString path = selected.dir().absoluteFilePath(base + '.' + suffix);
         const QFileInfo info(path);
         if (QFileInfo::exists(path) && info.isFile() && !info.isSymLink()) {
-            // Canonicalisation recovers the stored filename case on macOS.
-            // Keep the selected directory spelling (including directory links).
-            return selected.dir().absoluteFilePath(QFileInfo(info.canonicalFilePath()).fileName());
+            // Canonicalisation recovers the stored filename case (macOS and
+            // Windows). Keep the selected directory spelling (including
+            // directory links).
+            return selected.dir().absoluteFilePath(
+                QFileInfo(Catalogue::canonicalPath(info.absoluteFilePath())).fileName());
         }
     }
     const QFileInfoList entries = selected.dir().entryInfoList(QDir::Files | QDir::Hidden);

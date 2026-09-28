@@ -221,7 +221,10 @@ SettingsDialog::SettingsDialog(Context context, QWidget* parent)
     });
     m_nav->setCurrentRow(0);
     connect(m_context.preferences, &AppPreferences::changed, this, [this] { refreshControls(); });
-    connect(theme::notifier(), &theme::Notifier::changed, this, [this] { refreshScale(); });
+    connect(theme::notifier(), &theme::Notifier::changed, this, [this] {
+        refreshScale();
+        fitValueLabels();
+    });
     refreshControls();
 
     theme::setMinimumWidth(this, 760);
@@ -253,6 +256,18 @@ void SettingsDialog::ensureBuilt(int index)
     for (qsizetype i = firstNew; i < m_refreshers.size(); ++i)
         m_refreshers.at(i)();
     theme::rescale(m_pages->widget(index));
+    fitValueLabels();
+}
+
+void SettingsDialog::fitValueLabels()
+{
+    // Values such as "100%" are never cut short, whatever the system's font:
+    // Windows fonts run wider than the room the style gives them.
+    for (QLabel* label : findChildren<QLabel*>(QStringLiteral("settingValue"))) {
+        label->ensurePolished();
+        const int needed = label->fontMetrics().horizontalAdvance(QStringLiteral("150%")) + theme::px(4);
+        label->setMinimumWidth(std::max(theme::px(46), needed));
+    }
 }
 
 int SettingsDialog::pageIndex(const QString& name) const
@@ -481,8 +496,8 @@ void SettingsDialog::refreshScale()
     m_scaleUp->setEnabled(percent < std::min(theme::kMaxScalePercent, theme::scaleLimitPercent()));
     m_scaleReset->setEnabled(percent != 100);
     // Bigger would not fit this screen (Windows display scaling counts too).
-    m_scaleLimited->setVisible(theme::chosenScalePercent() > percent
-                               || theme::scaleLimitPercent() < theme::kMaxScalePercent);
+    m_scaleLimited->setVisible(theme::scaleLimitPercent() < theme::kMaxScalePercent
+                               && percent >= theme::scaleLimitPercent());
 }
 
 // ---- Playback ------------------------------------------------------------

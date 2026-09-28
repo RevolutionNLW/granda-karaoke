@@ -712,6 +712,7 @@ void MainWindow::closeEvent(QCloseEvent* event)
 void MainWindow::setKeepScaleWithinScreen(bool keep)
 {
     m_keepScaleWithinScreen = keep;
+    m_fittedRoom = {};
     if (!keep) {
         for (const QMetaObject::Connection& connection : std::as_const(m_screenConnections))
             disconnect(connection);
@@ -758,6 +759,16 @@ void MainWindow::fitScaleToScreen()
     QSize room = fullScreen ? where->geometry().size() : where->availableGeometry().size();
     if (!fullScreen)
         room -= frameGeometry().size() - geometry().size();  // title bar and borders
+    // Nothing to do when neither the room nor the choice changed (screens
+    // report many changes that leave the room as it was).
+    const auto currentlyFits = [this, room] {
+        const QSize needed = minimumSizeHint();
+        return needed.width() <= room.width() && needed.height() <= room.height();
+    };
+    if (room == m_fittedRoom && theme::chosenScalePercent() == m_fittedChosenScale && currentlyFits())
+        return;
+    m_fittedRoom = room;
+    m_fittedChosenScale = theme::chosenScalePercent();
     const auto ratio = [this, room] {
         const QSize needed = minimumSizeHint();
         if (!needed.isValid() || needed.isEmpty())

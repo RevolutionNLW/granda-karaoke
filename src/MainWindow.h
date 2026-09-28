@@ -158,6 +158,8 @@ private:
     DisplaySleepBlocker m_displaySleepBlocker;
     bool m_keepScaleWithinScreen = false;
     bool m_fittingScale = false;
+    QSize m_fittedRoom;       // the screen room and chosen size last fitted to
+    int m_fittedChosenScale = 0;
     QList<QMetaObject::Connection> m_screenConnections;
     QStackedWidget* m_pages;
     QWidget* m_home;

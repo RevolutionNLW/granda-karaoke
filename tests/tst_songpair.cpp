@@ -103,6 +103,9 @@ void TestSongPair::missingMp3IsReported()
 
 void TestSongPair::unreadableFileIsReported()
 {
+#ifdef Q_OS_WIN
+    QSKIP("File permissions cannot make a file unreadable here");
+#endif
     touch("Locked.mp3");
     const QString cdg = touch("Locked.cdg");
     QVERIFY(QFile::setPermissions(cdg, QFileDevice::Permissions{}));

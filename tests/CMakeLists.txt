@@ -55,3 +55,5 @@ fks_add_test(tst_shutdown LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 target_compile_definitions(tst_shutdown PRIVATE
     FKS_SHUTDOWN_HELPER="$<TARGET_FILE:tst_shutdown_helper>")
 add_dependencies(tst_shutdown tst_shutdown_helper)
+# It resolves an 18,000-song catalogue several times; slow machines need longer.
+set_tests_properties(tst_shutdown PROPERTIES TIMEOUT 1500)

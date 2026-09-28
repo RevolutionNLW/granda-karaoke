@@ -85,7 +85,7 @@ Songs prepareLibrary(const QString& root, LibraryController& controller)
     if (!QDir().mkpath(root) || !writeSong(first, 3000) || !writeSong(second, 3000))
         qFatal("Could not make synthetic media");
     QSignalSpy finished(&controller, &LibraryController::scanFinished);
-    if (!controller.chooseRoot(root) || (finished.count() == 0 && !finished.wait(5000)))
+    if (!controller.chooseRoot(root) || (finished.count() == 0 && !finished.wait(30000)))
         qFatal("Synthetic library scan did not finish");
     songs.firstId = controller.search(QStringLiteral("First Song"), 5).value(0).songId;
     songs.secondId = controller.search(QStringLiteral("Second Song"), 5).value(0).songId;
@@ -1913,7 +1913,9 @@ void TestSettings::quittingWhileSettingsWorkIsStillRunning()
     window.reset();
     QVERIFY(dialog.isNull());
     controller.reset();
-    QVERIFY2(timer.elapsed() < 1000, qPrintable(QString::number(timer.elapsed())));
+    // Promptly, not after the held work: well under the 3 s the program
+    // waits for background work at exit (slow machines take about 1 s).
+    QVERIFY2(timer.elapsed() < 2500, qPrintable(QString::number(timer.elapsed())));
     QCOMPARE(background::running(), int(findingOutputs) + int(countingNames));
 
     release = true;

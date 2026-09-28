@@ -1520,11 +1520,23 @@ void TestPlaylistView::rejectedLoadsKeepPlayingContextAndAutoplaySuccessor()
     QTRY_COMPARE(library->songResultCount(), 1);
     library->resultsList()->setCurrentIndex(
         library->resultsList()->model()->index(0, 0));
+    // The music is gone when Sing is pressed. Windows cannot rename a folder
+    // while a song in it is open (the paused one), so there the song itself
+    // goes; elsewhere the whole folder does, as when a drive is unplugged.
+#ifdef Q_OS_WIN
+    const QString gone = songs.firstMp3 + QStringLiteral(".away");
+    QVERIFY(QFile::rename(songs.firstMp3, gone));
+#else
     QVERIFY(QDir().rename(root, disconnected));
+#endif
     QTest::mouseClick(library->singButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Paused);
     QCOMPARE(window.playlistPlayback()->context()->itemId, playingItem);
+#ifdef Q_OS_WIN
+    QVERIFY(QFile::rename(gone, songs.firstMp3));
+#else
     QVERIFY(QDir().rename(disconnected, root));
+#endif
 
     player.play();
     QTRY_COMPARE_WITH_TIMEOUT(window.playlistPlayback()->context()->itemId,
@@ -2097,7 +2109,11 @@ void TestPlaylistView::panesStayReadableOnALaptopScreenAtEveryScale()
                 QCOMPARE(tabs->tabToolTip(tab), longName);
             } else {
                 QVERIFY2(tabs->tabRect(tab).width() >= metrics.horizontalAdvance(name) + theme::px(20),
-                         qPrintable(at + QStringLiteral(" ") + name));
+                         qPrintable(QStringLiteral("%1 %2: tab %3 wide, text %4, font %5 %6px, bar %7 wide")
+                                        .arg(at, name).arg(tabs->tabRect(tab).width())
+                                        .arg(metrics.horizontalAdvance(name))
+                                        .arg(tabs->font().family()).arg(tabs->font().pixelSize())
+                                        .arg(tabs->width())));
             }
         }
 

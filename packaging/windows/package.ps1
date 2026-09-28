@@ -114,7 +114,8 @@ $windows11 = @(
     'powrprof', 'propsys', 'psapi', 'rpcrt4', 'runtimeobject', 'secur32', 'setupapi', 'shcore',
     'shell32', 'shlwapi', 'ucrtbase', 'user32', 'userenv', 'uxtheme', 'version', 'winhttp', 'wininet',
     'winmm', 'ws2_32', 'wtsapi32', 'windowscodecs', 'dbghelp', 'opengl32', 'glu32', 'mscms', 'usp10',
-    'wldap32', 'sspicli', 'mswsock', 'iertutil', 'coremessaging', 'twinapi.appcore'
+    'wldap32', 'sspicli', 'mswsock', 'iertutil', 'coremessaging', 'twinapi.appcore',
+    'icu', 'icuuc', 'icuin', 'uiautomationcore'   # ICU and UI Automation: in Windows 10 1903+ and 11
 ) | ForEach-Object { "$_.dll" }
 $problems = @()
 foreach ($name in $external.Keys) {

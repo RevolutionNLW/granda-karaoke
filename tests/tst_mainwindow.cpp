@@ -135,14 +135,21 @@ void TestMainWindow::openShowsReadySong()
 void TestMainWindow::controlsFitDefaultSize()
 {
     const QSize minimum = m_window->minimumSizeHint();
-    QVERIFY2(minimum.width() <= 900,
+#ifdef Q_OS_WIN
+    // Windows fonts run wider. This still fits a 1366x768 laptop at 125%
+    // display scaling (1093x614 in Qt's terms) with room for the taskbar.
+    const QSize limit(1000, 560);
+#else
+    const QSize limit(900, 520);
+#endif
+    QVERIFY2(minimum.width() <= limit.width(),
              qPrintable(QStringLiteral("minimum width is %1").arg(minimum.width())));
-    QVERIFY2(minimum.height() <= 520,
+    QVERIFY2(minimum.height() <= limit.height(),
              qPrintable(QStringLiteral("minimum height is %1").arg(minimum.height())));
     m_window->showNormal();
-    m_window->resize(900, 520);
+    m_window->resize(limit);
     QCoreApplication::processEvents();
-    QCOMPARE(m_window->size(), QSize(900, 520));
+    QCOMPARE(m_window->size(), limit);
 }
 
 void TestMainWindow::settingsControlsDefaultsAndFocus()

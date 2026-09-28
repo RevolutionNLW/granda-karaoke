@@ -18,7 +18,78 @@
 #include <QUrl>
 #include <QUuid>
 
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+
+#include <string>
+#endif
+
 namespace {
+
+// Windows opens "Karaoke." and "Karaoke " as the folder "Karaoke". Paths are
+// compared in that same spelling, so no such name can slip past a check.
+QString withWindowsNameRules(const QString& path)
+{
+#ifdef Q_OS_WIN
+    QStringList parts = QDir::fromNativeSeparators(path).split(QLatin1Char('/'));
+    for (QString& part : parts) {
+        if (part == QLatin1String(".") || part == QLatin1String(".."))
+            continue;
+        qsizetype end = part.size();
+        while (end > 0 && (part.at(end - 1) == QLatin1Char('.') || part.at(end - 1) == QLatin1Char(' ')))
+            --end;
+        if (end > 0)
+            part.truncate(end);
+    }
+    return parts.join(QLatin1Char('/'));
+#else
+    return path;
+#endif
+}
+
+#ifdef Q_OS_WIN
+// Where Windows itself takes an existing file or folder to be: junctions,
+// symbolic links, substituted drive letters and short 8.3 names followed, in
+// the spelling stored on disk. Empty when Windows cannot say (the drive has
+// gone, say). Only a handle for reading attributes is opened.
+QString windowsFinalPath(const QString& existing)
+{
+    const std::wstring native = QDir::toNativeSeparators(existing).toStdWString();
+    const HANDLE handle = CreateFileW(native.c_str(), FILE_READ_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return {};
+    std::wstring buffer(MAX_PATH + 1, L'\0');
+    const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
+    if (length >= buffer.size()) {
+        buffer.assign(length + 1, L'\0');
+        length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
+    }
+    CloseHandle(handle);
+    if (length == 0 || length >= buffer.size())
+        return {};
+    QString path = QString::fromWCharArray(buffer.data(), qsizetype(length));
+    if (path.startsWith(QLatin1String("\\\\?\\UNC\\")))
+        path = QStringLiteral("\\\\") + path.mid(8);
+    else if (path.startsWith(QLatin1String("\\\\?\\")))
+        path = path.mid(4);
+    return QDir::cleanPath(QDir::fromNativeSeparators(path));
+}
+#endif
+
+// An existing file or folder's own path, links followed; empty if it does
+// not exist.
+QString existingCanonicalPath(const QFileInfo& info)
+{
+#ifdef Q_OS_WIN
+    const QString final = windowsFinalPath(info.absoluteFilePath());
+    if (!final.isEmpty())
+        return final;
+#endif
+    return info.canonicalFilePath();
+}
 
 Q_LOGGING_CATEGORY(lcCatalogue, "fks.catalogue")
 
@@ -59,7 +130,7 @@ bool indicatesCorruption(const QString& detail)
 
 QString lexicalPath(QString path)
 {
-    path = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    path = QDir::cleanPath(QFileInfo(withWindowsNameRules(path)).absoluteFilePath());
 #if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
     path = path.toCaseFolded();
 #endif
@@ -248,8 +319,8 @@ Catalogue::~Catalogue()
 
 QString Catalogue::canonicalPath(const QString& path)
 {
-    QFileInfo info(path);
-    QString canonical = info.canonicalFilePath();
+    QFileInfo info(withWindowsNameRules(path));
+    QString canonical = existingCanonicalPath(info);
     if (!canonical.isEmpty())
         return QDir::cleanPath(canonical);
 
@@ -262,7 +333,7 @@ QString Catalogue::canonicalPath(const QString& path)
             break;
         cursor.setFile(parent);
     }
-    canonical = cursor.canonicalFilePath();
+    canonical = existingCanonicalPath(cursor);
     if (canonical.isEmpty())
         canonical = cursor.absoluteFilePath();
     QDir directory(canonical);
