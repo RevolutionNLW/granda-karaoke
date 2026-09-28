@@ -65,11 +65,14 @@ inline Packet scroll(bool copy, std::uint8_t color, int hCommand, int hOffset, i
                         static_cast<std::uint8_t>((vCommand << 4) | vOffset)});
 }
 
-// Builds a stream of totalPackets packets, empty except where given.
+// Builds a stream of totalPackets packets, empty except where given. A packet
+// placed at or after the end is not part of the stream.
 inline std::vector<std::uint8_t> stream(std::size_t totalPackets, const std::map<std::size_t, Packet>& packets)
 {
     std::vector<std::uint8_t> data(totalPackets * 24, 0);
     for (const auto& [index, packet] : packets) {
+        if (index >= totalPackets)
+            break;  // the map is ordered: every later packet is past the end too
         for (std::size_t i = 0; i < 24; ++i)
             data[index * 24 + i] = packet[i];
     }

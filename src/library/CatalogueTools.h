@@ -3,6 +3,8 @@
 #include <QString>
 #include <QVariantMap>
 
+#include <functional>
+
 class Catalogue;
 
 class CatalogueTools {
@@ -19,6 +21,12 @@ public:
                                           QString* error = nullptr);
     static QVariantMap importTitleScreens(Catalogue& catalogue, const QString& path,
                                           QString* error = nullptr);
+    // Parses every stored file name again with the current rules. `cancelled`,
+    // when given, is asked for every name and must return at once; once it
+    // says stop nothing is changed (parser_version stays old, so the work is
+    // done again later) and *wasCancelled is set.
     static bool reparseStoredNames(Catalogue& catalogue, qint64* count = nullptr,
-                                   QString* error = nullptr);
+                                   QString* error = nullptr,
+                                   const std::function<bool()>& cancelled = {},
+                                   bool* wasCancelled = nullptr);
 };

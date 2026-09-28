@@ -45,6 +45,15 @@ public:
     bool isRootConnected() const;
     bool isScanning() const { return m_scanning; }
     bool scannerPaused() const;
+    // Closing: asks the background scanner to stop, takes no new work, and
+    // waits up to timeoutMs for its thread to end. The scanner notices within
+    // milliseconds. True once the thread has ended; false only if it is stuck
+    // (e.g. in a read from a music drive that stopped answering), in which
+    // case nothing it may still be using must be destroyed. Safe to repeat.
+    bool stopScanner(int timeoutMs);
+    bool scannerRunning() const { return m_scannerThread.isRunning(); }
+    // Tests only: runs `work` on the scanner's thread, as a scan step would.
+    void runOnScannerThreadForTesting(std::function<void()> work);
     // Cheap to ask often: the song count is remembered until the catalogue
     // changes (it is asked on every scan progress update).
     QString statusText() const;

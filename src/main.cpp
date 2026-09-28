@@ -4,6 +4,7 @@
 #include "LibraryController.h"
 #include "Logging.h"
 #include "MainWindow.h"
+#include "Shutdown.h"
 #include "SongSettings.h"
 #include "library/KnownLibraryRoots.h"
 #include "playlist/PlaylistStore.h"
@@ -134,6 +135,9 @@ int main(int argc, char* argv[])
             window.openSong(args.at(1));
 
         result = app.exec();
+        // The library scanner is stopped and its thread ended before anything
+        // it could still be using is destroyed below.
+        shutdown::stopLibraryOrExit(libraryController, result);
     }  // everything is saved and closed here
     qCInfo(lcApp) << "Exiting with code" << result;
     // Qt must not shut down under a background job still running. One stuck

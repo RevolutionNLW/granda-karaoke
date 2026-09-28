@@ -439,8 +439,32 @@ QString databaseError(const QSqlQuery& query, const QString& context)
     return QStringLiteral("%1: %2").arg(context, query.lastError().text());
 }
 
+// Cooperative cancellation for the resolver's stages. It is consulted once per
+// item and never blocks, so a request to stop is seen within milliseconds.
+// Once it has said stop it keeps saying so, and every later stage returns at
+// once; the caller then discards everything built in memory.
+class StopCheck {
+public:
+    StopCheck() = default;  // never stops
+    explicit StopCheck(const std::function<bool()>& cancelled)
+        : m_cancelled(cancelled ? &cancelled : nullptr)
+    {
+    }
+    bool operator()()
+    {
+        if (!m_stopped && m_cancelled)
+            m_stopped = (*m_cancelled)();
+        return m_stopped;
+    }
+    bool stopped() const { return m_stopped; }
+
+private:
+    const std::function<bool()>* m_cancelled = nullptr;
+    bool m_stopped = false;
+};
+
 bool loadCandidates(QSqlDatabase database, qint64 rootId, QList<Candidate>* candidates,
-                    QString* error)
+                    StopCheck& stop, QString* error)
 {
     QString sql = QStringLiteral(
         "SELECT s.id,s.song_id,s.root_id,s.parsed_json,COALESCE(f.rel_dir,''),"
@@ -465,6 +489,8 @@ bool loadCandidates(QSqlDatabase database, qint64 rootId, QList<Candidate>* cand
     }
     QSet<qint64> seenSongs;
     while (query.next()) {
+        if (stop())
+            return true;
         const qint64 songId = query.value(1).toLongLong();
         if (seenSongs.contains(songId))
             continue;
@@ -550,7 +576,7 @@ QString unorderedKey(const QStringList& fields)
 }
 
 bool applySidecars(QSqlDatabase database, qint64 rootId, QList<Candidate>& candidates,
-                   QString* error)
+                   StopCheck& stop, QString* error)
 {
     struct Entry { QString disc; QStringList fields; QString path; int line; };
     QString sql = QStringLiteral(
@@ -570,6 +596,8 @@ bool applySidecars(QSqlDatabase database, qint64 rootId, QList<Candidate>& candi
     }
     QHash<QString, QList<Entry>> byFolderTrack;
     while (query.next()) {
+        if (stop())
+            return true;
         QStringList fields;
         for (const QJsonValue& value : QJsonDocument::fromJson(query.value(4).toByteArray()).array())
             fields.append(value.toString());
@@ -584,6 +612,8 @@ bool applySidecars(QSqlDatabase database, qint64 rootId, QList<Candidate>& candi
     if (byFolderTrack.isEmpty())
         return true;
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return true;
         if (candidate.track <= 0)
             continue;
         const QString key = QString::number(candidate.rootId) + QLatin1Char(':')
@@ -667,7 +697,7 @@ QString letterSkeleton(const QString& value)
 // fields are codes. The order is then decided by the usual evidence, but a
 // name repaired this way is never more than medium confidence and never
 // votes for its disc or folder.
-void dropCodeFields(QList<Candidate>& candidates)
+void dropCodeFields(QList<Candidate>& candidates, StopCheck& stop)
 {
     // A short capitalised or numbered first field that recurs across three or
     // more three-field names in one folder or disc ("KV - ...", "XXX 05 -
@@ -677,6 +707,8 @@ void dropCodeFields(QList<Candidate>& candidates)
         QStringLiteral(R"(^(?:[A-Z]{1,3}|[A-Za-z]{1,8}\s*\d{1,4})$)"));
     QHash<QString, QSet<QString>> leadingSeen;
     for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return;
         if (candidate.fields.size() < 3
             || !labelShape.match(candidate.rawFields.value(0).trimmed()).hasMatch())
             continue;
@@ -686,6 +718,8 @@ void dropCodeFields(QList<Candidate>& candidates)
                 .insert(fieldKey(candidate.fields.at(1)));
     }
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return;
         if (candidate.fields.size() < 3)
             continue;
         const QString skeleton = letterSkeleton(candidate.fields.first());
@@ -728,17 +762,21 @@ int wordCount(const QString& value)
 // name is split only when both sides have several words, or when at least
 // three names in the same disc/folder share this shape. The result is never
 // better than medium confidence.
-void splitBareHyphenFields(QList<Candidate>& candidates)
+void splitBareHyphenFields(QList<Candidate>& candidates, StopCheck& stop)
 {
     // An underscore is taken as a field separator only when several names on
     // the same disc or folder are written that way; a lone underscore
     // ("Bridge_Over Troubled Water") is an ordinary space.
     QHash<QString, int> underscoreShaped;
     for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return;
         if (candidate.bareHyphenSplit && !candidate.unsplitRawField.isEmpty())
             ++underscoreShaped[groupKey(candidate)];
     }
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return;
         if (!candidate.bareHyphenSplit || candidate.unsplitRawField.isEmpty())
             continue;
         if (underscoreShaped.value(groupKey(candidate)) < 3 && !candidate.underscoreAfterCode) {
@@ -769,10 +807,14 @@ void splitBareHyphenFields(QList<Candidate>& candidates)
     };
     QHash<QString, int> shapedInGroup;
     for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return;
         if (candidate.fields.size() == 1 && splitPoint(candidate.fields.first()) > 0)
             ++shapedInGroup[groupKey(candidate)];
     }
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return;
         if (candidate.fields.size() != 1)
             continue;
         const QString field = candidate.fields.first();
@@ -809,12 +851,14 @@ QString voteGroupKey(const Candidate& candidate)
                                  : groupKey(candidate);
 }
 
-Evidence prepareEvidence(QList<Candidate>& candidates)
+Evidence prepareEvidence(QList<Candidate>& candidates, StopCheck& stop)
 {
     QHash<QString, QSet<QString>> partners;
     QHash<QString, QSet<QString>> canonicalPartners;
     QHash<QString, QHash<QString, QSet<QString>>> groupPartners;
     for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return {};
         if (candidate.fields.size() != 2)
             continue;
         const QString a = fieldKey(candidate.fields.at(0));
@@ -843,6 +887,8 @@ Evidence prepareEvidence(QList<Candidate>& candidates)
 
     Evidence evidence;
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return {};
         if (candidate.fields.size() != 2)
             continue;
         const QString a = candidate.fields.at(0);
@@ -922,6 +968,8 @@ Evidence prepareEvidence(QList<Candidate>& candidates)
     };
     QHash<QString, RecurrenceSupport> support;
     for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return {};
         if (candidate.fields.size() != 2 || candidate.bareHyphenSplit
             || candidate.codeFieldsDropped || candidate.capAtMedium)
             continue;
@@ -945,6 +993,8 @@ Evidence prepareEvidence(QList<Candidate>& candidates)
             && counts.artist >= 3 * qMax(1, counts.title);
     };
     for (Candidate& candidate : candidates) {
+        if (stop())
+            return {};
         if (candidate.fields.size() != 2
             || (candidate.structuralKind != StructuralKind::None
                 && candidate.structuralKind != StructuralKind::GlobalRecurrence))
@@ -1294,11 +1344,14 @@ bool containsTitleWords(const QString& text, const QString& title)
 // collection whose complete CDG is byte-identical (the MP3 audio is compared
 // as well). File sizes only nominated the pair for hashing; they prove nothing.
 bool applyDuplicateEvidence(QSqlDatabase database, qint64 rootId, QList<Resolved>& results,
-                            QString* error)
+                            StopCheck& stop, QString* error)
 {
     QHash<qint64, int> bySong;
-    for (int i = 0; i < results.size(); ++i)
+    for (int i = 0; i < results.size(); ++i) {
+        if (stop())
+            return true;
         bySong.insert(results.at(i).candidate->songId, i);
+    }
     QString sql = QStringLiteral(
         "SELECT ts.song_id,ds.song_id,"
         "CASE WHEN tm.content_sha256 IS NOT NULL AND tm.content_sha256=dm.content_sha256 "
@@ -1329,6 +1382,8 @@ bool applyDuplicateEvidence(QSqlDatabase database, qint64 rootId, QList<Resolved
     struct Donor { int index; bool audioEqual; QString path; };
     QHash<int, QList<Donor>> donors;
     while (query.next()) {
+        if (stop())
+            return true;
         const auto target = bySong.constFind(query.value(0).toLongLong());
         const auto donor = bySong.constFind(query.value(1).toLongLong());
         if (target == bySong.cend() || donor == bySong.cend())
@@ -1343,18 +1398,25 @@ bool applyDuplicateEvidence(QSqlDatabase database, qint64 rootId, QList<Resolved
         donors[*target].append({*donor, query.value(2).toBool(), query.value(3).toString()});
     }
     for (auto it = donors.cbegin(); it != donors.cend(); ++it) {
+        if (stop())
+            return true;
         Resolved& target = results[it.key()];
         // Every copy must name the same song (title); the singer is taken
         // from the best-named copies, which must agree with each other.
         QSet<QString> titles;
         int bestRank = 0;
-        for (const Donor& donor : it.value())
+        for (const Donor& donor : it.value()) {
+            if (stop())
+                return true;
             bestRank = qMax(bestRank, confidenceRank(results.at(donor.index).baseConfidence));
+        }
         QSet<QString> keys;
         const Resolved* best = nullptr;
         bool audioEqual = false;
         QJsonArray donorList;
         for (const Donor& donor : it.value()) {
+            if (stop())
+                return true;
             const Resolved& named = results.at(donor.index);
             titles.insert(normalizeForSearch(named.title));
             if (confidenceRank(named.baseConfidence) == bestRank) {
@@ -1439,11 +1501,13 @@ QString nameKey(const QString& value)
     return ocrKey(value);
 }
 
-NameDictionary buildDictionary(const QList<Resolved>& results)
+NameDictionary buildDictionary(const QList<Resolved>& results, StopCheck& stop)
 {
     NameDictionary dictionary;
     QHash<QString, QHash<QString, int>> artistForms;
     for (const Resolved& result : results) {
+        if (stop())
+            return {};
         if (confidenceRank(result.decision.confidence) < 2
             || result.provenance == QLatin1String("cdg_ocr")
             || result.provenance == QLatin1String("fallback"))
@@ -1480,11 +1544,16 @@ NameDictionary buildDictionary(const QList<Resolved>& results)
         return best;
     };
     for (auto it = dictionary.titleForms.cbegin(); it != dictionary.titleForms.cend(); ++it) {
+        if (stop())
+            return {};
         dictionary.titles.insert(it.key(), mostCommon(it.value()));
         dictionary.titlesByFirst[it.key().left(1)].append(it.key());
     }
-    for (auto it = artistForms.cbegin(); it != artistForms.cend(); ++it)
+    for (auto it = artistForms.cbegin(); it != artistForms.cend(); ++it) {
+        if (stop())
+            return {};
         dictionary.artists.insert(it.key(), mostCommon(it.value()));
+    }
     return dictionary;
 }
 
@@ -1541,11 +1610,14 @@ QString matchKnownTitle(const NameDictionary& dictionary, const QString& key, bo
 }
 
 bool applyTitleScreenEvidence(QSqlDatabase database, qint64 rootId, QList<Resolved>& results,
-                              QString* error)
+                              StopCheck& stop, QString* error)
 {
     QHash<qint64, int> bySong;
-    for (int i = 0; i < results.size(); ++i)
+    for (int i = 0; i < results.size(); ++i) {
+        if (stop())
+            return true;
         bySong.insert(results.at(i).candidate->songId, i);
+    }
     QString sql = QStringLiteral(
         "SELECT s.song_id,t.frames_json,t.engine FROM sources s "
         "JOIN files g ON g.id=s.graphics_file_id "
@@ -1565,6 +1637,8 @@ bool applyTitleScreenEvidence(QSqlDatabase database, qint64 rootId, QList<Resolv
     struct Screen { int index; QJsonArray frames; QString engine; };
     QList<Screen> screens;
     while (query.next()) {
+        if (stop())
+            return true;
         const auto found = bySong.constFind(query.value(0).toLongLong());
         if (found == bySong.cend())
             continue;
@@ -1575,8 +1649,10 @@ bool applyTitleScreenEvidence(QSqlDatabase database, qint64 rootId, QList<Resolv
     }
     if (screens.isEmpty())
         return true;
-    const NameDictionary dictionary = buildDictionary(results);
+    const NameDictionary dictionary = buildDictionary(results, stop);
     for (const Screen& screen : std::as_const(screens)) {
+        if (stop())
+            return true;
         Resolved& target = results[screen.index];
         TitleScreenReading reading;
         QString titleKey;
@@ -1584,6 +1660,8 @@ bool applyTitleScreenEvidence(QSqlDatabase database, qint64 rootId, QList<Resolv
         int frameMs = -1;
         QString firstTitle;
         for (const QJsonValue& value : screen.frames) {
+            if (stop())
+                return true;
             const QJsonObject frame = value.toObject();
             QList<OcrLine> lines;
             for (const QJsonValue& lineValue : frame.value(QStringLiteral("lines")).toArray()) {
@@ -1686,21 +1764,51 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
     if (!setMeta(database, QStringLiteral("reprocess_pending"), QStringLiteral("1"), error))
         return Status::Failed;
 
+    // Everything up to the writes happens in memory and is checked for a stop
+    // request item by item. A stop discards it all: nothing is written, and
+    // reprocess_pending (set above) stays on so the work resumes next time.
+    StopCheck stop(options.cancelled);
+    auto stage = [&options](const char* name) {
+        if (options.stageStarted)
+            options.stageStarted(QString::fromLatin1(name));
+    };
+    stage("candidates");
     QList<Candidate> candidates;
-    if (!loadCandidates(database, rootId, &candidates, error))
+    if (!loadCandidates(database, rootId, &candidates, stop, error))
         return Status::Failed;
-    if (!applySidecars(database, rootId, candidates, error))
+    if (stop.stopped())
+        return Status::Cancelled;
+    stage("sidecars");
+    if (!applySidecars(database, rootId, candidates, stop, error))
         return Status::Failed;
-    dropCodeFields(candidates);
-    splitBareHyphenFields(candidates);
-    const Evidence evidence = prepareEvidence(candidates);
+    if (stop.stopped())
+        return Status::Cancelled;
+    stage("names");
+    dropCodeFields(candidates, stop);
+    splitBareHyphenFields(candidates, stop);
+    stage("evidence");
+    const Evidence evidence = prepareEvidence(candidates, stop);
+    if (stop.stopped())
+        return Status::Cancelled;
+    stage("base");
     QList<Resolved> results;
     results.reserve(candidates.size());
-    for (const Candidate& candidate : std::as_const(candidates))
+    for (const Candidate& candidate : std::as_const(candidates)) {
+        if (stop())
+            return Status::Cancelled;
         results.append(resolveBase(candidate, evidence));
-    if (!applyDuplicateEvidence(database, rootId, results, error)
-        || !applyTitleScreenEvidence(database, rootId, results, error))
+    }
+    stage("duplicates");
+    if (!applyDuplicateEvidence(database, rootId, results, stop, error))
         return Status::Failed;
+    if (stop.stopped())
+        return Status::Cancelled;
+    stage("title_screens");
+    if (!applyTitleScreenEvidence(database, rootId, results, stop, error))
+        return Status::Failed;
+    if (stop.stopped())
+        return Status::Cancelled;
+    stage("write");
     if (options.progress)
         options.progress(0, results.size());
 
@@ -1735,6 +1843,12 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
     }
     qint64 resolved = 0;
     for (const Resolved& result : std::as_const(results)) {
+        // A stop between commits drops the open batch whole: every batch is
+        // either written completely or not at all.
+        if (stop()) {
+            database.rollback();
+            return Status::Cancelled;
+        }
         const Candidate& candidate = *result.candidate;
         const KaraokeLabel label = identifyKaraokeLabel(candidate.discPrefix, candidate.relDir);
         const QString& title = result.title;
@@ -1890,10 +2004,11 @@ QVariantMap MetadataResolver::evaluateTags(Catalogue& catalogue, int mismatchLim
 {
     QVariantMap result;
     QSqlDatabase database = catalogue.database();
+    StopCheck never;
     QList<Candidate> candidates;
-    if (!loadCandidates(database, -1, &candidates, error))
+    if (!loadCandidates(database, -1, &candidates, never, error))
         return result;
-    const Evidence evidence = prepareEvidence(candidates);
+    const Evidence evidence = prepareEvidence(candidates, never);
     QVariantMap counts;
     QVariantList mismatches;
     qlonglong eligible = 0;

@@ -37,3 +37,12 @@ fks_add_test(tst_metadatareview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_librarysort LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_settings LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_splash LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
+
+# Closing while the library scanner is busy; the helper runs the program's
+# closing sequence in a process of its own.
+add_executable(tst_shutdown_helper tst_shutdown_helper.cpp)
+target_link_libraries(tst_shutdown_helper PRIVATE fks_core)
+fks_add_test(tst_shutdown LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
+target_compile_definitions(tst_shutdown PRIVATE
+    FKS_SHUTDOWN_HELPER="$<TARGET_FILE:tst_shutdown_helper>")
+add_dependencies(tst_shutdown tst_shutdown_helper)

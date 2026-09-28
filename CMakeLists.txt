@@ -126,6 +126,8 @@ add_library(fks_core STATIC
     src/MainWindow.h
     src/SettingsDialog.cpp
     src/SettingsDialog.h
+    src/Shutdown.cpp
+    src/Shutdown.h
     src/ui/Controls.cpp
     src/ui/Controls.h
     src/ui/ElidedLabel.cpp

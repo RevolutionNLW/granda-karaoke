@@ -163,18 +163,37 @@ LibraryController::~LibraryController()
 {
     // A count still running is not waited for: it finishes on its own and
     // its result is dropped (main() waits for it before Qt shuts down).
-    if (m_scanner) {
-        m_scanner->requestCancel();
-        m_scannerThread.quit();
-        if (!m_scannerThread.wait(5000)) {
-            qCCritical(lcLibraryController)
-                << "Library scanner did not stop within 5 seconds; terminating worker";
-            m_scannerThread.terminate();
-            m_scannerThread.wait(1000);
-        }
+    //
+    // The scanner's thread is never destroyed while it runs and never
+    // terminated (that would abandon locks and half-done work). The program
+    // stops it with stopScanner() before destroying anything; waiting here
+    // covers any other owner.
+    if (!stopScanner(5000)) {
+        qCCritical(lcLibraryController) << "Library scanner has not stopped; still waiting for it";
+        while (!m_scannerThread.wait(5000))
+            qCCritical(lcLibraryController) << "Still waiting for the library scanner to stop";
     }
     flushPendingWrites(true);  // the scan has stopped: write anything still waiting
     m_catalogue.close();
+}
+
+bool LibraryController::stopScanner(int timeoutMs)
+{
+    if (m_scanner) {
+        // Asked while its thread still runs its event loop, so the scanner
+        // cannot have been deleted yet. It is deleted on its own thread as
+        // that thread ends; from here on nothing uses it or queues work.
+        m_scanner->requestCancel();
+        m_scanner = nullptr;
+        m_scannerThread.quit();
+    }
+    return m_scannerThread.wait(QDeadlineTimer(timeoutMs));
+}
+
+void LibraryController::runOnScannerThreadForTesting(std::function<void()> work)
+{
+    if (m_scanner)
+        QMetaObject::invokeMethod(m_scanner, std::move(work), Qt::QueuedConnection);
 }
 
 bool LibraryController::hasActiveRoot() const

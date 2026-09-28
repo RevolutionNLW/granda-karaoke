@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace cdg {
@@ -19,8 +20,11 @@ struct TitleFrame {
 // Decodes the first `limitMs` of a stream and returns up to `maxFrames`
 // candidate title frames shown before the screen is first cleared for the
 // lyrics, most text-like first. Never throws; an empty or blank stream gives
-// no frames. Timing is the stream's own packet clock.
+// no frames. Timing is the stream's own packet clock. `stop`, when given, is
+// asked at every step and must return at once; once it says stop, no frames
+// are returned.
 std::vector<TitleFrame> findTitleFrames(const std::vector<std::uint8_t>& stream,
-                                        int limitMs = 45000, int maxFrames = 3);
+                                        int limitMs = 45000, int maxFrames = 3,
+                                        const std::function<bool()>& stop = {});
 
 } // namespace cdg

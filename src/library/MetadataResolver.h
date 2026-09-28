@@ -16,7 +16,16 @@ public:
     static constexpr int Version = 5;
 
     struct Options {
+        // Consulted between write batches; may block (e.g. while playback
+        // pauses background work).
         std::function<bool()> shouldStop;
+        // Consulted for every item at every stage; must return at once. When
+        // it says stop, resolve() returns Cancelled promptly, having written
+        // no partial batch and leaving the reprocess pending.
+        std::function<bool()> cancelled;
+        // Told each stage's name as it begins ("candidates", "sidecars",
+        // "names", "evidence", "base", "duplicates", "title_screens", "write").
+        std::function<void(const QString& stage)> stageStarted;
         std::function<void(qint64 done, qint64 total)> progress;
     };
 

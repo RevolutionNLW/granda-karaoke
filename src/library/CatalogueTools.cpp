@@ -182,8 +182,18 @@ QVariantMap CatalogueTools::reparse(Catalogue& catalogue, QString* error)
     return result;
 }
 
-bool CatalogueTools::reparseStoredNames(Catalogue& catalogue, qint64* count, QString* error)
+bool CatalogueTools::reparseStoredNames(Catalogue& catalogue, qint64* count, QString* error,
+                                        const std::function<bool()>& cancelled, bool* wasCancelled)
 {
+    if (wasCancelled)
+        *wasCancelled = false;
+    const auto stop = [&cancelled, wasCancelled] {
+        if (!cancelled || !cancelled())
+            return false;
+        if (wasCancelled)
+            *wasCancelled = true;
+        return true;
+    };
     QSqlDatabase database = catalogue.database();
     QSqlQuery rows(database);
     if (!rows.exec(QStringLiteral(
@@ -197,6 +207,8 @@ bool CatalogueTools::reparseStoredNames(Catalogue& catalogue, qint64* count, QSt
     struct StoredName { qint64 id; QString rawPath; QString rawFileName; QString relDir; };
     QList<StoredName> names;
     while (rows.next()) {
+        if (stop())
+            return true;
         const QJsonObject old = QJsonDocument::fromJson(rows.value(1).toByteArray()).object();
         const QString rawPath = old.value(QStringLiteral("rawPath")).toString(rows.value(3).toString());
         QString rawFileName = old.value(QStringLiteral("rawFileName")).toString();
@@ -220,6 +232,10 @@ bool CatalogueTools::reparseStoredNames(Catalogue& catalogue, qint64* count, QSt
     QSqlQuery update(database);
     update.prepare(QStringLiteral("UPDATE sources SET parsed_json=? WHERE id=?"));
     for (const StoredName& name : std::as_const(names)) {
+        if (stop()) {
+            database.rollback();  // all or nothing: the old names stay
+            return true;
+        }
         const ParsedName parsed = parseSongName(name.relDir, name.rawFileName);
         update.bindValue(0, QString::fromUtf8(
             QJsonDocument(parsedNameJson(parsed, name.rawPath, name.rawFileName))

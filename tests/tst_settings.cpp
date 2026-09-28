@@ -9,6 +9,7 @@
 #include "PlaylistView.h"
 #include "AudioOutputs.h"
 #include "SettingsDialog.h"
+#include "Shutdown.h"
 #include "library/Catalogue.h"
 #include "SongSettings.h"
 #include "TestMedia.h"
@@ -27,6 +28,7 @@
 #include <QKeySequenceEdit>
 #include <QMessageBox>
 #include <QPointer>
+#include <QScopeGuard>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -210,6 +212,9 @@ private slots:
     void failedNameCountsSaySo();
     void quittingNeverWaitsLongForBackgroundWork();
     void theProgramWaitsForStuckWorkOnlyBriefly();
+    void everyWayOutClosesTheSameWay();
+    void quittingWhileSettingsWorkIsStillRunning_data();
+    void quittingWhileSettingsWorkIsStillRunning();
 
 private:
     QTemporaryDir m_media;
@@ -1754,6 +1759,123 @@ void TestSettings::theProgramWaitsForStuckWorkOnlyBriefly()
     release = true;
     QVERIFY(background::waitForAll(2000));  // and tidied away
     QCOMPARE(background::running(), 0);
+}
+
+void TestSettings::everyWayOutClosesTheSameWay()
+{
+    // The title bar's close button, Settings > General > Quit Application and
+    // the Exit shortcut all end in the same place: playback stopped, the
+    // window's place remembered, the window closed.
+    QTemporaryDir temporary;
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings);
+    window.shortcutAction(QStringLiteral("app.exit"))->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Q));
+    const QList<std::pair<QString, std::function<void()>>> routes = {
+        {QStringLiteral("close button"), [&window] {
+             // What the window system sends when the close button is clicked.
+             QCloseEvent close;
+             QCoreApplication::sendEvent(window.windowHandle(), &close);
+         }},
+        {QStringLiteral("Settings > Quit Application"), [&window] {
+             SettingsDialog* dialog = window.openSettings();
+             dialog->showPage(QStringLiteral("General"));
+             QPushButton* button = buttonWithText(dialog, QStringLiteral("Quit Application"));
+             QVERIFY(button);
+             QTest::mouseClick(button, Qt::LeftButton);
+         }},
+        {QStringLiteral("Exit shortcut"), [&window] {
+             window.shortcutAction(QStringLiteral("app.exit"))->trigger();
+         }},
+    };
+    for (const auto& [name, route] : routes) {
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QVERIFY(window.openSong(m_songPath));
+        player.play();
+        QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+        window.preferences()->setText(pref::WindowGeometry, QString());
+        route();
+        QTRY_VERIFY2(!window.isVisible(), qPrintable(name));
+        QVERIFY2(player.state() == KaraokePlayer::State::Stopped, qPrintable(name));
+        QVERIFY2(!window.preferences()->text(pref::WindowGeometry).isEmpty(), qPrintable(name));
+    }
+}
+
+void TestSettings::quittingWhileSettingsWorkIsStillRunning_data()
+{
+    QTest::addColumn<bool>("findingOutputs");
+    QTest::addColumn<bool>("countingNames");
+    QTest::newRow("sound outputs") << true << false;
+    QTest::newRow("song-name counts") << false << true;
+    QTest::newRow("both") << true << true;
+}
+
+void TestSettings::quittingWhileSettingsWorkIsStillRunning()
+{
+    // Settings opened on Audio and Metadata, then the program closes while
+    // both background jobs are still working. Settings, the window and the
+    // library all go, in the program's order, before the results arrive; the
+    // late results are dropped without touching anything that has gone.
+    QFETCH(bool, findingOutputs);
+    QFETCH(bool, countingNames);
+    std::atomic<bool> release{false};
+    std::atomic<int> started{0};
+    auto hold = [&] {
+        ++started;
+        while (!release)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+    audio::OutputFinder* finder = audio::OutputFinder::instance();
+    finder->setLister([&] {
+        if (findingOutputs)
+            hold();
+        return QList<audio::Output>{{QStringLiteral("id:9"), QStringLiteral("Late Speakers")}};
+    });
+    finder->forget();
+    // However the test ends, the workers are let go and waited for before
+    // what they use goes, and the shared finder is left as it was found.
+    const auto cleanUp = qScopeGuard([&] {
+        release = true;
+        background::waitForAll(5000);
+        finder->setLister({});
+        finder->forget();
+    });
+    QTemporaryDir temporary;
+    auto controller = std::make_unique<LibraryController>(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    prepareLibrary(temporary.filePath(QStringLiteral("music")), *controller);
+    controller->setReviewSummaryReader([&](const QString&) {
+        if (countingNames)
+            hold();
+        return std::optional<ReviewSummary>(ReviewSummary{});
+    });
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    auto window = std::make_unique<MainWindow>(&player, &settings, controller.get());
+    QPointer<SettingsDialog> dialog = window->openSettings();
+    if (findingOutputs)
+        dialog->showPage(QStringLiteral("Audio"));
+    if (countingNames)
+        dialog->showPage(QStringLiteral("Metadata"));
+    QTRY_COMPARE(started.load(), int(findingOutputs) + int(countingNames));
+
+    QElapsedTimer timer;
+    timer.start();
+    window->close();
+    shutdown::stopLibraryOrExit(*controller, 99);
+    window.reset();
+    QVERIFY(dialog.isNull());
+    controller.reset();
+    QVERIFY2(timer.elapsed() < 1000, qPrintable(QString::number(timer.elapsed())));
+    QCOMPARE(background::running(), int(findingOutputs) + int(countingNames));
+
+    release = true;
+    QVERIFY(background::waitForAll(3000));
+    QCoreApplication::processEvents();  // the late results are delivered now, and dropped
+    QTest::qWait(50);
+    QCOMPARE(background::running(), 0);
+    finder->setLister({});
+    finder->forget();
 }
 
 QTEST_MAIN(TestSettings)

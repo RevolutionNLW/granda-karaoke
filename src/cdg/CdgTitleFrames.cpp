@@ -73,7 +73,7 @@ double score(const TitleFrame& frame)
 } // namespace
 
 std::vector<TitleFrame> findTitleFrames(const std::vector<std::uint8_t>& stream, int limitMs,
-                                        int maxFrames)
+                                        int maxFrames, const std::function<bool()>& stop)
 {
     std::vector<TitleFrame> result;
     if (stream.empty() || maxFrames <= 0)
@@ -91,6 +91,8 @@ std::vector<TitleFrame> findTitleFrames(const std::vector<std::uint8_t>& stream,
     int clearedAt = -1;
     bool recordedCurrent = false;
     for (int time = 0; time <= last; time += kStepMs) {
+        if (stop && stop())
+            return result;
         decoder.advanceTo(time);
         decoder.renderArgb32(current.data(), CdgDecoder::kWidth);
         if (previous.empty() || current != previous) {

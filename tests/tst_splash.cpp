@@ -1,3 +1,6 @@
+#include "BusTestPlayer.h"
+#include "MainWindow.h"
+#include "SongSettings.h"
 #include "ui/Splash.h"
 #include "ui/Theme.h"
 
@@ -12,6 +15,7 @@
 #include <QSignalSpy>
 #include <QVBoxLayout>
 #include <QWheelEvent>
+#include <QTemporaryDir>
 #include <QtTest>
 
 #include <memory>
@@ -107,6 +111,8 @@ private slots:
     void noMenuOpensUnderIt();
     void followsTheWindowSize();
     void goesWithItsWindow();
+    void closingTheProgramAroundTheSplashIsSafe_data();
+    void closingTheProgramAroundTheSplashIsSafe();
     void drawsTheNameAndMarkAtEveryScale();
 };
 
@@ -482,6 +488,51 @@ void TestSplash::drawsTheNameAndMarkAtEveryScale()
         }
     }
     theme::setScalePercent(100);
+}
+
+void TestSplash::closingTheProgramAroundTheSplashIsSafe_data()
+{
+    QTest::addColumn<int>("closeAtMs");
+    QTest::addColumn<bool>("skipFirst");
+    QTest::newRow("at once") << 0 << false;
+    QTest::newRow("mid-way") << 1500 << false;
+    QTest::newRow("just after it ends") << ui::SplashOverlay::kLongestMs + 100 << false;
+    QTest::newRow("skipped, then closed quickly") << 150 << true;
+}
+
+void TestSplash::closingTheProgramAroundTheSplashIsSafe()
+{
+    // The real main window with its splash, closed and destroyed as the
+    // program does, at different moments. Afterwards nothing of the splash
+    // is left: no event filter on the application, no timer.
+    QFETCH(int, closeAtMs);
+    QFETCH(bool, skipFirst);
+    QTemporaryDir temporary;
+    QPointer<ui::SplashOverlay> splash;
+    {
+        BusTestPlayer player;
+        SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+        MainWindow window(&player, &settings);
+        splash = new ui::SplashOverlay(&window);
+        window.resize(900, 600);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        if (skipFirst) {
+            QTest::keyClick(window.windowHandle(), Qt::Key_Space);
+            QTRY_VERIFY(splash.isNull());
+        }
+        QTest::qWait(closeAtMs);
+        window.close();
+    }
+    settle();
+    QVERIFY(splash.isNull());
+    QLineEdit other;
+    other.show();
+    other.setFocus();
+    QTest::keyClick(&other, Qt::Key_X);
+    QCOMPARE(other.text(), QStringLiteral("x"));
+    QTest::qWait(300);  // any timer it left behind would fire here
+    QCOMPARE(other.text(), QStringLiteral("x"));
 }
 
 QTEST_MAIN(TestSplash)

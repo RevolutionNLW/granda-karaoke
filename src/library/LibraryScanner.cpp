@@ -190,6 +190,9 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
 {
     MetadataResolver::Options options;
     options.shouldStop = [this] { return !waitWhilePaused(); };
+    // Never waits: a cancelled scan must stop inside the resolver's long
+    // in-memory stages too, or closing the program would wait for them.
+    options.cancelled = [this] { return shouldStop(); };
     options.progress = [this, &phase](qint64 done, qint64 total) {
         reportProgress(phase, done, total, QString(), true);
     };
@@ -335,8 +338,18 @@ void LibraryScanner::reprocessMetadata()
             < kFilenameParserVersion
         && error.isEmpty()) {
         qint64 reparsed = 0;
-        if (!CatalogueTools::reparseStoredNames(catalogue, &reparsed, &error)) {
+        bool reparseCancelled = false;
+        if (!CatalogueTools::reparseStoredNames(catalogue, &reparsed, &error,
+                                                [this] { return shouldStop(); },
+                                                &reparseCancelled)) {
             emit failed(error);
+            return;
+        }
+        if (reparseCancelled) {
+            // Nothing was changed; the next reprocess parses them again.
+            summary.insert(QStringLiteral("status"), QStringLiteral("cancelled"));
+            summary.insert(QStringLiteral("sourceFileReads"), qulonglong(m_sourceFileReads));
+            emit finished(summary);
             return;
         }
         summary.insert(QStringLiteral("reparsedNames"), reparsed);
@@ -431,7 +444,10 @@ void LibraryScanner::reprocessMetadata()
     summary.insert(QStringLiteral("status"), cancelled ? QStringLiteral("cancelled")
                                                         : QStringLiteral("completed"));
     summary.insert(QStringLiteral("sourceFileReads"), qulonglong(m_sourceFileReads));
-    summary.insert(QStringLiteral("stats"), catalogue.metadataStats(&error));
+    // Counting every song takes a noticeable moment on a large library; a
+    // cancelled run (such as the program closing) ends without it.
+    if (!cancelled)
+        summary.insert(QStringLiteral("stats"), catalogue.metadataStats(&error));
     if (!error.isEmpty()) {
         emit failed(error);
         return;
@@ -1714,7 +1730,8 @@ bool LibraryScanner::readTitleScreens(Catalogue& catalogue, qint64 rootId,
         }
         const auto* first = reinterpret_cast<const std::uint8_t*>(bytes.constData());
         const std::vector<std::uint8_t> stream(first, first + bytes.size());
-        const std::vector<cdg::TitleFrame> frames = cdg::findTitleFrames(stream);
+        const std::vector<cdg::TitleFrame> frames = cdg::findTitleFrames(
+            stream, 45000, 3, [this] { return shouldStop(); });
         QJsonArray framesJson;
         QString status = frames.empty() ? QStringLiteral("no_title_frame") : QStringLiteral("ok");
         for (const cdg::TitleFrame& frame : frames) {
