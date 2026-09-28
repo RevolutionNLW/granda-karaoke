@@ -38,9 +38,11 @@ jobs:
       # aqtinstall cannot read the Qt 6.11 repository layout yet, so the
       # official prebuilt qtbase and qttools archives are fetched directly from download.qt.io
       # and checked against its published SHA-1.
+      # Restored and saved separately: actions/cache would only save when the
+      # whole job succeeds.
       - name: Restore Qt ${{ env.QT_VERSION }}
         id: qt-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.QT_DIR }}
           key: qt-${{ env.QT_VERSION }}-msvc2022_64-qtbase-qttools-v2
@@ -70,6 +72,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Could not extract $archive" }
           }
 
+      - name: Save Qt ${{ env.QT_VERSION }}
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.QT_DIR }}
+          key: ${{ steps.qt-cache.outputs.cache-primary-key }}
+
       - name: Use Qt ${{ env.QT_VERSION }}
         shell: pwsh
         run: |
@@ -82,7 +91,7 @@ jobs:
 
       - name: Restore GStreamer ${{ env.GST_VERSION }}
         id: gst-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.GST_DIR }}
           key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}-v1
@@ -102,6 +111,13 @@ jobs:
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
             '/TYPE=full', "/DIR=$env:GST_DIR", "/LOG=$log")
           if ($p.ExitCode -ne 0) { Get-Content $log -Tail 80; throw "GStreamer installer failed: $($p.ExitCode)" }
+
+      - name: Save GStreamer ${{ env.GST_VERSION }}
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.GST_DIR }}
+          key: ${{ steps.gst-cache.outputs.cache-primary-key }}
 
       - name: Locate GStreamer SDK root
         shell: pwsh

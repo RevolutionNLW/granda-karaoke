@@ -346,12 +346,24 @@ void TestShutdown::resolverStopsPromptlyInsideEveryStage()
         QHash<QString, int> checks;
         QString current;
         MetadataResolver::Options options;
-        options.stageStarted = [&](const QString& name) { current = name; };
+        // Time spent in each stage too, to compare machines.
+        QHash<QString, qint64> stageMs;
+        QElapsedTimer stageTimer;
+        options.stageStarted = [&](const QString& name) {
+            if (!current.isEmpty())
+                stageMs[current] += stageTimer.restart();
+            else
+                stageTimer.start();
+            current = name;
+        };
         options.cancelled = [&] { ++checks[current]; return false; };
         QElapsedTimer timer;
         timer.start();
         QCOMPARE(MetadataResolver::resolve(catalogue, -1, options), MetadataResolver::Status::Completed);
+        if (!current.isEmpty())
+            stageMs[current] += stageTimer.elapsed();
         qInfo() << "Uncancelled resolve of" << m_songs << "songs:" << timer.elapsed() << "ms; checks" << checks;
+        qInfo() << "Milliseconds per stage:" << stageMs;
         for (const char* name : {"candidates", "sidecars", "names", "evidence", "base", "write"})
             QVERIFY2(checks.value(QString::fromLatin1(name)) >= m_songs, name);
         QVERIFY(checks.value(QStringLiteral("duplicates")) >= kCopies);
