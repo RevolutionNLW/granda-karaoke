@@ -87,6 +87,22 @@ for ($round = 1; $round -le 3; $round++) {
 }
 if (-not (Select-String -Path $log -Pattern 'Music folder:.*Test Songs' -Quiet)) { Fail 'The Test Songs folder was not the music folder' }
 
+# Windows display scaling at 125% and 150%, as on many laptops: the window
+# must come up, keep its interface size within the screen, and quit cleanly.
+foreach ($scale in '1.25', '1.5') {
+    $env:QT_SCALE_FACTOR = $scale
+    $process = Start-Program
+    Remove-Item env:QT_SCALE_FACTOR
+    Wait-Window $process 30
+    Start-Sleep -Seconds 4
+    Stop-Program $process "display scaling $scale"
+    $screenLine = Select-String -Path $log -Pattern 'Primary screen' | Select-Object -First 1
+    $limitLine = Select-String -Path $log -Pattern 'Interface size .* so the window fits' | Select-Object -First 1
+    Write-Host "Display scaling ${scale}: $($screenLine.Line.Substring(24))"
+    if ($limitLine) { Write-Host "  $($limitLine.Line.Substring(24))" } else { Write-Host '  interface size fits without a limit' }
+    if (-not (Select-String -Path $log -Pattern "device pixel ratio $scale" -Quiet)) { Fail "Display scaling $scale was not in effect" }
+}
+
 # While a song is playing (opened from the command line).
 $process = Start-Program @("`"$song`"")
 Wait-Window $process 30
