@@ -1118,7 +1118,7 @@ QWidget* SettingsDialog::buildAudio()
     // list is kept for the session, and Refresh asks again.
     audio::OutputFinder* finder = audio::OutputFinder::instance();
     const auto fillOutputs = [output, showChoice, finder] {
-        const Timed timed("audio device list (fill)");
+        const Timed fillTimed("audio device list (fill)");
         {
             const QSignalBlocker blocker(output);
             output->clear();

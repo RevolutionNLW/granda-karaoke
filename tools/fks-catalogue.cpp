@@ -48,14 +48,14 @@ int main(int argc, char* argv[])
 {
     QCoreApplication app(argc, argv);
     QStringList args = app.arguments().mid(1);
-    const int dbOption = args.indexOf(QStringLiteral("--db"));
+    const qsizetype dbOption = args.indexOf(QStringLiteral("--db"));
     if (dbOption < 0 || dbOption + 1 >= args.size())
         return usage(QStringLiteral("--db is required"));
     const QString databasePath = args.at(dbOption + 1);
     args.removeAt(dbOption + 1);
     args.removeAt(dbOption);
     QString overridesPath;
-    const int overridesOption = args.indexOf(QStringLiteral("--overrides"));
+    const qsizetype overridesOption = args.indexOf(QStringLiteral("--overrides"));
     if (overridesOption >= 0) {
         if (overridesOption + 1 >= args.size())
             return usage(QStringLiteral("--overrides requires a path"));
@@ -75,12 +75,12 @@ int main(int argc, char* argv[])
             return usage(QStringLiteral("scan requires a library root"));
         const QString root = args.takeFirst();
         ScanOptions options;
-        const int noTags = args.indexOf(QStringLiteral("--no-tags"));
+        const qsizetype noTags = args.indexOf(QStringLiteral("--no-tags"));
         if (noTags >= 0) {
             options.readTags = false;
             args.removeAt(noTags);
         }
-        const int limit = args.indexOf(QStringLiteral("--limit-seconds"));
+        const qsizetype limit = args.indexOf(QStringLiteral("--limit-seconds"));
         if (limit >= 0) {
             if (limit + 1 >= args.size())
                 return usage(QStringLiteral("--limit-seconds requires an integer"));
@@ -121,13 +121,13 @@ int main(int argc, char* argv[])
         // database-only resolve, content matching for connected roots (reads
         // candidate files read-only), then a final resolve.
         ScanOptions options;
-        const int noContent = args.indexOf(QStringLiteral("--no-content-matching"));
+        const qsizetype noContent = args.indexOf(QStringLiteral("--no-content-matching"));
         if (noContent >= 0) {
             options.identifyDuplicates = false;
             args.removeAt(noContent);
         }
         std::shared_ptr<TitleScreenOcrEngine> engine;
-        const int titleScreens = args.indexOf(QStringLiteral("--title-screens"));
+        const qsizetype titleScreens = args.indexOf(QStringLiteral("--title-screens"));
         if (titleScreens >= 0) {
             args.removeAt(titleScreens);
             engine = createPlatformTitleScreenOcr();
@@ -214,7 +214,7 @@ int main(int argc, char* argv[])
             return usage(QStringLiteral("Unexpected metadata-stats arguments"));
         printJson(catalogue.metadataStats(&error));
     } else if (command == QLatin1String("compare")) {
-        const int baselineOption = args.indexOf(QStringLiteral("--baseline"));
+        const qsizetype baselineOption = args.indexOf(QStringLiteral("--baseline"));
         if (baselineOption < 0 || baselineOption + 1 >= args.size())
             return usage(QStringLiteral("compare requires --baseline <other.sqlite>"));
         const QString baseline = args.at(baselineOption + 1);
@@ -236,7 +236,7 @@ int main(int argc, char* argv[])
         output.insert(QStringLiteral("elapsedMs"), timer.elapsed());
         printJson(output);
     } else if (command == QLatin1String("evaluate")) {
-        const int goldOption = args.indexOf(QStringLiteral("--gold"));
+        const qsizetype goldOption = args.indexOf(QStringLiteral("--gold"));
         if (goldOption < 0 || goldOption + 1 >= args.size())
             return usage(QStringLiteral("evaluate requires --gold <gold.tsv>"));
         const QString goldPath = args.at(goldOption + 1);
@@ -247,7 +247,7 @@ int main(int argc, char* argv[])
         printJson(CatalogueTools::evaluateGold(catalogue, goldPath, &error));
     } else if (command == QLatin1String("evaluate-tags")) {
         int mismatchLimit = 50;
-        const int limitOption = args.indexOf(QStringLiteral("--limit"));
+        const qsizetype limitOption = args.indexOf(QStringLiteral("--limit"));
         if (limitOption >= 0) {
             if (limitOption + 1 >= args.size())
                 return usage(QStringLiteral("--limit requires a non-negative integer"));
@@ -287,7 +287,7 @@ int main(int argc, char* argv[])
         if (!valid || count <= 0)
             return usage(QStringLiteral("sample count must be positive"));
         QString confidence;
-        const int option = args.indexOf(QStringLiteral("--confidence"));
+        const qsizetype option = args.indexOf(QStringLiteral("--confidence"));
         if (option >= 0) {
             if (option + 1 >= args.size())
                 return usage(QStringLiteral("--confidence requires a value"));

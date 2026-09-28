@@ -142,7 +142,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="/DEBUG /OPT:REF /OPT:ICF"
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build build -- -k 0
 
       - name: Test
         shell: pwsh

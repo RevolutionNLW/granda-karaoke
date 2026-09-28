@@ -202,7 +202,6 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_results = new QTreeView(m_searchPage);
     m_resultsModel = new LibraryResultsModel(m_results);
     if (m_controller) {
-        LibraryController* controller = m_controller;
         m_resultsModel->setPlayCountProvider([controller](qint64 songId) {
             return controller->playStats(songId).playCount;
         });

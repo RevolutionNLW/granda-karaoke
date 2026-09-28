@@ -31,6 +31,7 @@ fks_add_test(tst_karaokeplayer LIBS fks_core ENV "FKS_TEST_MEDIA_DIR=${FKS_TEST_
 fks_add_test(tst_mainwindow LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_libraryview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_playlists LIBS fks_playlist fks_library)
+fks_add_test(tst_windowspaths LIBS fks_playlist fks_library)
 fks_add_test(tst_playlistplayback LIBS fks_core)
 fks_add_test(tst_playlistview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_metadatareview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")

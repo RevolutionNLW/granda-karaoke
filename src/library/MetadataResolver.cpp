@@ -754,7 +754,7 @@ void dropCodeFields(QList<Candidate>& candidates, StopCheck& stop)
 
 int wordCount(const QString& value)
 {
-    return value.split(QLatin1Char(' '), Qt::SkipEmptyParts).size();
+    return int(value.split(QLatin1Char(' '), Qt::SkipEmptyParts).size());
 }
 
 // "Everly Brothers-Bye Bye Love": one hyphen with no spaces joining two names.
@@ -906,10 +906,10 @@ Evidence prepareEvidence(QList<Candidate>& candidates, StopCheck& stop)
             candidate.structuralWeight = 3;
             candidate.structuralKind = StructuralKind::PersonalName;
         } else {
-            const int aLocalPartners = groupPartners.value(groupKey(candidate))
-                                           .value(fieldKey(a)).size();
-            const int bLocalPartners = groupPartners.value(groupKey(candidate))
-                                           .value(fieldKey(b)).size();
+            const int aLocalPartners = int(groupPartners.value(groupKey(candidate))
+                                               .value(fieldKey(a)).size());
+            const int bLocalPartners = int(groupPartners.value(groupKey(candidate))
+                                               .value(fieldKey(b)).size());
             if (aLocalPartners >= 2 && aLocalPartners > bLocalPartners) {
                 candidate.structuralOrder = Order::ArtistTitle;
                 candidate.structuralWeight = 2;
@@ -926,8 +926,8 @@ Evidence prepareEvidence(QList<Candidate>& candidates, StopCheck& stop)
                 candidate.structuralWeight = 2;
                 candidate.structuralKind = StructuralKind::Ensemble;
             }
-            const int aPartners = partners.value(fieldKey(a)).size();
-            const int bPartners = partners.value(fieldKey(b)).size();
+            const int aPartners = int(partners.value(fieldKey(a)).size());
+            const int bPartners = int(partners.value(fieldKey(b)).size());
             if (candidate.structuralOrder == Order::Unknown
                 && aPartners >= 2 && aPartners >= 2 * qMax(1, bPartners)) {
                 candidate.structuralOrder = Order::ArtistTitle;
@@ -1854,7 +1854,7 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
         const QString& title = result.title;
         const QString& artist = result.artist;
         const QString shownArtist = displayArtist(artist);
-        const QString evidence = evidenceJson(result);
+        const QString evidenceText = evidenceJson(result);
         const bool conflict = !result.conflicts.isEmpty();
         const QString effectiveTitle = candidate.manualTitle.isNull()
             ? title : candidate.manualTitle.toString();
@@ -1878,7 +1878,7 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
 
         const QList<QPair<const char*, QVariant>> values = {
             {":autoTitle", title}, {":autoArtist", artist}, {":autoSource", result.provenance},
-            {":autoConfidence", result.decision.confidence}, {":evidence", evidence},
+            {":autoConfidence", result.decision.confidence}, {":evidence", evidenceText},
             {":conflict", conflict}, {":version", Version}, {":base", result.baseConfidence},
             {":autoLabel", nullable(label.label)}, {":autoSeries", nullable(label.series)},
             {":autoLabelSource", nullable(label.source)}, {":autoDisc", candidate.discId},

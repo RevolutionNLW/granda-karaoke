@@ -102,7 +102,7 @@ SidecarTrackList parseTrackListSidecar(const QByteArray& contents)
                 ambiguous.insert(entry.track);
             continue;
         }
-        seen.insert(entry.track, entries.size());
+        seen.insert(entry.track, int(entries.size()));
         entries.append(entry);
     }
     for (const SidecarEntry& entry : std::as_const(entries)) {
