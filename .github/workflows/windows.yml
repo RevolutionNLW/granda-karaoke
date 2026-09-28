@@ -19,6 +19,7 @@ env:
   GST_VERSION: "1.28.7"
   GST_SHA256: "032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf"
   GST_DIR: 'C:\gstreamer'
+  QT_DIR: 'C:\Qt'
 
 jobs:
   build-test:
@@ -32,14 +33,50 @@ jobs:
         with:
           arch: x64
 
-      - name: Qt ${{ env.QT_VERSION }} (MSVC 2022 x64)
-        uses: jurplel/install-qt-action@v4
+      # aqtinstall cannot read the Qt 6.11 repository layout yet, so the
+      # official prebuilt qtbase archive is fetched directly from download.qt.io
+      # and checked against its published SHA-1.
+      - name: Restore Qt ${{ env.QT_VERSION }}
+        id: qt-cache
+        uses: actions/cache@v4
         with:
-          version: ${{ env.QT_VERSION }}
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
+          path: ${{ env.QT_DIR }}
+          key: qt-${{ env.QT_VERSION }}-msvc2022_64-qtbase-v1
+
+      - name: Install official Qt ${{ env.QT_VERSION }} (MSVC 2022 x64)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:QT_VERSION -replace '\.', ''
+          $repo = "https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_$v/qt6_${v}_msvc2022_64"
+          Invoke-WebRequest -Uri "$repo/Updates.xml" -OutFile "$env:RUNNER_TEMP\qt-updates.xml"
+          [xml]$updates = Get-Content -Raw "$env:RUNNER_TEMP\qt-updates.xml"
+          $package = $updates.Updates.PackageUpdate | Where-Object { $_.Name -eq "qt.qt6.$v.win64_msvc2022_64" }
+          if (-not $package) { throw "Qt package qt.qt6.$v.win64_msvc2022_64 not found" }
+          $archives = $package.DownloadableArchives -split ',\s*' | Where-Object { $_ -like 'qtbase-*' }
+          New-Item -ItemType Directory -Force -Path $env:QT_DIR | Out-Null
+          foreach ($archive in $archives) {
+            $name = "$($package.Version)$archive"
+            $file = "$env:RUNNER_TEMP\$archive"
+            Invoke-WebRequest -Uri "$repo/$($package.Name)/$name" -OutFile $file
+            Invoke-WebRequest -Uri "$repo/$($package.Name)/$name.sha1" -OutFile "$file.sha1"
+            $expected = ((Get-Content -Raw "$file.sha1").Trim() -split '\s+')[0]
+            $actual = (Get-FileHash $file -Algorithm SHA1).Hash.ToLower()
+            if ($actual -ne $expected.ToLower()) { throw "Checksum mismatch for $archive" }
+            7z x $file "-o$env:QT_DIR" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Could not extract $archive" }
+          }
+
+      - name: Use Qt ${{ env.QT_VERSION }}
+        shell: pwsh
+        run: |
+          $config = Get-ChildItem -Path $env:QT_DIR -Recurse -Filter Qt6Config.cmake | Select-Object -First 1
+          if (-not $config) { throw "Qt6Config.cmake not found under $env:QT_DIR" }
+          $prefix = $config.Directory.Parent.Parent.Parent.FullName
+          Write-Host "Qt prefix: $prefix"
+          "QT_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Restore GStreamer ${{ env.GST_VERSION }}
         id: gst-cache
@@ -98,6 +135,7 @@ jobs:
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$env:QT_PREFIX"
           -DGSTREAMER_ROOT="$env:GSTREAMER_ROOT"
           -DFKS_WARNINGS_AS_ERRORS=ON
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase
