@@ -79,23 +79,30 @@ Stop-Program $process 'while a song plays'
 Write-Host 'Quit while a song was playing: clean'
 
 # --- 3. A second copy while one is open -------------------------------------
+# --single-instance-probe exits at once: 3 if a copy is running, 0 if not.
+function Invoke-Probe {
+    $probe = Start-Process -FilePath $exe -ArgumentList '--single-instance-probe' -PassThru
+    if (-not $probe.WaitForExit(10000)) { $probe.Kill(); Fail 'The single-instance probe started a full copy' }
+    return $probe.ExitCode
+}
+if ((Invoke-Probe) -ne 0) { Fail 'The probe saw a running copy when none was open' }
 $first = Start-Program
 Wait-Window $first 30
 Start-Sleep -Seconds 2
-$logBefore = (Get-Item $log).Length
+$code = Invoke-Probe
+if ($code -ne 3) { Fail "A second copy was not refused while one was open (probe exit $code)" }
+Write-Host 'A second copy is refused while one is open'
+# A real second start shows "already open" and must leave the first alone.
 $second = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Seconds 4
 $second.Refresh()
-if ($second.HasExited) {
-    Write-Host "Second copy ended at once (exit $($second.ExitCode))"
-} else {
-    # It is showing "already open"; the test closes that message.
-    Stop-Process -Id $second.Id -Force
-    Write-Host 'Second copy showed its "already open" message'
-}
-if ((Get-Item $log).Length -lt $logBefore) { Fail 'The second copy replaced the running copy''s log' }
+if ($second.HasExited -and $second.ExitCode -ne 0) { Fail "The second copy failed (exit $($second.ExitCode))" }
+if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force }
+$first.Refresh()
+if ($first.HasExited) { Fail 'The first copy ended when a second was started' }
 Stop-Program $first 'first copy after a second was started'
-Write-Host 'Running copy unaffected by the second one, quit cleanly'
+if ((Invoke-Probe) -ne 0) { Fail 'The lock was not released when the program quit' }
+Write-Host 'The running copy was unaffected and released the lock when it quit'
 
 # --- 4. What was written, and where -----------------------------------------
 Write-Host "Program data folder ($dataFolder):"

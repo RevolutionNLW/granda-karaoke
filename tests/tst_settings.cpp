@@ -181,6 +181,7 @@ private slots:
     void actionsActOnTheSelectedSongsOnly();
     void interfaceScaleAppliesLiveAndPersists();
     void nothingClipsOrOverlapsAtAnyScale();
+    void interfaceSizeStaysWithinTheScreen();
     void removeConfirmationIsOptionalButDeleteAlwaysAsks();
     void exitCanAskFirst();
     void lyricsCanStayUpAtTheEndOfASong();
@@ -537,6 +538,52 @@ void TestSettings::interfaceScaleAppliesLiveAndPersists()
     QTest::mouseClick(dialog->scaleUpButton(), Qt::LeftButton);
     auto again = storedPreferences(controller);
     QCOMPARE(again->number(pref::ScalePercent, 100), 105);
+}
+
+void TestSettings::interfaceSizeStaysWithinTheScreen()
+{
+    // Windows display scaling makes the screen smaller in Qt's terms: a
+    // 1366x768 laptop at 150% is 911x512. The test screen (800x600) is as
+    // small, so a large size from Settings cannot fit it.
+    QTemporaryDir temporary;
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings);
+    window.preferences()->setNumber(pref::ScalePercent, 150);
+    QCOMPARE(theme::scalePercent(), 150);
+    window.showFullScreen();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    const QSize screen = window.screen()->geometry().size();
+    QVERIFY2(window.minimumSizeHint().width() > screen.width()
+                 || window.minimumSizeHint().height() > screen.height(),
+             "the test needs a screen too small for 150%");
+
+    window.setKeepScaleWithinScreen(true);
+    qInfo("Screen %dx%d: 150%% chosen, %d%% used, smallest window %dx%d", screen.width(), screen.height(),
+          theme::scalePercent(), window.minimumSizeHint().width(), window.minimumSizeHint().height());
+    QVERIFY(theme::scalePercent() < 150);
+    QCOMPARE(theme::chosenScalePercent(), 150);
+    QCOMPARE(window.preferences()->number(pref::ScalePercent, 100), 150);  // the choice is kept
+    QVERIFY(window.minimumSizeHint().width() <= screen.width());
+    QVERIFY(window.minimumSizeHint().height() <= screen.height());
+    // Settings shows the size in use and says why it is not bigger.
+    SettingsDialog* dialog = window.openSettings();
+    QCOMPARE(dialog->scaleValueLabel()->text(), QStringLiteral("%1%").arg(theme::scalePercent()));
+    QVERIFY(!dialog->scaleUpButton()->isEnabled());
+    QVERIFY(!dialog->scaleLimitedLabel()->isHidden());
+    // Smaller still works, and is exact.
+    dialog->scaleDownButton()->click();
+    const int smaller = theme::scalePercent();
+    QCOMPARE(window.preferences()->number(pref::ScalePercent, 100), smaller);
+    QCOMPARE(theme::chosenScalePercent(), smaller);
+    dialog->close();
+
+    // Without the limit (another, bigger screen) the chosen size is used.
+    window.preferences()->setNumber(pref::ScalePercent, 150);
+    window.setKeepScaleWithinScreen(false);
+    QCOMPARE(theme::scalePercent(), 150);
+    window.preferences()->reset(pref::ScalePercent);
+    QCOMPARE(theme::scalePercent(), 100);
 }
 
 void TestSettings::nothingClipsOrOverlapsAtAnyScale()

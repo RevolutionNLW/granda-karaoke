@@ -70,6 +70,7 @@ public:
     QPushButton* scaleDownButton();
     QPushButton* scaleUpButton();
     QPushButton* scaleResetButton();
+    QLabel* scaleLimitedLabel();
     QTreeWidget* shortcutList();
     QLineEdit* shortcutFilter();
     QKeySequenceEdit* shortcutEditor();
@@ -134,6 +135,7 @@ private:
     QPushButton* m_scaleDown = nullptr;
     QPushButton* m_scaleUp = nullptr;
     QPushButton* m_scaleReset = nullptr;
+    QLabel* m_scaleLimited = nullptr;
     QLabel* m_folderLabel = nullptr;
     QLabel* m_libraryStatus = nullptr;
     QLabel* m_lastScan = nullptr;

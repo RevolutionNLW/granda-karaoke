@@ -44,6 +44,14 @@ public:
     // to the user and returns false on failure.
     bool openSong(const QString& path);
 
+    // Keeps the interface size within the screen the window is on. Windows
+    // display scaling (125%, 150%) enlarges everything as well, so together
+    // with a large size from Settings the window could outgrow the screen;
+    // the largest size that fits is used then, and the chosen size comes back
+    // when the screen allows. The program turns this on once its window is
+    // shown (tests run on a small virtual screen and leave it off).
+    void setKeepScaleWithinScreen(bool keep);
+
     LyricsView* lyricsView() const { return m_lyrics; }
     bool lyricsVisible() const;
     bool libraryVisible() const;
@@ -102,6 +110,8 @@ protected:
     void changeEvent(QEvent* event) override;
 
 private:
+    void fitScaleToScreen();
+    void watchScreen();
     bool loadSong(const QString& path);
     QWidget* buildPlayerBar();
     void chooseSong();
@@ -146,6 +156,9 @@ private:
     PlaylistStore* m_playlistStore;
     PlaylistPlayback* m_playlistPlayback;
     DisplaySleepBlocker m_displaySleepBlocker;
+    bool m_keepScaleWithinScreen = false;
+    bool m_fittingScale = false;
+    QList<QMetaObject::Connection> m_screenConnections;
     QStackedWidget* m_pages;
     QWidget* m_home;
     LyricsView* m_lyrics;

@@ -243,6 +243,8 @@ QSlider::handle:horizontal {
 )";
 
 int g_scalePercent = 100;
+int g_chosenScalePercent = 100;
+int g_scaleLimitPercent = kMaxScalePercent;
 
 } // namespace
 
@@ -475,9 +477,32 @@ Notifier* notifier()
     return instance;
 }
 
-void setScalePercent(int percent)
+int chosenScalePercent()
+{
+    return g_chosenScalePercent;
+}
+
+int scaleLimitPercent()
+{
+    return g_scaleLimitPercent;
+}
+
+void setScaleLimitPercent(int percent)
 {
     percent = std::clamp(percent, kMinScalePercent, kMaxScalePercent);
+    if (percent == g_scaleLimitPercent)
+        return;
+    const int before = g_scalePercent;
+    g_scaleLimitPercent = percent;
+    setScalePercent(g_chosenScalePercent);
+    if (g_scalePercent == before)
+        emit notifier()->changed();  // the size is the same, but Settings says why
+}
+
+void setScalePercent(int percent)
+{
+    g_chosenScalePercent = std::clamp(percent, kMinScalePercent, kMaxScalePercent);
+    percent = std::min(g_chosenScalePercent, g_scaleLimitPercent);
     if (percent == g_scalePercent)
         return;
     g_scalePercent = percent;

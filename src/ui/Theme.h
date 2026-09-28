@@ -52,9 +52,17 @@ inline constexpr int kMinScalePercent = 80;
 inline constexpr int kMaxScalePercent = 150;
 inline constexpr int kScaleStepPercent = 5;
 
+// The size in use: the chosen one, unless the screen cannot hold it.
 int scalePercent();
 // Applies at once: the style sheet, fonts and every open window are redone.
 void setScalePercent(int percent);
+// The largest size the screen can hold (the window works it out; Windows
+// display scaling enlarges everything as well). The chosen size is kept and
+// comes back when the screen allows it again.
+int scaleLimitPercent();
+void setScaleLimitPercent(int percent);
+// The size chosen in Settings (scalePercent() may be smaller).
+int chosenScalePercent();
 // A 100% length at the current scale. Hairlines (0 and 1) stay as they are.
 int px(int base);
 

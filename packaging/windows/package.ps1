@@ -66,6 +66,12 @@ foreach ($plugin in $plugins) {
 $scanner = Join-Path $GStreamerRoot 'libexec\gstreamer-1.0\gst-plugin-scanner.exe'
 if (-not (Test-Path $scanner)) { throw "gst-plugin-scanner.exe not found" }
 Copy-Item $scanner $program
+# GLib starts helper programs through these; nothing imports them by name.
+foreach ($helper in 'gspawn-win64-helper.exe', 'gspawn-win64-helper-console.exe') {
+    $source = Join-Path $gstBin $helper
+    if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source $program }
+    else { Write-Host "::warning::$helper is not in the GStreamer SDK" }
+}
 
 # Every DLL any packaged file needs, found in the GStreamer or Qt SDK, is
 # copied beside the program, repeatedly until nothing new is needed.
@@ -96,15 +102,27 @@ while ($queue.Count -gt 0) {
     }
 }
 
-# Anything not packaged must be part of Windows itself. The Visual C++
-# runtime is not: some computers do not have it, so it must be packaged.
+# Anything not packaged must be part of every Windows 11 installation: this
+# list is reviewed by hand. (A DLL that merely exists on the build machine
+# proves nothing about the laptop.) The Visual C++ runtime is not part of
+# Windows, so it must be packaged.
+$windows11 = @(
+    'advapi32', 'authz', 'avrt', 'bcrypt', 'cfgmgr32', 'combase', 'comctl32', 'comdlg32', 'crypt32',
+    'd2d1', 'd3d11', 'd3d12', 'd3d9', 'dcomp', 'dnsapi', 'dsound', 'dwmapi', 'dwrite', 'dxgi', 'gdi32',
+    'hid', 'imm32', 'iphlpapi', 'kernel32', 'ksuser', 'mf', 'mfplat', 'mfreadwrite', 'mmdevapi',
+    'mpr', 'msdmo', 'msimg32', 'ncrypt', 'netapi32', 'normaliz', 'ntdll', 'ole32', 'oleaut32',
+    'powrprof', 'propsys', 'psapi', 'rpcrt4', 'runtimeobject', 'secur32', 'setupapi', 'shcore',
+    'shell32', 'shlwapi', 'ucrtbase', 'user32', 'userenv', 'uxtheme', 'version', 'winhttp', 'wininet',
+    'winmm', 'ws2_32', 'wtsapi32', 'windowscodecs', 'dbghelp', 'opengl32', 'glu32', 'mscms', 'usp10',
+    'wldap32', 'sspicli', 'mswsock', 'iertutil', 'coremessaging', 'twinapi.appcore'
+) | ForEach-Object { "$_.dll" }
 $problems = @()
 foreach ($name in $external.Keys) {
     if ($name -like 'api-ms-win-*' -or $name -like 'ext-ms-*') { continue }
     if ($name -match '^(msvcp|vcruntime|concrt|vccorlib)\d') {
         $problems += "$name (needed by $($external[$name])) is the Visual C++ runtime but is not packaged"
-    } elseif (-not (Test-Path (Join-Path $env:SystemRoot "System32\$name"))) {
-        $problems += "$name (needed by $($external[$name])) is neither packaged nor part of Windows"
+    } elseif ($windows11 -notcontains $name) {
+        $problems += "$name (needed by $($external[$name])) is not packaged and not on the reviewed list of Windows 11 system DLLs"
     }
 }
 if ($problems) { $problems | ForEach-Object { Write-Host "::error::$_" }; throw "Package is incomplete" }

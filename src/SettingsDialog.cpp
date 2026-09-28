@@ -305,6 +305,7 @@ QLabel* SettingsDialog::scaleValueLabel() { ensureBuilt(pageIndex(QStringLiteral
 QPushButton* SettingsDialog::scaleDownButton() { ensureBuilt(pageIndex(QStringLiteral("Appearance"))); return m_scaleDown; }
 QPushButton* SettingsDialog::scaleUpButton() { ensureBuilt(pageIndex(QStringLiteral("Appearance"))); return m_scaleUp; }
 QPushButton* SettingsDialog::scaleResetButton() { ensureBuilt(pageIndex(QStringLiteral("Appearance"))); return m_scaleReset; }
+QLabel* SettingsDialog::scaleLimitedLabel() { ensureBuilt(pageIndex(QStringLiteral("Appearance"))); return m_scaleLimited; }
 QTreeWidget* SettingsDialog::shortcutList() { ensureBuilt(pageIndex(QStringLiteral("Shortcuts"))); return m_shortcutList; }
 QLineEdit* SettingsDialog::shortcutFilter() { ensureBuilt(pageIndex(QStringLiteral("Shortcuts"))); return m_shortcutFilter; }
 QKeySequenceEdit* SettingsDialog::shortcutEditor() { ensureBuilt(pageIndex(QStringLiteral("Shortcuts"))); return m_shortcutEditor; }
@@ -414,6 +415,10 @@ QWidget* SettingsDialog::buildAppearance()
     m_refreshers.append([this] { refreshScale(); });
     addHint(layout, QStringLiteral("Makes the whole program bigger or smaller, straight away. "
                                    "The karaoke lyrics always fill the screen."), page);
+    m_scaleLimited = makeLabel(QStringLiteral("This is the largest size that fits this screen."),
+                               page, QStringLiteral("settingsHint"));
+    m_scaleLimited->setVisible(false);
+    layout->addWidget(m_scaleLimited);
 
     addSection(layout, QStringLiteral("Colours"), page);
     QHBoxLayout* themeRow = addRow(layout, QStringLiteral("Theme"), page);
@@ -473,8 +478,11 @@ void SettingsDialog::refreshScale()
     const int percent = theme::scalePercent();
     m_scaleValue->setText(QStringLiteral("%1%").arg(percent));
     m_scaleDown->setEnabled(percent > theme::kMinScalePercent);
-    m_scaleUp->setEnabled(percent < theme::kMaxScalePercent);
+    m_scaleUp->setEnabled(percent < std::min(theme::kMaxScalePercent, theme::scaleLimitPercent()));
     m_scaleReset->setEnabled(percent != 100);
+    // Bigger would not fit this screen (Windows display scaling counts too).
+    m_scaleLimited->setVisible(theme::chosenScalePercent() > percent
+                               || theme::scaleLimitPercent() < theme::kMaxScalePercent);
 }
 
 // ---- Playback ------------------------------------------------------------

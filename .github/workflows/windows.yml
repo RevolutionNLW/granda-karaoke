@@ -34,14 +34,14 @@ jobs:
           arch: x64
 
       # aqtinstall cannot read the Qt 6.11 repository layout yet, so the
-      # official prebuilt qtbase archive is fetched directly from download.qt.io
+      # official prebuilt qtbase and qttools archives are fetched directly from download.qt.io
       # and checked against its published SHA-1.
       - name: Restore Qt ${{ env.QT_VERSION }}
         id: qt-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.QT_DIR }}
-          key: qt-${{ env.QT_VERSION }}-msvc2022_64-qtbase-v1
+          key: qt-${{ env.QT_VERSION }}-msvc2022_64-qtbase-qttools-v2
 
       - name: Install official Qt ${{ env.QT_VERSION }} (MSVC 2022 x64)
         if: steps.qt-cache.outputs.cache-hit != 'true'
@@ -54,7 +54,7 @@ jobs:
           [xml]$updates = Get-Content -Raw "$env:RUNNER_TEMP\qt-updates.xml"
           $package = $updates.Updates.PackageUpdate | Where-Object { $_.Name -eq "qt.qt6.$v.win64_msvc2022_64" }
           if (-not $package) { throw "Qt package qt.qt6.$v.win64_msvc2022_64 not found" }
-          $archives = $package.DownloadableArchives -split ',\s*' | Where-Object { $_ -like 'qtbase-*' }
+          $archives = $package.DownloadableArchives -split ',\s*' | Where-Object { $_ -like 'qtbase-*' -or $_ -like 'qttools-*' }
           New-Item -ItemType Directory -Force -Path $env:QT_DIR | Out-Null
           foreach ($archive in $archives) {
             $name = "$($package.Version)$archive"
@@ -123,7 +123,7 @@ jobs:
           $missing = @()
           foreach ($e in 'playbin','decodebin','uridecodebin','filesrc','typefind','id3demux','mpegaudioparse',
                          'mpg123audiodec','audioconvert','audioresample','capsfilter','scaletempo','pitch',
-                         'volume','audiotestsrc','autoaudiosink','wasapi2sink','fakesink','lamemp3enc','filesink') {
+                         'volume','audiotestsrc','autoaudiosink','wasapi2sink','fakesink','lamemp3enc','filesink','id3v2mux') {
             & "$env:GSTREAMER_ROOT\bin\gst-inspect-1.0.exe" --exists $e
             if ($LASTEXITCODE -ne 0) { $missing += $e }
           }

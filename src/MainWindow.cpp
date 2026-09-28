@@ -40,6 +40,11 @@
 #include <QStandardPaths>
 #include <QStackedWidget>
 #include <QTimer>
+#include <QScopedValueRollback>
+
+#include <algorithm>
+#include <QScreen>
+#include <QWindow>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -538,6 +543,7 @@ void MainWindow::applyPreference(const QString& key)
         applyDisplaySleep();
     } else if (key == pref::ScalePercent) {
         theme::setScalePercent(m_preferences->number(key, 100));
+        fitScaleToScreen();
     } else if (key == pref::CompactRows) {
         theme::setCompactRows(m_preferences->flag(key, false));
     } else if (key == pref::AlternateRows) {
@@ -703,9 +709,81 @@ void MainWindow::closeEvent(QCloseEvent* event)
     event->accept();
 }
 
+void MainWindow::setKeepScaleWithinScreen(bool keep)
+{
+    m_keepScaleWithinScreen = keep;
+    if (!keep) {
+        for (const QMetaObject::Connection& connection : std::as_const(m_screenConnections))
+            disconnect(connection);
+        m_screenConnections.clear();
+        theme::setScaleLimitPercent(theme::kMaxScalePercent);
+        return;
+    }
+    watchScreen();
+    fitScaleToScreen();
+}
+
+void MainWindow::watchScreen()
+{
+    for (const QMetaObject::Connection& connection : std::as_const(m_screenConnections))
+        disconnect(connection);
+    m_screenConnections.clear();
+    if (!m_keepScaleWithinScreen)
+        return;
+    // Moved to another screen, or this screen changed (resolution, Windows
+    // display scaling, taskbar): fit again.
+    if (QWindow* window = windowHandle()) {
+        m_screenConnections.append(connect(window, &QWindow::screenChanged, this, [this] {
+            watchScreen();
+            fitScaleToScreen();
+        }));
+    }
+    if (QScreen* where = screen()) {
+        m_screenConnections.append(connect(where, &QScreen::geometryChanged, this,
+                                           &MainWindow::fitScaleToScreen));
+        m_screenConnections.append(connect(where, &QScreen::availableGeometryChanged, this,
+                                           &MainWindow::fitScaleToScreen));
+        m_screenConnections.append(connect(where, &QScreen::logicalDotsPerInchChanged, this,
+                                           &MainWindow::fitScaleToScreen));
+    }
+}
+
+void MainWindow::fitScaleToScreen()
+{
+    const QScreen* where = screen();
+    if (!m_keepScaleWithinScreen || m_fittingScale || !where)
+        return;
+    const QScopedValueRollback<bool> fitting(m_fittingScale, true);
+    const bool fullScreen = windowState() & Qt::WindowFullScreen;
+    QSize room = fullScreen ? where->geometry().size() : where->availableGeometry().size();
+    if (!fullScreen)
+        room -= frameGeometry().size() - geometry().size();  // title bar and borders
+    const auto ratio = [this, room] {
+        const QSize needed = minimumSizeHint();
+        if (!needed.isValid() || needed.isEmpty())
+            return 1.0;
+        return std::min(double(room.width()) / needed.width(), double(room.height()) / needed.height());
+    };
+    // Sizes grow in step with the scale, so start from an estimate, then make
+    // sure: a step smaller until everything fits (80% is the smallest).
+    const int step = theme::kScaleStepPercent;
+    const int estimate = int(theme::scalePercent() * ratio() + 1e-6) / step * step;
+    theme::setScaleLimitPercent(estimate >= theme::chosenScalePercent() ? theme::kMaxScalePercent
+                                                                        : estimate);
+    while (ratio() < 1.0 && theme::scalePercent() > theme::kMinScalePercent)
+        theme::setScaleLimitPercent(theme::scalePercent() - step);
+    if (theme::scalePercent() < theme::chosenScalePercent()) {
+        qCInfo(lcUi) << "Interface size" << theme::scalePercent() << "% instead of"
+                     << theme::chosenScalePercent() << "% so the window fits the screen" << room
+                     << "(device pixel ratio" << where->devicePixelRatio() << ")";
+    }
+}
+
 void MainWindow::changeEvent(QEvent* event)
 {
     QWidget::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange)
+        fitScaleToScreen();  // full screen has more room than a window
     if (event->type() == QEvent::ActivationChange && isActiveWindow()) {
         QWidget* focused = QApplication::focusWidget();
         if (lyricsVisible()) {

@@ -132,6 +132,16 @@ void checkAudioComponents(Report& report, bool packaged)
                      QStringLiteral("Audio component %1").arg(QLatin1String(name)),
                      file.isEmpty() ? QStringLiteral("(built in)") : file);
     }
+#ifdef Q_OS_WIN
+    // The speakers themselves: autoaudiosink alone could be present while
+    // the Windows output it picks cannot load. Made, not started, so no
+    // speaker is needed for this.
+    GstElement* windowsSink = gst_element_factory_make("wasapi2sink", nullptr);
+    report.check(windowsSink != nullptr, QStringLiteral("Windows sound output component loads"),
+                 QStringLiteral("wasapi2sink"));
+    if (windowsSink)
+        gst_object_unref(gst_object_ref_sink(windowsSink));
+#endif
 }
 
 void checkPlayback(Report& report, const QString& songPath)

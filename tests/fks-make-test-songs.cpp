@@ -40,15 +40,18 @@ bool writeMp3(const QString& path, const TestSong& song)
         ? QStringLiteral("audiotestsrc wave=sine freq=440 volume=0.3")
         : QStringLiteral("audiotestsrc wave=ticks tick-interval=1000000000 freq=%1 volume=0.6")
               .arg(song.clickHz);
+    // Real karaoke MP3s carry ID3 tags, so the test songs do too.
     GstElementFactory* id3 = gst_element_factory_find("id3v2mux");
-    const bool tags = id3 != nullptr;
-    if (id3)
-        gst_object_unref(id3);
+    if (!id3) {
+        std::fprintf(stderr, "The GStreamer element id3v2mux is missing\n");
+        return false;
+    }
+    gst_object_unref(id3);
     const QByteArray description = QStringLiteral(
         "%1 num-buffers=%2 samplesperbuffer=441 ! audio/x-raw,rate=44100,channels=2 "
-        "! audioconvert ! lamemp3enc target=bitrate bitrate=128 cbr=true %3! filesink name=out")
+        "! audioconvert ! lamemp3enc target=bitrate bitrate=128 cbr=true ! id3v2mux name=tags "
+        "! filesink name=out")
         .arg(source).arg(buffers)
-        .arg(tags ? QStringLiteral("! id3v2mux name=tags ") : QString())
         .toUtf8();
     GError* error = nullptr;
     GstElement* pipeline = gst_parse_launch(description.constData(), &error);

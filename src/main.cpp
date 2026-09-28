@@ -58,20 +58,39 @@ int main(int argc, char* argv[])
     if (const qsizetype check = launchArguments.indexOf(QStringLiteral("--self-check")); check >= 0)
         return selfcheck::run(launchArguments.value(check + 1), launchArguments.value(check + 2));
 
-    QDir().mkpath(appDataPath);
+    if (appDataPath.isEmpty() || !QDir().mkpath(appDataPath)) {
+        QMessageBox::critical(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                              QStringLiteral("Frankie's Karaoke Studio cannot create its data folder"
+                                             "\n\n%1\n\nThe program will close without changing anything.")
+                                  .arg(QDir::toNativeSeparators(appDataPath)));
+        return 1;
+    }
 
     // One copy at a time. Windows does not stop a second copy when the icon
     // is opened twice, and two copies would share the same databases and log.
     // The lock is held by this process only; a crashed copy's lock is taken
     // over (its process no longer exists), never after a time limit.
+    // --single-instance-probe (automated checks): exit 3 if a copy is
+    // running, 0 if not, without showing anything.
+    const bool probe = launchArguments.contains(QStringLiteral("--single-instance-probe"));
     QLockFile instanceLock(QDir(appDataPath).filePath(QStringLiteral("running.lock")));
     instanceLock.setStaleLockTime(0);
-    if (!appDataPath.isEmpty() && !instanceLock.tryLock(0)
-        && instanceLock.error() == QLockFile::LockFailedError) {
-        QMessageBox::information(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
-                                 QStringLiteral("Frankie's Karaoke Studio is already open."));
-        return 0;
+    if (!instanceLock.tryLock(0)) {
+        if (instanceLock.error() == QLockFile::LockFailedError) {
+            if (probe)
+                return 3;
+            QMessageBox::information(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                                     QStringLiteral("Frankie's Karaoke Studio is already open."));
+            return 0;
+        }
+        QMessageBox::critical(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                              QStringLiteral("Frankie's Karaoke Studio cannot safely use its data folder"
+                                             "\n\n%1\n\nThe program will close without changing anything.")
+                                  .arg(QDir::toNativeSeparators(appDataPath)));
+        return 1;
     }
+    if (probe)
+        return 0;
 
     const QString logFile = logging::install();
     qCInfo(lcApp) << "Frankie's Karaoke Studio" << FKS_VERSION << "starting; Qt" << qVersion()
@@ -188,6 +207,7 @@ int main(int argc, char* argv[])
             window.setWindowState(window.windowState() & ~Qt::WindowFullScreen);
             window.show();
         }
+        window.setKeepScaleWithinScreen(true);
         qCInfo(lcApp) << "Main window shown" << launch.elapsed() << "ms after launch";
         // For automated checks: --music-folder <folder> chooses the music
         // folder exactly as Settings does, with the same safety checks.

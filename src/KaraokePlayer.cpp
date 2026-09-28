@@ -114,6 +114,11 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
     const QDir programFolder(QCoreApplication::applicationDirPath());
     const QString bundledPlugins = programFolder.filePath(QStringLiteral("lib/gstreamer-1.0"));
     if (QFileInfo(bundledPlugins).isDir()) {
+        // Only the program's own plugin list, whatever the computer has set.
+        const QString registry = QDir(appstorage::folder()).filePath(
+            QStringLiteral("gstreamer-registry-%1.bin").arg(QSysInfo::buildCpuArchitecture()));
+        qunsetenv("GST_REGISTRY");
+        setEnvironmentPath("GST_REGISTRY_1_0", registry);
         setEnvironmentPath("GST_PLUGIN_SYSTEM_PATH_1_0", bundledPlugins);
         for (const QString& scannerName : {QStringLiteral("gst-plugin-scanner.exe"),
                                            QStringLiteral("gst-plugin-scanner")}) {
