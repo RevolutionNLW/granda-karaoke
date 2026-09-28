@@ -1,0 +1,3 @@
+# Windows helper scripts and notes in the package must keep CRLF endings.
+packaging/windows/*.cmd text eol=crlf
+packaging/windows/*.txt text eol=crlf

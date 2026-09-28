@@ -189,12 +189,18 @@ int main(int argc, char* argv[])
             window.show();
         }
         qCInfo(lcApp) << "Main window shown" << launch.elapsed() << "ms after launch";
+        // For automated checks: --music-folder <folder> chooses the music
+        // folder exactly as Settings does, with the same safety checks.
+        if (const qsizetype option = launchArguments.indexOf(QStringLiteral("--music-folder")); option >= 0) {
+            QString refused;
+            if (!libraryController.chooseRoot(launchArguments.value(option + 1), &refused))
+                qCWarning(lcApp).noquote() << "Music folder refused:" << refused;
+        }
         libraryController.startConfiguredScan();
 
         // Optional: a song path on the command line is opened at start-up.
-        const QStringList args = QApplication::arguments();
-        if (args.size() > 1 && !args.at(1).startsWith(QLatin1Char('-')))
-            window.openSong(args.at(1));
+        if (launchArguments.size() > 1 && !launchArguments.at(1).startsWith(QLatin1Char('-')))
+            window.openSong(launchArguments.at(1));
 
         result = app.exec();
         // The library scanner is stopped and its thread ended before anything

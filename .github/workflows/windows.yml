@@ -157,3 +157,63 @@ jobs:
             build/Testing/Temporary/LastTest.log
             ${{ runner.temp }}/gstreamer-install.log
           if-no-files-found: ignore
+
+      - name: Package (portable x64 folder)
+        shell: pwsh
+        run: >
+          ./packaging/windows/package.ps1
+          -BuildDir build -QtPrefix "$env:QT_PREFIX" -GStreamerRoot "$env:GSTREAMER_ROOT"
+          -Output "$env:RUNNER_TEMP/FrankiesKaraokeStudio-Windows-x64"
+
+      # Downloads as FrankiesKaraokeStudio-Windows-x64.zip.
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrankiesKaraokeStudio-Windows-x64
+          path: ${{ runner.temp }}/FrankiesKaraokeStudio-Windows-x64
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrankiesKaraokeStudio-Windows-x64-symbols
+          path: build/FrankiesKaraokeStudio.pdb
+          if-no-files-found: warn
+          retention-days: 30
+
+  # A fresh Windows machine with no Qt, GStreamer or build tools, as on the
+  # laptop: the package must run from its own folder alone.
+  package-smoke-test:
+    needs: build-test
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: packaging/windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: FrankiesKaraokeStudio-Windows-x64
+          path: ${{ runner.temp }}/package
+
+      - name: Run the packaged program on a clean machine
+        shell: pwsh
+        run: ./packaging/windows/smoke-test.ps1 -Package "$env:RUNNER_TEMP/package"
+
+      - name: Collect smoke-test logs
+        if: always()
+        shell: pwsh
+        run: |
+          $logs = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/smoke-logs"
+          Copy-Item "$env:RUNNER_TEMP/installation-check.txt" $logs -ErrorAction SilentlyContinue
+          Copy-Item "$env:LOCALAPPDATA/Granda/FrankiesKaraokeStudio/*.log*" $logs -ErrorAction SilentlyContinue
+
+      - name: Upload smoke-test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-test-logs
+          path: ${{ runner.temp }}/smoke-logs
+          if-no-files-found: ignore
