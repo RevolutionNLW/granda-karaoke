@@ -681,6 +681,9 @@ void TestCatalogue::scannerRobustness()
 
     QCOMPARE(runScan(db, root).value(QStringLiteral("status")).toString(),
              QStringLiteral("completed"));
+#ifndef Q_OS_WIN
+    // Windows file permissions (a read-only flag) cannot make a folder
+    // unreadable, so that part runs elsewhere only.
     QVERIFY(QFile::setPermissions(restricted, QFileDevice::Permissions()));
     QVERIFY(!QDir(restricted).isReadable());
     const QVariantMap summary = runScan(db, root);
@@ -688,6 +691,7 @@ void TestCatalogue::scannerRobustness()
     const QVariantMap counts = summary.value(QStringLiteral("counts")).toMap();
     QCOMPARE(counts.value(QStringLiteral("walkComplete")).toBool(), false);
     QCOMPARE(counts.value(QStringLiteral("skippedUnreadableDirectories")).toLongLong(), 1LL);
+#endif
 
     Catalogue catalogue(db);
     QString error;

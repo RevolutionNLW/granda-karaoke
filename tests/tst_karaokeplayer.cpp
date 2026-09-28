@@ -3,6 +3,7 @@
 // time without needing a sound device.
 
 #include "KaraokePlayer.h"
+#include "AudioOutputs.h"
 #include "BusTestPlayer.h"
 #include "SongPair.h"
 #include "TestMedia.h"
@@ -112,6 +113,8 @@ private slots:
     void rejectedLyricsPreservePlayback_data();
     void rejectedLyricsPreservePlayback();
     void explicitSinkDoesNotReportUnavailableOutput();
+    void windowsOutputsAreOfferedOnce();
+    void startupChecksEveryKaraokeComponent();
     void defaultSinkReportsUnavailableOutput();
     void skippedInstructionsAreSummarised_data();
     void skippedInstructionsAreSummarised();
@@ -767,6 +770,53 @@ void TestKaraokePlayer::rejectedLyricsPreservePlayback()
         QVERIFY(player.lastError().contains("empty or damaged"));
     QTRY_VERIFY_WITH_TIMEOUT(player.positionMs() > position + 100, 1500);
     QCOMPARE(player.state(), State::Playing);
+}
+
+void TestKaraokePlayer::windowsOutputsAreOfferedOnce()
+{
+    // Windows lists each speaker once per sound system; only the newest
+    // system's entries are offered, so nothing appears two or three times.
+    const QStringList all{QStringLiteral("wasapi2"), QStringLiteral("wasapi"), QStringLiteral("directsound")};
+    QVERIFY(audio::offerDeviceOf(QStringLiteral("wasapi2"), all));
+    QVERIFY(!audio::offerDeviceOf(QStringLiteral("wasapi"), all));
+    QVERIFY(!audio::offerDeviceOf(QStringLiteral("directsound"), all));
+    const QStringList older{QStringLiteral("wasapi"), QStringLiteral("directsound")};
+    QVERIFY(audio::offerDeviceOf(QStringLiteral("wasapi"), older));
+    QVERIFY(!audio::offerDeviceOf(QStringLiteral("directsound"), older));
+    QVERIFY(audio::offerDeviceOf(QStringLiteral("directsound"), {QStringLiteral("directsound")}));
+    // Other systems (macOS, Linux) are never filtered.
+    QVERIFY(audio::offerDeviceOf(QStringLiteral("GstOsxAudioDevice"),
+                                 {QStringLiteral("GstOsxAudioDevice"), QStringLiteral("wasapi2")}));
+    // Whatever this computer has, no output is offered twice by id.
+    QStringList ids;
+    for (const audio::Output& output : audio::outputs()) {
+        QVERIFY2(!ids.contains(output.id), qPrintable(output.id));
+        ids.append(output.id);
+    }
+    qInfo() << "Sound outputs here:" << ids.size();
+}
+
+void TestKaraokePlayer::startupChecksEveryKaraokeComponent()
+{
+    // initTestCase has started GStreamer through the same check the
+    // program uses; every component it names must really be there.
+    QStringList names;
+    for (const char* name : KaraokePlayer::requiredElements())
+        names.append(QLatin1String(name));
+    for (const QString& needed : {QStringLiteral("playbin"), QStringLiteral("pitch"), QStringLiteral("scaletempo"),
+                                  QStringLiteral("mpg123audiodec"), QStringLiteral("id3demux"),
+                                  QStringLiteral("autoaudiosink")})
+        QVERIFY2(names.contains(needed), qPrintable(needed));
+    for (const QString& name : std::as_const(names)) {
+        GstElementFactory* factory = gst_element_factory_find(name.toLatin1().constData());
+        QVERIFY2(factory, qPrintable(name));
+        gst_object_unref(factory);
+    }
+    // The user is told plainly, without plugin names.
+    const QString message = KaraokePlayer::missingAudioComponentsMessage();
+    QVERIFY(message.contains(QStringLiteral("karaoke audio components are missing")));
+    for (const QString& name : std::as_const(names))
+        QVERIFY2(!message.contains(name), qPrintable(name));
 }
 
 void TestKaraokePlayer::explicitSinkDoesNotReportUnavailableOutput()

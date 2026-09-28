@@ -1,10 +1,11 @@
 #include "Logging.h"
 
+#include "AppStorage.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QMutex>
-#include <QStandardPaths>
 
 #include <cstdio>
 
@@ -54,7 +55,7 @@ namespace logging {
 
 QString install()
 {
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    const QString dir = appstorage::folder();
     QString path;
     if (!dir.isEmpty() && QDir().mkpath(dir)) {
         path = QDir(dir).filePath(QStringLiteral("frankies-karaoke-studio.log"));

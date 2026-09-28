@@ -25,6 +25,11 @@ QStringList outputNames();
 // nullptr if it is not there (unplugged, renamed). The caller owns the
 // returned (floating) element.
 GstElement* createSink(const QString& output);
+// Windows reports every speaker once for each sound system GStreamer can use
+// (WASAPI2, WASAPI, DirectSound). Given the systems of all the devices found,
+// true if a device of `system` should be offered: only the newest system's.
+// Elsewhere every device is offered.
+bool offerDeviceOf(const QString& system, const QStringList& systemsFound);
 
 // Finds the outputs on a worker thread (asking the system can take a moment)
 // and remembers them for the whole session; refresh() looks again. Only one

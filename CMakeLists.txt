@@ -33,6 +33,8 @@ target_include_directories(fks_cdg PUBLIC src)
 # Read-only song-library parsing primitives.  This target deliberately has no
 # UI or media-playback dependency so the parsers remain independently testable.
 add_library(fks_library STATIC
+    src/AppStorage.cpp
+    src/AppStorage.h
     src/library/Catalogue.cpp
     src/library/Catalogue.h
     src/library/CatalogueTools.cpp
@@ -126,6 +128,8 @@ add_library(fks_core STATIC
     src/MainWindow.h
     src/SettingsDialog.cpp
     src/SettingsDialog.h
+    src/SelfCheck.cpp
+    src/SelfCheck.h
     src/Shutdown.cpp
     src/Shutdown.h
     src/ui/Controls.cpp

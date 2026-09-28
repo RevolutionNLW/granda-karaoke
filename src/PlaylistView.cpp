@@ -251,19 +251,19 @@ protected:
 
     QMimeData* mimeData(const QList<QListWidgetItem*>& items) const override
     {
-        QMimeData* data = QListWidget::mimeData(items);
+        QMimeData* mime = QListWidget::mimeData(items);
         if (items.size() == 1) {
             const qint64 itemId = items.first()->data(ItemIdRole).toLongLong();
             if (itemId != 0)
-                data->setData(PlaylistItemMimeType, QByteArray::number(itemId));
+                mime->setData(PlaylistItemMimeType, QByteArray::number(itemId));
         }
-        return data;
+        return mime;
     }
 
-    bool dropMimeData(int, const QMimeData* data, Qt::DropAction) override
+    bool dropMimeData(int, const QMimeData* mime, Qt::DropAction) override
     {
-        return data && (data->hasFormat(LibraryResultsModel::SongMimeType)
-                        || data->hasFormat(PlaylistItemMimeType));
+        return mime && (mime->hasFormat(LibraryResultsModel::SongMimeType)
+                        || mime->hasFormat(PlaylistItemMimeType));
     }
 
     Qt::DropActions supportedDropActions() const override

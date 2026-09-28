@@ -6,6 +6,7 @@
 
 #include <QElapsedTimer>
 #include <QImage>
+#include <QList>
 #include <QObject>
 #include <QString>
 #include <QTimer>
@@ -43,6 +44,10 @@ public:
     // Initialises GStreamer and checks that the required elements exist.
     // Must be called once before creating a player.
     static bool initializeGStreamer(QString* errorMessage);
+    // The GStreamer elements a karaoke song needs, all checked at start-up.
+    static QList<const char*> requiredElements();
+    // What the user is told when any of them is missing (no plugin names).
+    static QString missingAudioComponentsMessage();
 
     // Validates the lyrics before replacing the current song. Rejected lyrics
     // emit errorOccurred and return false without disturbing playback.

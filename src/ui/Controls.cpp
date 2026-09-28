@@ -89,7 +89,7 @@ public:
     {
         QColor color = m_color;
         if (mode == QIcon::Disabled)
-            color.setAlphaF(0.35);
+            color.setAlphaF(0.35f);
         painter->save();
         drawGlyph(*painter, m_glyph, rect, color);
         painter->restore();
@@ -210,7 +210,7 @@ void ToggleSwitch::paintEvent(QPaintEvent*)
     const qreal radius = track.height() / 2;
     QColor fill = isChecked() ? theme::color::accent : QColor(0x3a, 0x3d, 0x44);
     if (!isEnabled())
-        fill.setAlphaF(0.4);
+        fill.setAlphaF(0.4f);
     painter.setPen(Qt::NoPen);
     painter.setBrush(fill);
     painter.drawRoundedRect(track, radius, radius);

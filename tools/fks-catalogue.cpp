@@ -201,6 +201,12 @@ int main(int argc, char* argv[])
         if (args.size() != 1)
             return usage(QStringLiteral("%1 requires one file").arg(command));
         const bool exporting = command == QLatin1String("title-screens-export");
+        // Every music folder the application knows, not only this
+        // catalogue's: the file is never written or read inside one.
+        if (!Catalogue::storageIsSafe(args.first(), {}, knownRoots, &error)) {
+            QTextStream(stderr) << error << '\n';
+            return 1;
+        }
         const QVariantMap output = exporting
             ? CatalogueTools::exportTitleScreens(catalogue, args.first(), &error)
             : CatalogueTools::importTitleScreens(catalogue, args.first(), &error);

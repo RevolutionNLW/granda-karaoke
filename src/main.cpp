@@ -1,11 +1,14 @@
 #include "AppPreferences.h"
+#include "AppStorage.h"
 #include "BackgroundWork.h"
 #include "KaraokePlayer.h"
 #include "LibraryController.h"
 #include "Logging.h"
 #include "MainWindow.h"
+#include "SelfCheck.h"
 #include "Shutdown.h"
 #include "SongSettings.h"
+#include "library/Catalogue.h"
 #include "library/KnownLibraryRoots.h"
 #include "playlist/PlaylistStore.h"
 #include "ui/Controls.h"
@@ -16,9 +19,10 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QMessageBox>
 #include <QScreen>
-#include <QStandardPaths>
+#include <QSysInfo>
 
 #include <cstdlib>
 
@@ -34,9 +38,56 @@ int main(int argc, char* argv[])
     theme::apply(app);
     QApplication::setWindowIcon(ui::glyphIcon(ui::Glyph::App, theme::color::accent));
 
+    // Everything the program writes lives in its own folder (see AppStorage).
+    // Nothing is written anywhere until it is certain that folder is not
+    // inside a music folder (only a system that moved it there could do that).
+    const QString appDataPath = appstorage::folder();
+    for (const QString& root : KnownLibraryRoots::load()) {
+        if (!appDataPath.isEmpty() && Catalogue::pathIsInsideOrEqual(appDataPath, root)) {
+            QMessageBox::critical(
+                nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                QStringLiteral("Frankie's Karaoke Studio cannot start: its own data folder\n\n%1\n\n"
+                               "is inside the music folder\n\n%2\n\nNothing has been changed.")
+                    .arg(QDir::toNativeSeparators(appDataPath), QDir::toNativeSeparators(root)));
+            return 1;
+        }
+    }
+
+    // Installation check: FrankiesKaraokeStudio --self-check <report> [<song.mp3>]
+    const QStringList launchArguments = QApplication::arguments();
+    if (const qsizetype check = launchArguments.indexOf(QStringLiteral("--self-check")); check >= 0)
+        return selfcheck::run(launchArguments.value(check + 1), launchArguments.value(check + 2));
+
+    QDir().mkpath(appDataPath);
+
+    // One copy at a time. Windows does not stop a second copy when the icon
+    // is opened twice, and two copies would share the same databases and log.
+    // The lock is held by this process only; a crashed copy's lock is taken
+    // over (its process no longer exists), never after a time limit.
+    QLockFile instanceLock(QDir(appDataPath).filePath(QStringLiteral("running.lock")));
+    instanceLock.setStaleLockTime(0);
+    if (!appDataPath.isEmpty() && !instanceLock.tryLock(0)
+        && instanceLock.error() == QLockFile::LockFailedError) {
+        QMessageBox::information(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                                 QStringLiteral("Frankie's Karaoke Studio is already open."));
+        return 0;
+    }
+
     const QString logFile = logging::install();
     qCInfo(lcApp) << "Frankie's Karaoke Studio" << FKS_VERSION << "starting; Qt" << qVersion()
                   << "log file:" << (logFile.isEmpty() ? QStringLiteral("(none)") : logFile);
+    qCInfo(lcApp).noquote() << "System:" << QSysInfo::prettyProductName()
+                            << "kernel" << QSysInfo::kernelVersion()
+                            << QSysInfo::currentCpuArchitecture()
+                            << "| platform" << QGuiApplication::platformName();
+    qCInfo(lcApp).noquote() << "Program folder:" << QCoreApplication::applicationDirPath();
+    qCInfo(lcApp).noquote() << "Program data folder:" << appDataPath;
+    if (const QScreen* primary = QGuiApplication::primaryScreen()) {
+        qCInfo(lcApp) << "Primary screen" << primary->size() << "available" << primary->availableGeometry()
+                      << "device pixel ratio" << primary->devicePixelRatio()
+                      << "logical DPI" << primary->logicalDotsPerInch()
+                      << "screens" << QGuiApplication::screens().size();
+    }
 
     QString error;
     if (!KaraokePlayer::initializeGStreamer(&error)) {
@@ -48,14 +99,10 @@ int main(int argc, char* argv[])
     int result = 0;
     {
         KaraokePlayer player;
-        const QString appDataPath = QStandardPaths::writableLocation(
-            QStandardPaths::AppDataLocation);
-        QDir().mkpath(appDataPath);
         const QString settingsPath = QDir(appDataPath).filePath(
             QStringLiteral("song-settings.json"));
         SongSettingsStore settingsStore(settingsPath);
-        const QString cataloguePath = QDir(QStandardPaths::writableLocation(
-            QStandardPaths::AppLocalDataLocation)).filePath(QStringLiteral("library.sqlite"));
+        const QString cataloguePath = QDir(appDataPath).filePath(QStringLiteral("library.sqlite"));
         const QString playlistsPath = QDir(appDataPath).filePath(
             QStringLiteral("playlists.sqlite"));
         const QString overridesPath = QDir(appDataPath).filePath(
@@ -94,6 +141,21 @@ int main(int argc, char* argv[])
         });
         AppPreferences& settings = libraryController.hasPreferences() ? storedPreferences : preferences;
         theme::setScalePercent(settings.number(pref::ScalePercent, 100));
+        {
+            const CatalogueRoot root = libraryController.activeRoot();
+            qCInfo(lcApp).noquote() << "Catalogue:" << cataloguePath
+                                    << (libraryController.isAvailable() ? QString() : QStringLiteral("(unavailable)"));
+            qCInfo(lcApp).noquote() << "Music folder:"
+                                    << (root.path.isEmpty() ? QStringLiteral("(none chosen)") : root.path)
+                                    << (root.path.isEmpty() ? QString()
+                                        : libraryController.isRootConnected() ? QStringLiteral("(connected)")
+                                                                              : QStringLiteral("(not connected)"));
+            const QString output = settings.text(pref::AudioOutput);
+            qCInfo(lcApp).noquote() << "Sound output:"
+                                    << (output.isEmpty() ? QStringLiteral("system default") : output)
+                                    << "| volume" << settings.number(pref::Volume, 100) << "%"
+                                    << "| UI scale" << theme::scalePercent() << "%";
+        }
         theme::setCompactRows(settings.flag(pref::CompactRows, false));
         theme::setAlternateRows(settings.flag(pref::AlternateRows, true));
         applyStartupChoices(settings, playlistStore);

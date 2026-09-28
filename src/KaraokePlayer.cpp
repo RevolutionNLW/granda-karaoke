@@ -1,16 +1,19 @@
 #include "KaraokePlayer.h"
 
+#include "AppStorage.h"
 #include "AudioOutputs.h"
 #include "Logging.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QStandardPaths>
 #include <QSysInfo>
 #include <QUrl>
 
 #include <gst/gst.h>
+
+#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -51,25 +54,76 @@ KaraokePlayer::~KaraokePlayer()
     destroyPipeline();
 }
 
+namespace {
+
+// A file path for GStreamer in an environment variable. GLib reads the
+// Windows environment as UTF-16, so any user or folder name survives there.
+void setEnvironmentPath(const char* name, const QString& path)
+{
+#ifdef Q_OS_WIN
+    const QString wideName = QString::fromLatin1(name);
+    const QString widePath = QDir::toNativeSeparators(path);
+    _wputenv_s(reinterpret_cast<const wchar_t*>(wideName.utf16()),
+               reinterpret_cast<const wchar_t*>(widePath.utf16()));
+#else
+    qputenv(name, QFile::encodeName(path));
+#endif
+}
+
+} // namespace
+
+QList<const char*> KaraokePlayer::requiredElements()
+{
+    return {"playbin", "decodebin", "uridecodebin", "typefind", "filesrc",
+            "id3demux", "mpegaudioparse", "mpg123audiodec",
+            "audioconvert", "audioresample", "capsfilter", "volume",
+            "scaletempo", "pitch", "autoaudiosink", "audiotestsrc", "fakesink"};
+}
+
+QString KaraokePlayer::missingAudioComponentsMessage()
+{
+    return QStringLiteral("Frankie's Karaoke Studio could not start because the karaoke audio "
+                          "components are missing.\n\nPlease reinstall the program.");
+}
+
 bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
 {
     // Use a registry private to this application so a different GStreamer
     // installation on the same machine cannot interfere with plugin discovery.
     if (!qEnvironmentVariableIsSet("GST_REGISTRY")) {
-        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+        const QString dir = appstorage::folder();
         if (!dir.isEmpty() && QDir().mkpath(dir)) {
             const QString registry = QDir(dir).filePath(
                 QStringLiteral("gstreamer-registry-%1.bin").arg(QSysInfo::buildCpuArchitecture()));
-            qputenv("GST_REGISTRY", QFile::encodeName(registry));
+            setEnvironmentPath("GST_REGISTRY", registry);
         }
     }
 
     for (const char* name : {"GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0",
-                             "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0"}) {
+                             "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
+                             "GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0"}) {
         if (qEnvironmentVariableIsSet(name)) {
             qCInfo(lcPlayer) << "Ignoring external plugin path" << name << "=" << qgetenv(name);
             qunsetenv(name);
         }
+    }
+
+    // A packaged copy carries its own audio components beside the program
+    // (lib/gstreamer-1.0). They are the only ones used, whatever else is
+    // installed on the computer, and its own plugin scanner checks them.
+    const QDir programFolder(QCoreApplication::applicationDirPath());
+    const QString bundledPlugins = programFolder.filePath(QStringLiteral("lib/gstreamer-1.0"));
+    if (QFileInfo(bundledPlugins).isDir()) {
+        setEnvironmentPath("GST_PLUGIN_SYSTEM_PATH_1_0", bundledPlugins);
+        for (const QString& scannerName : {QStringLiteral("gst-plugin-scanner.exe"),
+                                           QStringLiteral("gst-plugin-scanner")}) {
+            const QString scanner = programFolder.filePath(scannerName);
+            if (QFileInfo(scanner).isFile()) {
+                setEnvironmentPath("GST_PLUGIN_SCANNER_1_0", scanner);
+                break;
+            }
+        }
+        qCInfo(lcPlayer).noquote() << "Using the packaged audio components in" << bundledPlugins;
     }
 
     GError* error = nullptr;
@@ -77,7 +131,7 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
         qCCritical(lcPlayer) << "gst_init_check failed:" << (error ? error->message : "unknown error");
         g_clear_error(&error);
         if (errorMessage)
-            *errorMessage = QStringLiteral("The audio system (GStreamer) could not be started.");
+            *errorMessage = missingAudioComponentsMessage();
         return false;
     }
 
@@ -89,17 +143,29 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
         qCInfo(lcPlayer) << "Loaded coreelements:" << gst_plugin_get_filename(plugin);
         gst_object_unref(plugin);
     }
-    for (const char* name : {"playbin", "autoaudiosink", "pitch", "scaletempo",
-                             "audioconvert", "audioresample", "capsfilter"}) {
+    // Every piece a karaoke song needs: none may be missing, or songs would
+    // load and then play silently or not at all. The names go to the log only.
+    QStringList missing;
+    for (const char* name : requiredElements()) {
         GstElementFactory* factory = gst_element_factory_find(name);
         if (!factory) {
-            qCCritical(lcPlayer) << "Required GStreamer element missing:" << name;
-            if (errorMessage)
-                *errorMessage = QStringLiteral("The audio system is incomplete (missing \"%1\"). "
-                                               "Please reinstall the application.").arg(QLatin1String(name));
-            return false;
+            missing.append(QLatin1String(name));
+            continue;
         }
+        GstPlugin* plugin = gst_plugin_feature_get_plugin(GST_PLUGIN_FEATURE(factory));
+        qCInfo(lcPlayer).noquote() << "Audio component" << name << "from"
+                                   << (plugin && gst_plugin_get_filename(plugin)
+                                           ? QString::fromUtf8(gst_plugin_get_filename(plugin))
+                                           : QStringLiteral("(built in)"));
+        if (plugin)
+            gst_object_unref(plugin);
         gst_object_unref(factory);
+    }
+    if (!missing.isEmpty()) {
+        qCCritical(lcPlayer).noquote() << "Required GStreamer elements missing:" << missing.join(QStringLiteral(", "));
+        if (errorMessage)
+            *errorMessage = missingAudioComponentsMessage();
+        return false;
     }
     return true;
 }

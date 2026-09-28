@@ -14,18 +14,43 @@ namespace audio {
 
 namespace {
 
-// Every sound output the system reports, each with a reference the caller
-// must release with gst_object_unref.
+// Which sound system a device belongs to: its GStreamer class, which names
+// it whatever properties the system reports.
+QString deviceSystem(GstDevice* device)
+{
+    const QString type = QString::fromLatin1(G_OBJECT_TYPE_NAME(device));
+    if (type.contains(QLatin1String("Wasapi2")))
+        return QStringLiteral("wasapi2");
+    if (type.contains(QLatin1String("Wasapi")))
+        return QStringLiteral("wasapi");
+    if (type.contains(QLatin1String("DirectSound")))
+        return QStringLiteral("directsound");
+    return type;
+}
+
+// Every sound output the system reports (once each), each with a reference
+// the caller must release with gst_object_unref.
 QList<GstDevice*> sinkDevices()
 {
-    QList<GstDevice*> result;
+    QList<GstDevice*> found;
     GstDeviceMonitor* monitor = gst_device_monitor_new();
     gst_device_monitor_add_filter(monitor, "Audio/Sink", nullptr);
     GList* devices = gst_device_monitor_get_devices(monitor);
     for (GList* item = devices; item; item = item->next)
-        result.append(GST_DEVICE(item->data));  // the list's reference moves to us
+        found.append(GST_DEVICE(item->data));  // the list's reference moves to us
     g_list_free(devices);
     gst_object_unref(monitor);
+
+    QStringList systems;
+    for (GstDevice* device : std::as_const(found))
+        systems.append(deviceSystem(device));
+    QList<GstDevice*> result;
+    for (qsizetype i = 0; i < found.size(); ++i) {
+        if (offerDeviceOf(systems.at(i), systems))
+            result.append(found.at(i));
+        else
+            gst_object_unref(found.at(i));
+    }
     return result;
 }
 
@@ -38,6 +63,21 @@ QString deviceName(GstDevice* device)
 }
 
 } // namespace
+
+bool offerDeviceOf(const QString& system, const QStringList& systemsFound)
+{
+    // Newest first; a device of an older system is a repeat of a newer one's.
+    static const QStringList windowsSystems{QStringLiteral("wasapi2"), QStringLiteral("wasapi"),
+                                            QStringLiteral("directsound")};
+    const qsizetype rank = windowsSystems.indexOf(system);
+    if (rank < 0)
+        return true;
+    for (qsizetype newer = 0; newer < rank; ++newer) {
+        if (systemsFound.contains(windowsSystems.at(newer)))
+            return false;
+    }
+    return true;
+}
 
 // A device's own lasting id, where its system gives one.
 QString deviceId(GstDevice* device)

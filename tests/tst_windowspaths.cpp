@@ -5,6 +5,7 @@
 // folder, and a sibling folder such as C:/Karaoke2 is never mistaken for
 // part of C:/Karaoke. Every other platform runs the portable part.
 
+#include "AppStorage.h"
 #include "library/Catalogue.h"
 #include "library/LibraryScanner.h"
 #include "library/MetadataOverrideStore.h"
@@ -19,6 +20,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QScopeGuard>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -117,6 +119,7 @@ private slots:
     void substitutedDriveIsRecognised();
     void longPathsAreCompared();
     void uncShareContainment();
+    void programDataFolderIsLocalAndOwnedByTheProgram();
 };
 
 void TestWindowsPaths::containment_data()
@@ -479,6 +482,38 @@ void TestWindowsPaths::uncShareContainment()
     QVERIFY(!Catalogue::pathIsInsideOrEqual(QStringLiteral("C:/Karaoke/x.sqlite"),
                                             share + QStringLiteral("/Karaoke")));
     qInfo() << "UNC comparisons took" << timer.elapsed() << "ms";
+#endif
+}
+
+void TestWindowsPaths::programDataFolderIsLocalAndOwnedByTheProgram()
+{
+    // The names main() sets; everything the program writes lives here.
+    QCoreApplication::setOrganizationName(QStringLiteral("Granda"));
+    QCoreApplication::setApplicationName(QStringLiteral("FrankiesKaraokeStudio"));
+    const auto restore = qScopeGuard([] {
+        QCoreApplication::setOrganizationName({});
+        QCoreApplication::setApplicationName(QStringLiteral("tst_windowspaths"));
+    });
+    const QString folder = appstorage::folder();
+    qInfo().noquote() << "Program data folder:" << folder;
+    QVERIFY(!folder.isEmpty());
+    QVERIFY(folder.endsWith(QStringLiteral("/Granda/FrankiesKaraokeStudio")));
+    const QString programFolder = QCoreApplication::applicationDirPath();
+    QVERIFY(!Catalogue::pathIsInsideOrEqual(folder, programFolder));
+    QVERIFY(!Catalogue::pathIsInsideOrEqual(
+        folder, QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)));
+    QVERIFY(!Catalogue::pathIsInsideOrEqual(
+        folder, QStandardPaths::writableLocation(QStandardPaths::DesktopLocation)));
+#ifdef Q_OS_WIN
+    // %LOCALAPPDATA%, not the roaming profile.
+    const QString local = QDir::fromNativeSeparators(qEnvironmentVariable("LOCALAPPDATA"));
+    QVERIFY(!local.isEmpty());
+    QCOMPARE(folder.toCaseFolded(), (local + QStringLiteral("/Granda/FrankiesKaraokeStudio")).toCaseFolded());
+    const QString roaming = QDir::fromNativeSeparators(qEnvironmentVariable("APPDATA"));
+    QVERIFY(!Catalogue::pathIsInsideOrEqual(folder, roaming));
+#elif defined(Q_OS_MACOS)
+    // Unchanged on macOS: both locations are the same folder there.
+    QCOMPARE(folder, QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
 #endif
 }
 

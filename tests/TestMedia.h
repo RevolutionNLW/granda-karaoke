@@ -27,7 +27,12 @@ inline bool writeMp3(const QString& path, int durationMs)
         return false;
     }
     GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "out");
-    g_object_set(sink, "location", QFile::encodeName(path).constData(), nullptr);
+#ifdef Q_OS_WIN
+    const QByteArray location = path.toUtf8();  // GLib file names are UTF-8 on Windows
+#else
+    const QByteArray location = QFile::encodeName(path);
+#endif
+    g_object_set(sink, "location", location.constData(), nullptr);
     gst_object_unref(sink);
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);

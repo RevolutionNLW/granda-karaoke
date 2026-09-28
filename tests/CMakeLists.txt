@@ -13,7 +13,8 @@ function(fks_add_test name)
     add_test(NAME ${name} COMMAND ${name})
     if(WIN32)
         set_tests_properties(${name} PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${GSTREAMER_ROOT}/bin")
+            ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:${GSTREAMER_ROOT}/bin;PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
     endif()
     if(ARG_ENV)
         set_tests_properties(${name} PROPERTIES ENVIRONMENT "${ARG_ENV}")
@@ -38,6 +39,13 @@ fks_add_test(tst_metadatareview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_librarysort LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_settings LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_splash LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
+
+# Synthetic songs for trying an installation (packaged with Windows builds).
+add_executable(fks-make-test-songs fks-make-test-songs.cpp CdgTestData.h)
+target_link_libraries(fks-make-test-songs PRIVATE Qt6::Core GStreamer::GStreamer)
+if(MSVC)
+    target_compile_options(fks-make-test-songs PRIVATE /utf-8)
+endif()
 
 # Closing while the library scanner is busy; the helper runs the program's
 # closing sequence in a process of its own.
