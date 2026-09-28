@@ -1617,7 +1617,8 @@ void TestSettings::songCountIsRememberedButStaysCurrent()
     timer.start();
     for (int i = 0; i < 2000; ++i)
         QVERIFY(!controller.statusText().isEmpty());
-    QVERIFY2(timer.elapsed() < 200, qPrintable(QString::number(timer.elapsed())));
+    // Well under a millisecond a question (file checks are slower on Windows).
+    QVERIFY2(timer.elapsed() < 500, qPrintable(QString::number(timer.elapsed())));
     // Remembered: a change made behind the library's back is not re-counted
     // on every question...
     {

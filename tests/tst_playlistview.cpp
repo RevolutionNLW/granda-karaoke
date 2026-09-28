@@ -2065,6 +2065,16 @@ void TestPlaylistView::onlyThePaneInUsePaintsItsSelectionGold()
 
 void TestPlaylistView::panesStayReadableOnALaptopScreenAtEveryScale()
 {
+    // The look the program has from its start (font sizes and style sheet),
+    // before any window is made; the rest of this file runs without it.
+    auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
+    const QFont plainFont = QApplication::font();
+    theme::apply(*app);
+    const auto plain = qScopeGuard([app, plainFont] {
+        theme::setScalePercent(100);
+        app->setStyleSheet(QString());
+        QApplication::setFont(plainFont);
+    });
     QTemporaryDir temporary;
     LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
     prepareLibrary(temporary, controller);
@@ -2093,6 +2103,9 @@ void TestPlaylistView::panesStayReadableOnALaptopScreenAtEveryScale()
     };
     for (const int percent : {80, 100, 110, 125, 150}) {
         theme::setScalePercent(percent);
+        // The new font reaches the widgets through posted events.
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::ApplicationFontChange);
+        QCoreApplication::processEvents();
         const QString at = QStringLiteral("at %1%").arg(percent);
         // A 1366x768 laptop, with room left for the taskbar and title bar.
         QVERIFY2(window.minimumSizeHint().width() <= 1366, qPrintable(at));
