@@ -229,9 +229,21 @@ jobs:
           name: FrankiesKaraokeStudio-Windows-x64
           path: ${{ runner.temp }}/package
 
+      # A virtual sound card (VB-CABLE) on this throwaway machine, so real
+      # Windows sound output is exercised. Pinned to a reviewed commit.
+      - name: Windows Audio service
+        shell: pwsh
+        run: |
+          Set-Service -Name Audiosrv -StartupType Automatic
+          Start-Service -Name Audiosrv
+          Get-Service Audiosrv, AudioEndpointBuilder | Format-Table -AutoSize Name, Status
+
+      - name: Virtual sound card
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf  # v1.0.4
+
       - name: Run the packaged program on a clean machine
         shell: pwsh
-        run: ./packaging/windows/smoke-test.ps1 -Package "$env:RUNNER_TEMP/package"
+        run: ./packaging/windows/smoke-test.ps1 -Package "$env:RUNNER_TEMP/package" -ExpectSound
 
       - name: Collect smoke-test logs
         if: always()

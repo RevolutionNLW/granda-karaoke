@@ -141,7 +141,9 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
     }
 
     gchar* version = gst_version_string();
-    qCInfo(lcPlayer) << "Initialised" << version << "registry:" << qgetenv("GST_REGISTRY");
+    qCInfo(lcPlayer) << "Initialised" << version << "registry:"
+                     << (qEnvironmentVariableIsSet("GST_REGISTRY_1_0") ? qgetenv("GST_REGISTRY_1_0")
+                                                                       : qgetenv("GST_REGISTRY"));
     g_free(version);
 
     if (GstPlugin* plugin = gst_plugin_load_by_name("coreelements")) {

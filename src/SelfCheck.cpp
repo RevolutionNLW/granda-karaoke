@@ -179,6 +179,43 @@ void checkPlayback(Report& report, const QString& songPath)
     player.stop();
 }
 
+// A short, quiet beep through the computer's default sound output, as a
+// song would play: proves the speakers (or headphones) can be opened.
+void checkDefaultOutput(Report& report)
+{
+    GError* error = nullptr;
+    GstElement* pipeline = gst_parse_launch(
+        "audiotestsrc num-buffers=25 freq=880 volume=0.15 ! audioconvert ! audioresample "
+        "! autoaudiosink", &error);
+    if (!pipeline) {
+        report.check(false, QStringLiteral("A beep plays through the default sound output"),
+                     error ? QString::fromUtf8(error->message) : QString());
+        g_clear_error(&error);
+        return;
+    }
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    GstBus* bus = gst_element_get_bus(pipeline);
+    GstMessage* message = gst_bus_timed_pop_filtered(
+        bus, 10 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    QString detail;
+    bool ok = message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
+    if (message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+        GError* failure = nullptr;
+        gst_message_parse_error(message, &failure, nullptr);
+        detail = failure ? QString::fromUtf8(failure->message) : QString();
+        g_clear_error(&failure);
+    } else if (!message) {
+        detail = QStringLiteral("no answer within 10 seconds");
+    }
+    if (message)
+        gst_message_unref(message);
+    gst_object_unref(bus);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    report.check(ok, QStringLiteral("A beep plays through the default sound output"),
+                 ok ? QStringLiteral("you should have heard a short beep") : detail);
+}
+
 void noteSoundOutputs(Report& report)
 {
     const QList<audio::Output> outputs = audio::outputs();
@@ -190,7 +227,9 @@ void noteSoundOutputs(Report& report)
 void noteFonts(Report& report)
 {
     const QFont font = QGuiApplication::font();
-    report.note(QStringLiteral("Interface font"), QStringLiteral("%1 %2pt").arg(font.family()).arg(font.pointSizeF()));
+    report.note(QStringLiteral("Interface font"),
+                font.pointSizeF() > 0 ? QStringLiteral("%1 %2pt").arg(font.family()).arg(font.pointSizeF())
+                                      : QStringLiteral("%1 %2px").arg(font.family()).arg(font.pixelSize()));
     // Symbols the interface shows as text. Missing ones fall back to another
     // system font, which the report cannot see, so this is information only.
     const QFontMetrics metrics(font);
@@ -240,8 +279,10 @@ int run(const QString& reportPath, const QString& songPath, const QStringList& m
     checkAudioComponents(report, packaged);
     if (!songPath.isEmpty() && gst_is_initialized())
         checkPlayback(report, songPath);
-    if (gst_is_initialized())
+    if (gst_is_initialized()) {
         noteSoundOutputs(report);
+        checkDefaultOutput(report);
+    }
     noteFonts(report);
     report.line(report.failures() == 0 ? QStringLiteral("RESULT: PASS")
                                        : QStringLiteral("RESULT: FAIL (%1 problems)").arg(report.failures()));

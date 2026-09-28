@@ -2,7 +2,11 @@
 # GStreamer and no build tools: the installation check with a test song,
 # several starts and clean quits, a second copy started while one runs, and
 # proof that the Test Songs folder was not touched.
-param([Parameter(Mandatory)] [string] $Package)
+param(
+    [Parameter(Mandatory)] [string] $Package,
+    # The machine has a sound output (in CI, a virtual sound card).
+    [switch] $ExpectSound
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -19,7 +23,14 @@ foreach ($name in @(Get-ChildItem env: | Where-Object { $_.Name -like 'GST*' -or
 }
 if (Test-Path $dataFolder) { Remove-Item -Recurse -Force $dataFolder }
 
-function Fail([string] $message) { Write-Host "::error::$message"; throw $message }
+function Fail([string] $message) {
+    Write-Host "::error::$message"
+    if (Test-Path $log) {
+        Write-Host '--- End of the program log ---'
+        Get-Content $log | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
+    }
+    throw $message
+}
 
 # --- 1. Installation check, with the MP3 decoder, Key and Tempo ---------------
 $report = Join-Path $env:RUNNER_TEMP 'installation-check.txt'
@@ -28,6 +39,11 @@ $check = Start-Process -FilePath $exe -ArgumentList "--self-check `"$report`" `"
 Get-Content $report
 if ($check.ExitCode -ne 0) { Fail "Installation check failed (exit $($check.ExitCode))" }
 if (-not (Select-String -Path $report -Pattern 'Packaged copy: yes' -Quiet)) { Fail 'Not recognised as a packaged copy' }
+if ($ExpectSound) {
+    $outputs = Select-String -Path $report -Pattern 'Sound outputs found: (\d+)' | ForEach-Object { [int]$_.Matches[0].Groups[1].Value }
+    if (-not $outputs -or $outputs -lt 1) { Fail 'No sound output was found' }
+    Write-Host "Sound outputs found: $outputs"
+}
 # The self-check also rejects any audio component loaded from outside the package.
 $unicodeSong = Get-ChildItem -LiteralPath (Join-Path $Package 'Test Songs') -Recurse -Filter '*.mp3' |
     Where-Object { $_.FullName -match '[^\x00-\x7F]' } | Select-Object -First 1
