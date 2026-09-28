@@ -1,0 +1,121 @@
+name: Windows x64
+
+# Builds Frankie's Karaoke Studio for Windows 11 x64 with MSVC, the official
+# Qt 6 MSVC build and the official GStreamer MSVC runtime, then runs every
+# automated test. Nothing here ever uses real karaoke media.
+
+on:
+  push:
+    branches: [main, windows-prep]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_VERSION: "6.11.2"
+  GST_VERSION: "1.28.7"
+  GST_SHA256: "032fc6062b8539838fc8da22589cb9b24c5d820baa7f8cc160af9ea08395badf"
+  GST_DIR: 'C:\gstreamer'
+
+jobs:
+  build-test:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Qt ${{ env.QT_VERSION }} (MSVC 2022 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Restore GStreamer ${{ env.GST_VERSION }}
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GST_DIR }}
+          key: gstreamer-msvc-x86_64-${{ env.GST_VERSION }}-v1
+
+      - name: Install official GStreamer ${{ env.GST_VERSION }} (MSVC x86_64)
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "$env:RUNNER_TEMP\gstreamer.exe"
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:GST_SHA256) { throw "GStreamer installer checksum mismatch: $hash" }
+          $log = "$env:RUNNER_TEMP\gstreamer-install.log"
+          $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            '/TYPE=full', "/DIR=$env:GST_DIR", "/LOG=$log")
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 80; throw "GStreamer installer failed: $($p.ExitCode)" }
+
+      - name: Locate GStreamer SDK root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $header = Get-ChildItem -Path $env:GST_DIR -Recurse -Filter gst.h -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*include\gstreamer-1.0\gst\gst.h' } | Select-Object -First 1
+          if (-not $header) {
+            Get-ChildItem $env:GST_DIR -Depth 3 | Select-Object -First 80 | ForEach-Object { $_.FullName }
+            throw "GStreamer development headers were not installed"
+          }
+          $root = $header.Directory.Parent.Parent.Parent.FullName
+          Write-Host "GStreamer SDK root: $root"
+          "GSTREAMER_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$root\bin\gst-inspect-1.0.exe" --version
+
+      - name: Required GStreamer elements present in the SDK
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($e in 'playbin','decodebin','uridecodebin','filesrc','typefind','id3demux','mpegaudioparse',
+                         'mpg123audiodec','audioconvert','audioresample','capsfilter','scaletempo','pitch',
+                         'volume','audiotestsrc','autoaudiosink','wasapi2sink','fakesink','lamemp3enc','filesink') {
+            & "$env:GSTREAMER_ROOT\bin\gst-inspect-1.0.exe" --exists $e
+            if ($LASTEXITCODE -ne 0) { $missing += $e }
+          }
+          if ($missing) { throw "Missing GStreamer elements: $($missing -join ', ')" }
+          Write-Host "All required GStreamer elements found."
+
+      - name: Configure (Release x64, warnings are errors)
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DGSTREAMER_ROOT="$env:GSTREAMER_ROOT"
+          -DFKS_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase
+          -DCMAKE_EXE_LINKER_FLAGS="/DEBUG /OPT:REF /OPT:ICF"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build --output-on-failure --timeout 600
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            ${{ runner.temp }}/gstreamer-install.log
+          if-no-files-found: ignore

@@ -155,11 +155,19 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
+# CI turns warnings into errors: the build must stay free of warnings.
+option(FKS_WARNINGS_AS_ERRORS "Treat compiler warnings in the program's own code as errors" OFF)
 foreach(_target fks_cdg fks_library fks_ocr fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
     if(MSVC)
-        target_compile_options(${_target} PRIVATE /W4 /utf-8)
+        target_compile_options(${_target} PRIVATE /W4 /utf-8 /permissive-)
+        if(FKS_WARNINGS_AS_ERRORS)
+            target_compile_options(${_target} PRIVATE /WX)
+        endif()
     else()
         target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
+        if(FKS_WARNINGS_AS_ERRORS)
+            target_compile_options(${_target} PRIVATE -Werror)
+        endif()
     endif()
 endforeach()
 
