@@ -124,6 +124,8 @@ add_library(fks_core STATIC
     src/playlist/PlaylistPlayback.h
     src/platform/DisplaySleepBlocker.cpp
     src/platform/DisplaySleepBlocker.h
+    src/platform/SingleInstance.cpp
+    src/platform/SingleInstance.h
     src/MainWindow.cpp
     src/MainWindow.h
     src/SettingsDialog.cpp

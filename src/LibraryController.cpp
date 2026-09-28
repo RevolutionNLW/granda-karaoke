@@ -707,7 +707,7 @@ bool LibraryController::chooseRoot(const QString& path, QString* error)
         return false;
     }
     for (const QString& protectedPath : std::as_const(m_protectedStoragePaths)) {
-        if (Catalogue::pathIsInsideOrEqual(protectedPath, path)) {
+        if (Catalogue::mayBeInsideOrEqual(protectedPath, path)) {
             if (error) {
                 *error = QStringLiteral(
                     "Application storage must not be inside library root: %1").arg(path);

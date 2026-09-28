@@ -171,6 +171,14 @@ void TestWindowsPaths::containment_data()
     QTest::newRow("removable drive root") << "F:/Songs/x.sqlite" << "F:/" << true;
     QTest::newRow("removable other drive") << "G:/x.sqlite" << "F:/" << false;
     QTest::newRow("backslash dot-dot out") << "C:\\Karaoke\\..\\Karaoke2\\x" << "C:/Karaoke" << false;
+    // Windows drops trailing dots and spaces, and names of dots alone.
+    QTest::newRow("trailing dot") << "C:/Karaoke./x.sqlite" << "C:/Karaoke" << true;
+    QTest::newRow("trailing space") << "C:/Karaoke /x.sqlite" << "C:/Karaoke" << true;
+    QTest::newRow("trailing dots and spaces") << "C:/Karaoke. . /x.sqlite" << "C:/Karaoke" << true;
+    QTest::newRow("name of dots") << "C:/.../Karaoke/x.sqlite" << "C:/Karaoke" << true;
+    QTest::newRow("name of spaces") << "C:/   /Karaoke/x.sqlite" << "C:/Karaoke" << true;
+    QTest::newRow("root with trailing dot") << "C:/Karaoke/x.sqlite" << "C:/Karaoke." << true;
+    QTest::newRow("dotted sibling stays outside") << "C:/Karaoke.2/x.sqlite" << "C:/Karaoke" << false;
 #endif
 }
 
@@ -180,6 +188,9 @@ void TestWindowsPaths::containment()
     QFETCH(QString, root);
     QFETCH(bool, inside);
     QCOMPARE(Catalogue::pathIsInsideOrEqual(candidate, root), inside);
+    // The check used before writing agrees wherever Windows can say where
+    // a path is (and errs towards "inside" where it cannot).
+    QCOMPARE(Catalogue::mayBeInsideOrEqual(candidate, root), inside);
 }
 
 void TestWindowsPaths::storageRefusedInsideRoot_data()

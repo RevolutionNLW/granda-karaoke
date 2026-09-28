@@ -4,6 +4,7 @@
 #include "AudioOutputs.h"
 #include "KaraokePlayer.h"
 #include "SongPair.h"
+#include "library/Catalogue.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -13,6 +14,7 @@
 #include <QFileInfo>
 #include <QFont>
 #include <QFontMetrics>
+#include <QSaveFile>
 #include <QGuiApplication>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -203,8 +205,22 @@ void noteFonts(Report& report)
 
 } // namespace
 
-int run(const QString& reportPath, const QString& songPath)
+int run(const QString& reportPath, const QString& songPath, const QStringList& musicFolders)
 {
+    if (!reportPath.isEmpty()) {
+        const SongPairResult song = songPath.isEmpty() ? SongPairResult{} : resolveSongPair(songPath);
+        bool refused = false;
+        for (const QString& folder : musicFolders)
+            refused = refused || Catalogue::mayBeInsideOrEqual(reportPath, folder);
+        for (const QString& file : {songPath, song.pair.mp3Path, song.pair.cdgPath})
+            refused = refused || (!file.isEmpty() && Catalogue::mayBeInsideOrEqual(reportPath, file));
+        if (refused) {
+            std::fputs("The report would be written inside a music folder or over the test song; "
+                       "nothing was written.\n", stderr);
+            return 2;
+        }
+    }
+
     Report report;
     report.line(QStringLiteral("Frankie's Karaoke Studio installation check"));
     report.note(QStringLiteral("Version"), QCoreApplication::applicationVersion());
@@ -234,9 +250,9 @@ int run(const QString& reportPath, const QString& songPath)
     std::fputs(text.constData(), stdout);
     std::fflush(stdout);
     if (!reportPath.isEmpty()) {
-        QFile file(reportPath);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)
-            || file.write(text) != text.size())
+        QSaveFile file(reportPath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text) || file.write(text) != text.size()
+            || !file.commit())
             return 2;
     }
     return report.failures() == 0 ? 0 : 1;

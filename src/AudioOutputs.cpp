@@ -85,7 +85,8 @@ QString deviceId(GstDevice* device)
     QString id;
     if (GstStructure* properties = gst_device_get_properties(device)) {
         for (const char* key : {"device.id", "unique-id", "device.strid", "wasapi2.device.id",
-                                "wasapi.device.id", "device.path", "alsa.device", "object.path"}) {
+                                "wasapi.device.id", "device.guid", "device.path", "alsa.device",
+                                "object.path"}) {
             if (const gchar* value = gst_structure_get_string(properties, key)) {
                 id = QString::fromUtf8(value);
                 break;

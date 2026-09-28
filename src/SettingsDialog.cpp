@@ -494,7 +494,7 @@ void SettingsDialog::refreshScale()
     m_scaleValue->setText(QStringLiteral("%1%").arg(percent));
     m_scaleDown->setEnabled(percent > theme::kMinScalePercent);
     m_scaleUp->setEnabled(percent < std::min(theme::kMaxScalePercent, theme::scaleLimitPercent()));
-    m_scaleReset->setEnabled(percent != 100);
+    m_scaleReset->setEnabled(percent != 100 || theme::chosenScalePercent() != 100);
     // Bigger would not fit this screen (Windows display scaling counts too).
     m_scaleLimited->setVisible(theme::scaleLimitPercent() < theme::kMaxScalePercent
                                && percent >= theme::scaleLimitPercent());

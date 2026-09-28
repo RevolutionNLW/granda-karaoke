@@ -26,20 +26,24 @@
 
 namespace {
 
-// Windows opens "Karaoke." and "Karaoke " as the folder "Karaoke". Paths are
-// compared in that same spelling, so no such name can slip past a check.
+// Windows opens "Karaoke." and "Karaoke " as the folder "Karaoke", and takes
+// a name made only of dots or spaces as no name at all. Paths are compared in
+// that same spelling, so no such name can slip past a check. (Paths in
+// Windows' extended form, \\?\..., are taken exactly as written.)
 QString withWindowsNameRules(const QString& path)
 {
 #ifdef Q_OS_WIN
-    QStringList parts = QDir::fromNativeSeparators(path).split(QLatin1Char('/'));
+    const QString slashed = QDir::fromNativeSeparators(path);
+    if (slashed.startsWith(QLatin1String("//?/")) || slashed.startsWith(QLatin1String("//./")))
+        return slashed;
+    QStringList parts = slashed.split(QLatin1Char('/'));
     for (QString& part : parts) {
-        if (part == QLatin1String(".") || part == QLatin1String(".."))
+        if (part.isEmpty() || part == QLatin1String(".") || part == QLatin1String(".."))
             continue;
         qsizetype end = part.size();
         while (end > 0 && (part.at(end - 1) == QLatin1Char('.') || part.at(end - 1) == QLatin1Char(' ')))
             --end;
-        if (end > 0)
-            part.truncate(end);
+        part = end > 0 ? part.left(end) : QStringLiteral(".");
     }
     return parts.join(QLatin1Char('/'));
 #else
@@ -50,45 +54,101 @@ QString withWindowsNameRules(const QString& path)
 #ifdef Q_OS_WIN
 // Where Windows itself takes an existing file or folder to be: junctions,
 // symbolic links, substituted drive letters and short 8.3 names followed, in
-// the spelling stored on disk. Empty when Windows cannot say (the drive has
-// gone, say). Only a handle for reading attributes is opened.
+// the spelling stored on disk (a volume without a drive letter by its GUID).
+// Empty when Windows will not say. Only a handle for reading attributes is
+// opened.
 QString windowsFinalPath(const QString& existing)
 {
-    const std::wstring native = QDir::toNativeSeparators(existing).toStdWString();
-    const HANDLE handle = CreateFileW(native.c_str(), FILE_READ_ATTRIBUTES,
+    QString native = QDir::toNativeSeparators(existing);
+    // Long paths go through the extended form, which has no 260-character limit.
+    if (native.size() >= MAX_PATH - 12 && !native.startsWith(QLatin1String("\\\\?\\"))) {
+        native = native.startsWith(QLatin1String("\\\\"))
+            ? QStringLiteral("\\\\?\\UNC\\") + native.mid(2)
+            : QStringLiteral("\\\\?\\") + native;
+    }
+    const std::wstring wide = native.toStdWString();
+    const HANDLE handle = CreateFileW(wide.c_str(), FILE_READ_ATTRIBUTES,
                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
         return {};
-    std::wstring buffer(MAX_PATH + 1, L'\0');
-    const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
-    DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
-    if (length >= buffer.size()) {
-        buffer.assign(length + 1, L'\0');
-        length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
+    QString path;
+    for (const DWORD volume : {DWORD(VOLUME_NAME_DOS), DWORD(VOLUME_NAME_GUID)}) {
+        std::wstring buffer(MAX_PATH + 1, L'\0');
+        const DWORD flags = FILE_NAME_NORMALIZED | volume;
+        DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
+        if (length >= buffer.size()) {
+            buffer.assign(length + 1, L'\0');
+            length = GetFinalPathNameByHandleW(handle, buffer.data(), DWORD(buffer.size()), flags);
+        }
+        if (length > 0 && length < buffer.size()) {
+            path = QString::fromWCharArray(buffer.data(), qsizetype(length));
+            break;
+        }
     }
     CloseHandle(handle);
-    if (length == 0 || length >= buffer.size())
-        return {};
-    QString path = QString::fromWCharArray(buffer.data(), qsizetype(length));
     if (path.startsWith(QLatin1String("\\\\?\\UNC\\")))
         path = QStringLiteral("\\\\") + path.mid(8);
-    else if (path.startsWith(QLatin1String("\\\\?\\")))
-        path = path.mid(4);
-    return QDir::cleanPath(QDir::fromNativeSeparators(path));
+    else if (path.startsWith(QLatin1String("\\\\?\\")) && path.size() > 5 && path.at(5) == QLatin1Char(':'))
+        path = path.mid(4);  // a drive letter; a volume GUID keeps its prefix
+    return path.isEmpty() ? QString() : QDir::cleanPath(QDir::fromNativeSeparators(path));
 }
 #endif
 
-// An existing file or folder's own path, links followed; empty if it does
-// not exist.
-QString existingCanonicalPath(const QFileInfo& info)
+// An existing file or folder's own path, links followed. On Windows, when
+// Windows will not say what it is, *certain is set to false (and Qt's answer,
+// or the path as given, is used).
+QString existingCanonicalPath(const QFileInfo& info, bool* certain)
 {
 #ifdef Q_OS_WIN
     const QString final = windowsFinalPath(info.absoluteFilePath());
     if (!final.isEmpty())
         return final;
+    if (certain)
+        *certain = false;
+#else
+    Q_UNUSED(certain);
 #endif
     return info.canonicalFilePath();
+}
+
+// The canonical form of a path whose end may not exist yet: the part that
+// exists resolved, the rest appended. *certain as above.
+QString canonicalPathOf(const QString& path, bool* certain)
+{
+    const QFileInfo info(withWindowsNameRules(path));
+    QStringList missing;
+    QFileInfo cursor = info;
+    while (!cursor.exists()) {
+        missing.prepend(cursor.fileName());
+        const QString parent = cursor.absolutePath();
+        if (parent == cursor.absoluteFilePath())
+            break;
+        cursor.setFile(parent);
+    }
+    QString canonical = cursor.exists() ? existingCanonicalPath(cursor, certain) : QString();
+    if (canonical.isEmpty())
+        canonical = cursor.absoluteFilePath();
+    QDir directory(canonical);
+    for (const QString& part : missing)
+        canonical = directory.filePath(part), directory.setPath(canonical);
+    return QDir::cleanPath(canonical);
+}
+
+// Whether canonical `child` is `parent` or inside it (whole names only).
+bool canonicalInsideOrEqual(QString child, QString parent)
+{
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+    child = child.toCaseFolded();
+    parent = parent.toCaseFolded();
+#endif
+    if (child == parent)
+        return true;
+    // Qt paths always use '/', on Windows too: QDir::separator() is '\\' there,
+    // and no path inside the folder would ever match.
+    if (!parent.endsWith(QLatin1Char('/')))
+        parent.append(QLatin1Char('/'));
+    return child.startsWith(parent);
 }
 
 Q_LOGGING_CATEGORY(lcCatalogue, "fks.catalogue")
@@ -157,9 +217,18 @@ bool storedStorageIsSafe(const QString& databasePath, const QString& cacheDirect
     // them again here: DB-only commands must not probe a disconnected volume.
     // The catalogue and cache paths are local and are canonicalised the same
     // way, so a symlinked spelling (/var vs /private/var) cannot slip past.
-    const QString canonicalDatabase = Catalogue::canonicalPath(databasePath);
+    bool certain = true;
+    const QString canonicalDatabase = canonicalPathOf(databasePath, &certain);
     const QString canonicalCache = cacheDirectory.isEmpty() ? QString()
-                                                            : Catalogue::canonicalPath(cacheDirectory);
+                                                            : canonicalPathOf(cacheDirectory, &certain);
+    if (!certain && !storedRoots.isEmpty()) {
+        // Windows would not say where the storage really is, so it cannot be
+        // shown to be outside the music: it is not used.
+        if (error)
+            *error = QStringLiteral("Database and SQLite sidecars must not be inside library root: "
+                                    "their location could not be checked");
+        return false;
+    }
     for (const QString& root : storedRoots) {
         if (lexicalPathIsInsideOrEqual(databasePath, root)
             || lexicalPathIsInsideOrEqual(canonicalDatabase, root)) {
@@ -319,27 +388,7 @@ Catalogue::~Catalogue()
 
 QString Catalogue::canonicalPath(const QString& path)
 {
-    QFileInfo info(withWindowsNameRules(path));
-    QString canonical = existingCanonicalPath(info);
-    if (!canonical.isEmpty())
-        return QDir::cleanPath(canonical);
-
-    QStringList missing;
-    QFileInfo cursor = info;
-    while (!cursor.exists()) {
-        missing.prepend(cursor.fileName());
-        const QString parent = cursor.absolutePath();
-        if (parent == cursor.absoluteFilePath())
-            break;
-        cursor.setFile(parent);
-    }
-    canonical = existingCanonicalPath(cursor);
-    if (canonical.isEmpty())
-        canonical = cursor.absoluteFilePath();
-    QDir directory(canonical);
-    for (const QString& part : missing)
-        canonical = directory.filePath(part), directory.setPath(canonical);
-    return QDir::cleanPath(canonical);
+    return canonicalPathOf(path, nullptr);
 }
 
 QString Catalogue::normalizedPlaylistRelativePath(const QString& path)
@@ -365,32 +414,33 @@ bool Catalogue::playlistSnapshotPathsMatch(const QString& firstRoot,
 
 bool Catalogue::pathIsInsideOrEqual(const QString& candidate, const QString& root)
 {
-    QString child = canonicalPath(candidate);
-    QString parent = canonicalPath(root);
-#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
-    child = child.toCaseFolded();
-    parent = parent.toCaseFolded();
-#endif
-    if (child == parent)
+    return canonicalInsideOrEqual(canonicalPath(candidate), canonicalPath(root));
+}
+
+bool Catalogue::mayBeInsideOrEqual(const QString& candidate, const QString& root)
+{
+    bool certain = true;
+    const QString child = canonicalPathOf(candidate, &certain);
+    const QString parent = canonicalPathOf(root, &certain);
+    if (!certain) {
+        qCWarning(lcCatalogue).noquote() << "Windows could not say where" << candidate << "or" << root
+                                         << "is; taking it to be inside the music folder";
         return true;
-    // Qt paths always use '/', on Windows too: QDir::separator() is '\\' there,
-    // and no path inside the folder would ever match.
-    if (!parent.endsWith(QLatin1Char('/')))
-        parent.append(QLatin1Char('/'));
-    return child.startsWith(parent);
+    }
+    return canonicalInsideOrEqual(child, parent);
 }
 
 bool Catalogue::storageIsSafe(const QString& databasePath, const QString& cacheDirectory,
                               const QStringList& libraryRoots, QString* error)
 {
     for (const QString& root : libraryRoots) {
-        if (pathIsInsideOrEqual(databasePath, root)) {
+        if (mayBeInsideOrEqual(databasePath, root)) {
             if (error)
                 *error = QStringLiteral("Database and SQLite sidecars must not be inside library root: %1")
                              .arg(root);
             return false;
         }
-        if (!cacheDirectory.isEmpty() && pathIsInsideOrEqual(cacheDirectory, root)) {
+        if (!cacheDirectory.isEmpty() && mayBeInsideOrEqual(cacheDirectory, root)) {
             if (error)
                 *error = QStringLiteral("Cache directory must not be inside library root: %1").arg(root);
             return false;

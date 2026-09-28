@@ -207,6 +207,9 @@ public:
                                            const QString& secondRoot,
                                            const QString& secondRelativePath);
     static bool pathIsInsideOrEqual(const QString& candidate, const QString& root);
+    // The same, for deciding where the program may write: on Windows, a path
+    // that exists but that Windows will not identify is taken to be inside.
+    static bool mayBeInsideOrEqual(const QString& candidate, const QString& root);
     static bool storageIsSafe(const QString& databasePath, const QString& cacheDirectory,
                               const QStringList& libraryRoots, QString* error = nullptr);
 

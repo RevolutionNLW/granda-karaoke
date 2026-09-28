@@ -99,7 +99,7 @@ bool KaraokePlayer::initializeGStreamer(QString* errorMessage)
         }
     }
 
-    for (const char* name : {"GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0",
+    for (const char* name : {"GST_REGISTRY_1_0", "GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0",
                              "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
                              "GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0"}) {
         if (qEnvironmentVariableIsSet(name)) {

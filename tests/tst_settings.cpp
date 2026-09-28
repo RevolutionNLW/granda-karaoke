@@ -554,9 +554,9 @@ void TestSettings::interfaceSizeStaysWithinTheScreen()
     window.showFullScreen();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     const QSize screen = window.screen()->geometry().size();
-    QVERIFY2(window.minimumSizeHint().width() > screen.width()
-                 || window.minimumSizeHint().height() > screen.height(),
-             "the test needs a screen too small for 150%");
+    if (window.minimumSizeHint().width() <= screen.width()
+        && window.minimumSizeHint().height() <= screen.height())
+        QSKIP("This test needs a (virtual) screen too small for 150%");
 
     window.setKeepScaleWithinScreen(true);
     qInfo("Screen %dx%d: 150%% chosen, %d%% used, smallest window %dx%d", screen.width(), screen.height(),

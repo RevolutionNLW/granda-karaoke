@@ -10,6 +10,7 @@
 #include "SongSettings.h"
 #include "library/Catalogue.h"
 #include "library/KnownLibraryRoots.h"
+#include "platform/SingleInstance.h"
 #include "playlist/PlaylistStore.h"
 #include "ui/Controls.h"
 #include "ui/Splash.h"
@@ -19,7 +20,6 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
-#include <QLockFile>
 #include <QMessageBox>
 #include <QScreen>
 #include <QSysInfo>
@@ -41,9 +41,15 @@ int main(int argc, char* argv[])
     // Everything the program writes lives in its own folder (see AppStorage).
     // Nothing is written anywhere until it is certain that folder is not
     // inside a music folder (only a system that moved it there could do that).
+    // A music folder given on the command line (automated checks) counts too.
     const QString appDataPath = appstorage::folder();
-    for (const QString& root : KnownLibraryRoots::load()) {
-        if (!appDataPath.isEmpty() && Catalogue::pathIsInsideOrEqual(appDataPath, root)) {
+    const QStringList launchArguments = QApplication::arguments();
+    QStringList musicFolders = KnownLibraryRoots::load();
+    if (const qsizetype option = launchArguments.indexOf(QStringLiteral("--music-folder"));
+        option >= 0 && !launchArguments.value(option + 1).isEmpty())
+        musicFolders.append(launchArguments.value(option + 1));
+    for (const QString& root : std::as_const(musicFolders)) {
+        if (!appDataPath.isEmpty() && Catalogue::mayBeInsideOrEqual(appDataPath, root)) {
             QMessageBox::critical(
                 nullptr, QStringLiteral("Frankie's Karaoke Studio"),
                 QStringLiteral("Frankie's Karaoke Studio cannot start: its own data folder\n\n%1\n\n"
@@ -54,9 +60,9 @@ int main(int argc, char* argv[])
     }
 
     // Installation check: FrankiesKaraokeStudio --self-check <report> [<song.mp3>]
-    const QStringList launchArguments = QApplication::arguments();
     if (const qsizetype check = launchArguments.indexOf(QStringLiteral("--self-check")); check >= 0)
-        return selfcheck::run(launchArguments.value(check + 1), launchArguments.value(check + 2));
+        return selfcheck::run(launchArguments.value(check + 1), launchArguments.value(check + 2),
+                              musicFolders);
 
     if (appDataPath.isEmpty() || !QDir().mkpath(appDataPath)) {
         QMessageBox::critical(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
@@ -68,21 +74,20 @@ int main(int argc, char* argv[])
 
     // One copy at a time. Windows does not stop a second copy when the icon
     // is opened twice, and two copies would share the same databases and log.
-    // The lock is held by this process only; a crashed copy's lock is taken
-    // over (its process no longer exists), never after a time limit.
     // --single-instance-probe (automated checks): exit 3 if a copy is
     // running, 0 if not, without showing anything.
     const bool probe = launchArguments.contains(QStringLiteral("--single-instance-probe"));
-    QLockFile instanceLock(QDir(appDataPath).filePath(QStringLiteral("running.lock")));
-    instanceLock.setStaleLockTime(0);
-    if (!instanceLock.tryLock(0)) {
-        if (instanceLock.error() == QLockFile::LockFailedError) {
-            if (probe)
-                return 3;
-            QMessageBox::information(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
-                                     QStringLiteral("Frankie's Karaoke Studio is already open."));
-            return 0;
-        }
+    SingleInstance instance(appDataPath);
+    switch (instance.acquire()) {
+    case SingleInstance::Result::Acquired:
+        break;
+    case SingleInstance::Result::AlreadyRunning:
+        if (probe)
+            return 3;
+        QMessageBox::information(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
+                                 QStringLiteral("Frankie's Karaoke Studio is already open."));
+        return 0;
+    case SingleInstance::Result::Failed:
         QMessageBox::critical(nullptr, QStringLiteral("Frankie's Karaoke Studio"),
                               QStringLiteral("Frankie's Karaoke Studio cannot safely use its data folder"
                                              "\n\n%1\n\nThe program will close without changing anything.")
