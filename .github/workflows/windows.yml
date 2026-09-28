@@ -25,6 +25,8 @@ jobs:
   build-test:
     runs-on: windows-2025
     timeout-minutes: 90
+    outputs:
+      packaged: ${{ steps.package.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -144,12 +146,19 @@ jobs:
       - name: Build
         run: cmake --build build -- -k 0
 
+      # On Windows QtTest writes to the debugger unless told otherwise.
+      # The package is still made when a test fails (the job fails at the
+      # end), so one run reports on everything.
       - name: Test
+        id: tests
+        continue-on-error: true
         shell: pwsh
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        env:
+          QT_FORCE_STDERR_LOGGING: "1"
+        run: ctest --test-dir build --output-on-failure --timeout 300
 
       - name: Upload test logs on failure
-        if: failure()
+        if: failure() || steps.tests.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: windows-test-logs
@@ -159,6 +168,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package (portable x64 folder)
+        id: package
         shell: pwsh
         run: >
           ./packaging/windows/package.ps1
@@ -182,10 +192,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Fail if any test failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
+
   # A fresh Windows machine with no Qt, GStreamer or build tools, as on the
   # laptop: the package must run from its own folder alone.
   package-smoke-test:
     needs: build-test
+    if: always() && needs.build-test.outputs.packaged == 'true'
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
