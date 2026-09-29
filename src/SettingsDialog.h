@@ -103,7 +103,6 @@ private:
     bool confirmForgetAll();
     bool songInProgress() const;
     void refreshScale();
-    void fitValueLabels();
     void fitToScreen();
     void refreshLibraryStatus();
     void refreshShortcutList();

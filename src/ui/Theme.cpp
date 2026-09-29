@@ -2,6 +2,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QFontMetrics>
 #include <QBoxLayout>
 #include <QFont>
 #include <QLayout>
@@ -53,6 +54,7 @@ QToolTip {
 QLabel#controlCaption { color: #b9b5ae; font-size: 14px; }
 QLabel#settingValue {
     color: #f5f1ea; font-size: 14px; font-weight: 700;
+    min-width: VALUE_MIN_WIDTH;
 }
 QFrame#barSeparator { background: #2c2f35; max-width: 1px; min-width: 1px; }
 
@@ -399,6 +401,14 @@ QString scaledStyleSheet()
         last = match.capturedEnd();
     }
     result += sheet.mid(last);
+    // Values such as "100%" (Key, Tempo, sizes, volume) get at least 46px,
+    // and never so little that the widest is cut short in this system's font
+    // (Windows fonts run wider than the Mac's, where it is always 46px).
+    QFont valueFont = QApplication::font();
+    valueFont.setPixelSize(px(14));
+    valueFont.setBold(true);
+    const int valueWidth = std::max(px(46), QFontMetrics(valueFont).horizontalAdvance(QStringLiteral("150%")) + px(4));
+    result.replace(QStringLiteral("VALUE_MIN_WIDTH"), QString::number(valueWidth) + QStringLiteral("px"));
     return result;
 }
 

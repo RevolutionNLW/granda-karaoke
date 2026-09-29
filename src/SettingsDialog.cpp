@@ -221,10 +221,7 @@ SettingsDialog::SettingsDialog(Context context, QWidget* parent)
     });
     m_nav->setCurrentRow(0);
     connect(m_context.preferences, &AppPreferences::changed, this, [this] { refreshControls(); });
-    connect(theme::notifier(), &theme::Notifier::changed, this, [this] {
-        refreshScale();
-        fitValueLabels();
-    });
+    connect(theme::notifier(), &theme::Notifier::changed, this, [this] { refreshScale(); });
     refreshControls();
 
     theme::setMinimumWidth(this, 760);
@@ -256,18 +253,6 @@ void SettingsDialog::ensureBuilt(int index)
     for (qsizetype i = firstNew; i < m_refreshers.size(); ++i)
         m_refreshers.at(i)();
     theme::rescale(m_pages->widget(index));
-    fitValueLabels();
-}
-
-void SettingsDialog::fitValueLabels()
-{
-    // At least 46 (scaled), and never so narrow that a value such as "100%"
-    // is cut short, whatever the system's font (Windows fonts run wider).
-    for (QLabel* label : findChildren<QLabel*>(QStringLiteral("settingValue"))) {
-        label->ensurePolished();
-        const int needed = label->fontMetrics().horizontalAdvance(QStringLiteral("150%")) + theme::px(4);
-        label->setMinimumWidth(std::max(theme::px(46), needed));
-    }
 }
 
 int SettingsDialog::pageIndex(const QString& name) const

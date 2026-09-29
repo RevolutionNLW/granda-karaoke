@@ -34,6 +34,7 @@ private slots:
     void openShowsReadySong();
     void controlsFitDefaultSize();
     void settingsControlsDefaultsAndFocus();
+    void keyAndTempoValuesKeepTheirWidth();
     void keyAndTempoButtonsClampAndReset();
     void perSongSettingsPersistAcrossWindows();
     void playShowsLyricsPage();
@@ -171,6 +172,18 @@ void TestMainWindow::settingsControlsDefaultsAndFocus()
     QCOMPARE(m_window->tempoValueLabel()->text(), QStringLiteral("100%"));
     for (QPushButton* button : buttons)
         QVERIFY(button->isEnabled());
+}
+
+void TestMainWindow::keyAndTempoValuesKeepTheirWidth()
+{
+    // The values between the - and + buttons keep their room (46 at 100%),
+    // and more where the system's font needs it for the widest value.
+    for (QLabel* label : {m_window->keyValueLabel(), m_window->tempoValueLabel()}) {
+        label->ensurePolished();
+        QVERIFY2(label->minimumWidth() >= theme::px(46), qPrintable(QString::number(label->minimumWidth())));
+        QFont font = label->font();
+        QVERIFY(label->minimumWidth() >= QFontMetrics(font).horizontalAdvance(QStringLiteral("150%")));
+    }
 }
 
 void TestMainWindow::keyAndTempoButtonsClampAndReset()
