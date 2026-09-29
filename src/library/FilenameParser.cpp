@@ -10,22 +10,23 @@ namespace {
 QString collapseWhitespace(QString value)
 {
     value.replace(QChar(0x00a0), QLatin1Char(' '));
-    // Patterns are made once: making one costs far more on Windows.
-    static const QRegularExpression whitespace(QStringLiteral(R"(\s+)"));
+    // Patterns are made once per thread (the scanner and the search box both
+    // parse names): making one costs far more on Windows.
+    static thread_local const QRegularExpression whitespace(QStringLiteral(R"(\s+)"));
     value.replace(whitespace, QStringLiteral(" "));
     return value.trimmed();
 }
 
 const QRegularExpression& nonDigit()
 {
-    static const QRegularExpression pattern(QStringLiteral(R"(\D)"));
+    static thread_local const QRegularExpression pattern(QStringLiteral(R"(\D)"));
     return pattern;
 }
 
 QString canonicalDisc(QString token)
 {
     token = token.toUpper();
-    static const QRegularExpression separators(QStringLiteral(R"([\s.-]+)"));
+    static thread_local const QRegularExpression separators(QStringLiteral(R"([\s.-]+)"));
     token.remove(separators);
     return token;
 }
@@ -50,7 +51,7 @@ bool isGenericTrackFolder(const QString& value)
 
 QStringList folderParts(const QString& relativeDir)
 {
-    static const QRegularExpression slashes(QStringLiteral(R"([/\\]+)"));
+    static thread_local const QRegularExpression slashes(QStringLiteral(R"([/\\]+)"));
     return relativeDir.split(slashes, Qt::SkipEmptyParts);
 }
 
@@ -122,14 +123,14 @@ QStringList splitFields(const QString& text)
     spaced.append(text.mid(start));
     // A truncated name can leave a bracket open ("(Theme From The Legend O -
     // Pat Benatar"): then the brackets say nothing and every " - " separates.
-    static const QRegularExpression spacedDash(QStringLiteral(R"(\s+-\s+)"));
+    static thread_local const QRegularExpression spacedDash(QStringLiteral(R"(\s+-\s+)"));
     if (depth > 0)
         spaced = text.split(spacedDash, Qt::SkipEmptyParts);
     for (const QString& rawPiece : std::as_const(spaced)) {
         const QString piece = rawPiece.trimmed();
         if (piece.isEmpty())
             continue;
-        static const QRegularExpression doubleDash(QStringLiteral(R"(\s*-{2,}\s*)"));
+        static thread_local const QRegularExpression doubleDash(QStringLiteral(R"(\s*-{2,}\s*)"));
         const QStringList parts = piece.split(doubleDash, Qt::SkipEmptyParts);
         bool allNamed = parts.size() > 1;
         for (const QString& part : parts)
@@ -149,7 +150,7 @@ QStringList splitFields(const QString& text)
 
 bool underscoresSeparateFields(const QString& stem)
 {
-    static const QRegularExpression underscoreDash(QStringLiteral(R"(_-_|_-\s|\s-_)"));
+    static thread_local const QRegularExpression underscoreDash(QStringLiteral(R"(_-_|_-\s|\s-_)"));
     if (!stem.contains(QLatin1Char(' ')) || !stem.contains(QLatin1Char('_'))
         || stem.contains(underscoreDash))
         return false;
@@ -247,7 +248,7 @@ ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
         }
     }
     if (!parsed.discId.isEmpty()) {
-        static const QRegularExpression leadingDashes(QStringLiteral(R"(^\s*-+\s*)"));
+        static thread_local const QRegularExpression leadingDashes(QStringLiteral(R"(^\s*-+\s*)"));
         remainder.remove(leadingDashes);
         remainder = collapseWhitespace(remainder);
         parsed.fields = splitFields(remainder);

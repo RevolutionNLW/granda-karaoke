@@ -77,11 +77,14 @@ public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT rect);
 function Test-WindowFits($process, [string] $what) {
     $rect = New-Object Fks.Win32+RECT
     if (-not [Fks.Win32]::GetWindowRect($process.MainWindowHandle, [ref]$rect)) { Fail "No window rectangle ($what)" }
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $screen = [System.Windows.Forms.Screen]::FromHandle($process.MainWindowHandle).Bounds
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
-    Write-Host "  window ${width}x${height} on a $($screen.Width)x$($screen.Height) screen ($what)"
-    if ($width -gt $screen.Width -or $height -gt $screen.Height) { Fail "The window is larger than the screen ($what)" }
+    Write-Host "  window ${width}x${height} at $($rect.Left),$($rect.Top) on a $($screen.Width)x$($screen.Height) screen ($what)"
+    if ($rect.Left -lt $screen.Left -or $rect.Top -lt $screen.Top -or
+        $rect.Right -gt $screen.Right -or $rect.Bottom -gt $screen.Bottom) {
+        Fail "Part of the window is off the screen ($what)"
+    }
 }
 function Stop-Program($process, [string] $what) {
     if (-not $process.CloseMainWindow()) { Fail "Could not ask the program to close ($what)" }
