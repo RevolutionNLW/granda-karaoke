@@ -229,6 +229,12 @@ void TestSettings::initTestCase()
     QVERIFY2(KaraokePlayer::initializeGStreamer(&error), qPrintable(error));
     m_songPath = m_media.filePath(QStringLiteral("Loose Song.mp3"));
     QVERIFY(writeSong(m_media.filePath(QStringLiteral("Loose Song")), 3000));
+    // Which font the layout checks measure with (on Windows CI, the test
+    // platform needs the system fonts folder to have real ones).
+    const QFontMetrics metrics(QApplication::font());
+    qInfo().noquote() << "Font for layout checks:" << QFontInfo(QApplication::font()).family()
+                      << QApplication::font().pixelSize() << "px; \"Friday Night\" is"
+                      << metrics.horizontalAdvance(QStringLiteral("Friday Night")) << "px wide";
 }
 
 void TestSettings::cleanup()

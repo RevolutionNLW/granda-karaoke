@@ -787,6 +787,13 @@ void TestKaraokePlayer::windowsOutputsAreOfferedOnce()
     // Other systems (macOS, Linux) are never filtered.
     QVERIFY(audio::offerDeviceOf(QStringLiteral("GstOsxAudioDevice"),
                                  {QStringLiteral("GstOsxAudioDevice"), QStringLiteral("wasapi2")}));
+    // Windows' "Default Audio Render Device" only stands for the default,
+    // which the program's own "system default" choice already is.
+    QVERIFY(audio::isDefaultDeviceStandIn(QStringLiteral("{E6327CAD-DCEC-4949-AE8A-991E976A79D2}")));
+    QVERIFY(audio::isDefaultDeviceStandIn(QStringLiteral("{e6327cad-dcec-4949-ae8a-991e976a79d2}")));
+    QVERIFY(!audio::isDefaultDeviceStandIn(
+        QStringLiteral("{0.0.0.00000000}.{6063f081-6166-42e3-b921-9a79fbe03dd9}")));
+    QVERIFY(!audio::isDefaultDeviceStandIn(QStringLiteral("BuiltInSpeakerDevice")));
     // Whatever this computer has, no output is offered twice by id.
     QStringList ids;
     for (const audio::Output& output : audio::outputs()) {

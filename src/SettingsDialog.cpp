@@ -261,8 +261,8 @@ void SettingsDialog::ensureBuilt(int index)
 
 void SettingsDialog::fitValueLabels()
 {
-    // Values such as "100%" are never cut short, whatever the system's font:
-    // Windows fonts run wider than the room the style gives them.
+    // At least 46 (scaled), and never so narrow that a value such as "100%"
+    // is cut short, whatever the system's font (Windows fonts run wider).
     for (QLabel* label : findChildren<QLabel*>(QStringLiteral("settingValue"))) {
         label->ensurePolished();
         const int needed = label->fontMetrics().horizontalAdvance(QStringLiteral("150%")) + theme::px(4);

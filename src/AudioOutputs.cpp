@@ -12,6 +12,8 @@
 
 namespace audio {
 
+QString deviceId(GstDevice* device);
+
 namespace {
 
 // Which sound system a device belongs to: its GStreamer class, which names
@@ -46,7 +48,7 @@ QList<GstDevice*> sinkDevices()
         systems.append(deviceSystem(device));
     QList<GstDevice*> result;
     for (qsizetype i = 0; i < found.size(); ++i) {
-        if (offerDeviceOf(systems.at(i), systems))
+        if (offerDeviceOf(systems.at(i), systems) && !isDefaultDeviceStandIn(deviceId(found.at(i))))
             result.append(found.at(i));
         else
             gst_object_unref(found.at(i));
@@ -77,6 +79,12 @@ bool offerDeviceOf(const QString& system, const QStringList& systemsFound)
             return false;
     }
     return true;
+}
+
+bool isDefaultDeviceStandIn(const QString& deviceId)
+{
+    // The audio-render device interface class (DEVINTERFACE_AUDIO_RENDER).
+    return deviceId.compare(QLatin1String("{E6327CAD-DCEC-4949-AE8A-991E976A79D2}"), Qt::CaseInsensitive) == 0;
 }
 
 // A device's own lasting id, where its system gives one.

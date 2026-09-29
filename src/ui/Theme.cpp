@@ -53,7 +53,6 @@ QToolTip {
 QLabel#controlCaption { color: #b9b5ae; font-size: 14px; }
 QLabel#settingValue {
     color: #f5f1ea; font-size: 14px; font-weight: 700;
-    min-width: 46px;
 }
 QFrame#barSeparator { background: #2c2f35; max-width: 1px; min-width: 1px; }
 

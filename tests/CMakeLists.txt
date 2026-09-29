@@ -47,6 +47,10 @@ if(MSVC)
     target_compile_options(fks-make-test-songs PRIVATE /utf-8)
 endif()
 
+# Timings of plain computing and SQLite work, to compare machines.
+add_executable(fks-bench fks-bench.cpp)
+target_link_libraries(fks-bench PRIVATE Qt6::Core Qt6::Sql)
+
 # Closing while the library scanner is busy; the helper runs the program's
 # closing sequence in a process of its own.
 add_executable(tst_shutdown_helper tst_shutdown_helper.cpp)

@@ -30,6 +30,9 @@ GstElement* createSink(const QString& output);
 // true if a device of `system` should be offered: only the newest system's.
 // Elsewhere every device is offered.
 bool offerDeviceOf(const QString& system, const QStringList& systemsFound);
+// Windows' own "Default Audio Render Device", which only stands for whichever
+// output is the default: the program's "system default" choice is that already.
+bool isDefaultDeviceStandIn(const QString& deviceId);
 
 // Finds the outputs on a worker thread (asking the system can take a moment)
 // and remembers them for the whole session; refresh() looks again. Only one

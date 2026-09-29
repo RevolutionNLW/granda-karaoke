@@ -171,7 +171,16 @@ jobs:
         shell: pwsh
         env:
           QT_FORCE_STDERR_LOGGING: "1"
+          # Qt's offscreen test platform has no fonts of its own on Windows.
+          QT_QPA_FONTDIR: 'C:\Windows\Fonts'
         run: ctest --test-dir build --output-on-failure --timeout 300
+
+      # Timings to compare with a Mac (the metadata resolver is far slower
+      # here); information only.
+      - name: Benchmark
+        continue-on-error: true
+        shell: pwsh
+        run: ./build/tests/fks-bench.exe "$env:RUNNER_TEMP/bench"
 
       - name: Upload test logs on failure
         if: failure() || steps.tests.outcome == 'failure'
