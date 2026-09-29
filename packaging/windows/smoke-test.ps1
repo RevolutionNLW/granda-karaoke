@@ -66,6 +66,23 @@ function Wait-Window($process, [int] $seconds) {
     }
     Fail 'The program window did not appear'
 }
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -Namespace Fks -Name Win32 -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct RECT { public int Left, Top, Right, Bottom; }
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT rect);
+'@
+# The program's window must fit on the screen (no part of it off the edge).
+function Test-WindowFits($process, [string] $what) {
+    $rect = New-Object Fks.Win32+RECT
+    if (-not [Fks.Win32]::GetWindowRect($process.MainWindowHandle, [ref]$rect)) { Fail "No window rectangle ($what)" }
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    Write-Host "  window ${width}x${height} on a $($screen.Width)x$($screen.Height) screen ($what)"
+    if ($width -gt $screen.Width -or $height -gt $screen.Height) { Fail "The window is larger than the screen ($what)" }
+}
 function Stop-Program($process, [string] $what) {
     if (-not $process.CloseMainWindow()) { Fail "Could not ask the program to close ($what)" }
     if (-not $process.WaitForExit(20000)) { $process.Kill(); Fail "The program did not quit within 20 s ($what)" }
@@ -80,6 +97,7 @@ for ($round = 1; $round -le 3; $round++) {
     $process = if ($round -eq 1) { Start-Program @('--music-folder', "`"$songs`"") } else { Start-Program }
     Wait-Window $process 30
     Start-Sleep -Seconds (2 + $round)   # through the splash, then a little longer each time
+    Test-WindowFits $process "start $round"
     Stop-Program $process "start $round"
     Write-Host ("Start/quit {0}: window after launch, clean quit after {1:N1} s" -f $round, ((Get-Date) - $started).TotalSeconds)
     if (-not (Select-String -Path $log -Pattern 'Exiting with code 0' -Quiet)) { Fail "No clean exit in the log (start $round)" }
@@ -95,6 +113,7 @@ foreach ($scale in '1.25', '1.5') {
     Remove-Item env:QT_SCALE_FACTOR
     Wait-Window $process 30
     Start-Sleep -Seconds 4
+    Test-WindowFits $process "display scaling $scale"
     Stop-Program $process "display scaling $scale"
     $screenLine = Select-String -Path $log -Pattern 'Primary screen' | Select-Object -First 1
     $limitLine = Select-String -Path $log -Pattern 'Interface size .* so the window fits' | Select-Object -First 1

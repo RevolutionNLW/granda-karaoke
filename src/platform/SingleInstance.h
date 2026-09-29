@@ -6,10 +6,10 @@
 
 class QLockFile;
 
-// One running copy of the program per user. On Windows a named mutex, which
-// Windows releases the moment the process ends, however it ends; elsewhere a
-// lock file in the program's data folder (taken over from a copy that has
-// crashed, as its process no longer exists).
+// One running copy of the program per user (per data folder). On Windows a
+// named mutex, which Windows releases the moment the process ends, however it
+// ends; elsewhere a lock file in the program's data folder (taken over from a
+// copy that has crashed, as its process no longer exists).
 class SingleInstance {
 public:
     enum class Result { Acquired, AlreadyRunning, Failed };

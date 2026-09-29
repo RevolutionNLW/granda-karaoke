@@ -273,8 +273,16 @@ namespace {
 
 bool outsideLibraryRoots(Catalogue& catalogue, const QString& path, QString* error)
 {
+    QString rootsError;
+    const QList<CatalogueRoot> known = catalogue.roots(&rootsError);
+    if (!rootsError.isEmpty()) {
+        // Without the music folders the file cannot be shown to be outside them.
+        if (error)
+            *error = rootsError;
+        return false;
+    }
     QStringList roots;
-    for (const CatalogueRoot& root : catalogue.roots(error))
+    for (const CatalogueRoot& root : known)
         roots.append(root.path);
     return Catalogue::storageIsSafe(path, {}, roots, error);
 }

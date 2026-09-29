@@ -120,6 +120,7 @@ private slots:
     void longPathsAreCompared();
     void uncShareContainment();
     void programDataFolderIsLocalAndOwnedByTheProgram();
+    void linkToAPlaceNotYetMadeIsRefused();
 };
 
 void TestWindowsPaths::containment_data()
@@ -526,6 +527,46 @@ void TestWindowsPaths::programDataFolderIsLocalAndOwnedByTheProgram()
     // Unchanged on macOS: both locations are the same folder there.
     QCOMPARE(folder, QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
 #endif
+}
+
+void TestWindowsPaths::linkToAPlaceNotYetMadeIsRefused()
+{
+    // A link whose target does not exist yet looks like a missing name, but
+    // creating the database through it would put it in the music folder.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("Karaoke"));
+    makeMusicFolder(root);
+    const QStringList before = snapshot(root);
+    const QString app = temporary.filePath(QStringLiteral("app"));
+    QVERIFY(QDir().mkpath(app));
+#ifdef Q_OS_WIN
+    // Qt makes shortcut files, not links, on Windows; a junction does the same.
+    const QString folder = app + QStringLiteral("/linked");
+    QVERIFY(runCommand(QStringLiteral("cmd.exe"),
+                       {QStringLiteral("/c"), QStringLiteral("mklink"), QStringLiteral("/J"),
+                        QDir::toNativeSeparators(folder),
+                        QDir::toNativeSeparators(root + QStringLiteral("/Not Yet"))}));
+    const QString at = folder + QStringLiteral("/");
+#else
+    for (const char* name : {"library.sqlite", "playlists.sqlite", "metadata-overrides.sqlite",
+                             "user-state.sqlite"}) {
+        QVERIFY(QFile::link(QDir(root).filePath(QLatin1String(name)),
+                            QDir(app).filePath(QLatin1String(name))));
+    }
+    const QString at = app + QStringLiteral("/");
+#endif
+    QString error;
+    Catalogue catalogue(at + QStringLiteral("library.sqlite"));
+    QVERIFY(!catalogue.open(&error, {root}));
+    PlaylistStore playlists(at + QStringLiteral("playlists.sqlite"));
+    QVERIFY(!playlists.open(&error, {root}));
+    MetadataOverrideStore overrides(at + QStringLiteral("metadata-overrides.sqlite"));
+    QVERIFY(!overrides.open(&error, {root}));
+    UserStateStore userState(at + QStringLiteral("user-state.sqlite"));
+    QVERIFY(!userState.open(&error, {root}));
+    QVERIFY(Catalogue::mayBeInsideOrEqual(at + QStringLiteral("library.sqlite"), root));
+    QCOMPARE(snapshot(root), before);
 }
 
 QTEST_GUILESS_MAIN(TestWindowsPaths)

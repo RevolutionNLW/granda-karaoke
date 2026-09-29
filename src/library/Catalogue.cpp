@@ -113,13 +113,18 @@ QString existingCanonicalPath(const QFileInfo& info, bool* certain)
 }
 
 // The canonical form of a path whose end may not exist yet: the part that
-// exists resolved, the rest appended. *certain as above.
-QString canonicalPathOf(const QString& path, bool* certain)
+// exists resolved, the rest appended. *certain as above, and also false when
+// a missing part is a link (a link to a place that does not exist yet could
+// lead anywhere) or, for a place about to be written (`destination`), when
+// on Windows no part of the path exists at all.
+QString canonicalPathOf(const QString& path, bool* certain, bool destination = false)
 {
     const QFileInfo info(withWindowsNameRules(path));
     QStringList missing;
     QFileInfo cursor = info;
     while (!cursor.exists()) {
+        if (certain && (cursor.isSymLink() || cursor.isJunction()))
+            *certain = false;
         missing.prepend(cursor.fileName());
         const QString parent = cursor.absolutePath();
         if (parent == cursor.absoluteFilePath())
@@ -127,6 +132,12 @@ QString canonicalPathOf(const QString& path, bool* certain)
         cursor.setFile(parent);
     }
     QString canonical = cursor.exists() ? existingCanonicalPath(cursor, certain) : QString();
+#ifdef Q_OS_WIN
+    if (certain && destination && !cursor.exists())
+        *certain = false;  // a drive or share that is not there
+#else
+    Q_UNUSED(destination);
+#endif
     if (canonical.isEmpty())
         canonical = cursor.absoluteFilePath();
     QDir directory(canonical);
@@ -218,9 +229,9 @@ bool storedStorageIsSafe(const QString& databasePath, const QString& cacheDirect
     // The catalogue and cache paths are local and are canonicalised the same
     // way, so a symlinked spelling (/var vs /private/var) cannot slip past.
     bool certain = true;
-    const QString canonicalDatabase = canonicalPathOf(databasePath, &certain);
+    const QString canonicalDatabase = canonicalPathOf(databasePath, &certain, true);
     const QString canonicalCache = cacheDirectory.isEmpty() ? QString()
-                                                            : canonicalPathOf(cacheDirectory, &certain);
+                                                            : canonicalPathOf(cacheDirectory, &certain, true);
     if (!certain && !storedRoots.isEmpty()) {
         // Windows would not say where the storage really is, so it cannot be
         // shown to be outside the music: it is not used.
@@ -419,8 +430,10 @@ bool Catalogue::pathIsInsideOrEqual(const QString& candidate, const QString& roo
 
 bool Catalogue::mayBeInsideOrEqual(const QString& candidate, const QString& root)
 {
+    // A music folder that is not there (an unplugged drive) is compared by
+    // name; the place to be written must be identified.
     bool certain = true;
-    const QString child = canonicalPathOf(candidate, &certain);
+    const QString child = canonicalPathOf(candidate, &certain, true);
     const QString parent = canonicalPathOf(root, &certain);
     if (!certain) {
         qCWarning(lcCatalogue).noquote() << "Windows could not say where" << candidate << "or" << root

@@ -1,5 +1,6 @@
 #include "platform/SingleInstance.h"
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QLockFile>
 
@@ -25,8 +26,13 @@ SingleInstance::~SingleInstance()
 SingleInstance::Result SingleInstance::acquire()
 {
 #ifdef Q_OS_WIN
-    // "Local\": this user's Windows session.
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\Granda.FrankiesKaraokeStudio.Running");
+    // Every Windows session of this user (the same account signed in twice
+    // shares one data folder), and only this user: named after the folder.
+    const QByteArray folder = QDir::cleanPath(m_dataFolder).toCaseFolded().toUtf8();
+    const QString name = QStringLiteral("Global\\Granda.FrankiesKaraokeStudio.%1")
+                             .arg(QString::fromLatin1(
+                                 QCryptographicHash::hash(folder, QCryptographicHash::Sha256).toHex().left(32)));
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, reinterpret_cast<const wchar_t*>(name.utf16()));
     if (!mutex)
         return Result::Failed;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
