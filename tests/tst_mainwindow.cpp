@@ -82,8 +82,9 @@ void TestMainWindow::initTestCase()
     QVERIFY2(KaraokePlayer::initializeGStreamer(&error), qPrintable(error));
     m_songPath = m_dir.filePath("Long Song.mp3");
     m_shortSongPath = m_dir.filePath("Short Song.cdg");
-    QVERIFY(testmedia::writeMp3(m_songPath, 4000));
-    QVERIFY(testmedia::writeCdg(m_dir.filePath("Long Song.cdg"), testmedia::markerCdg(4000, 300)));
+    // Long enough to still be playing after a dialog on a slow machine.
+    QVERIFY(testmedia::writeMp3(m_songPath, 8000));
+    QVERIFY(testmedia::writeCdg(m_dir.filePath("Long Song.cdg"), testmedia::markerCdg(8000, 300)));
     QVERIFY(testmedia::writeMp3(m_dir.filePath("Short Song.mp3"), 1200));
     QVERIFY(testmedia::writeCdg(m_shortSongPath, testmedia::markerCdg(1200, 300)));
     m_settingsPath = m_dir.filePath("song-settings.json");
@@ -520,7 +521,7 @@ void TestMainWindow::rejectedOpenErrorClearsOnStateChange()
     QCOMPARE(m_window->statusText(), rejectedError);
 
     if (finishNaturally) {
-        QTRY_COMPARE_WITH_TIMEOUT(m_player->state(), State::Finished, 6000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_player->state(), State::Finished, 12000);
         QCOMPARE(m_window->statusText(), QStringLiteral("Finished. Press Play to sing it again."));
     } else {
         QTest::mouseClick(m_window->stopButton(), Qt::LeftButton);

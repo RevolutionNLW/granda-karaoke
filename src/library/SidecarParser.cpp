@@ -47,7 +47,8 @@ SidecarTrackList parseTrackListSidecar(const QByteArray& contents)
     static const QRegularExpression listNumber(QStringLiteral(R"(^\s*\d{1,3}\.\s+)"));
     static const QRegularExpression mediaSuffix(QStringLiteral(R"(\.(?:mp3|cdg|zip)\s*$)"),
                                                 QRegularExpression::CaseInsensitiveOption);
-    const QStringList lines = decodeText(contents).split(QRegularExpression(QStringLiteral("\r\n|\r|\n")));
+    static const QRegularExpression lineBreak(QStringLiteral("\r\n|\r|\n"));
+    const QStringList lines = decodeText(contents).split(lineBreak);
     int contentLines = 0;
     QList<SidecarEntry> parsed;
     for (int i = 0; i < lines.size(); ++i) {

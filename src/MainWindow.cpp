@@ -783,6 +783,14 @@ void MainWindow::fitScaleToScreen()
                                                                         : estimate);
     while (ratio() < 1.0 && theme::scalePercent() > theme::kMinScalePercent)
         theme::setScaleLimitPercent(theme::scalePercent() - step);
+    // A window that grew to an earlier, larger minimum is not shrunk by the
+    // system (full screen neither): bring it back within the screen.
+    if (isVisible() && (width() > room.width() || height() > room.height())) {
+        if (fullScreen)
+            setGeometry(where->geometry());
+        else
+            resize(size().boundedTo(room));
+    }
     if (theme::scalePercent() < theme::chosenScalePercent()) {
         qCInfo(lcUi) << "Interface size" << theme::scalePercent() << "% instead of"
                      << theme::chosenScalePercent() << "% so the window fits the screen" << room

@@ -10,14 +10,23 @@ namespace {
 QString collapseWhitespace(QString value)
 {
     value.replace(QChar(0x00a0), QLatin1Char(' '));
-    value.replace(QRegularExpression(QStringLiteral(R"(\s+)")), QStringLiteral(" "));
+    // Patterns are made once: making one costs far more on Windows.
+    static const QRegularExpression whitespace(QStringLiteral(R"(\s+)"));
+    value.replace(whitespace, QStringLiteral(" "));
     return value.trimmed();
+}
+
+const QRegularExpression& nonDigit()
+{
+    static const QRegularExpression pattern(QStringLiteral(R"(\D)"));
+    return pattern;
 }
 
 QString canonicalDisc(QString token)
 {
     token = token.toUpper();
-    token.remove(QRegularExpression(QStringLiteral(R"([\s.-]+)")));
+    static const QRegularExpression separators(QStringLiteral(R"([\s.-]+)"));
+    token.remove(separators);
     return token;
 }
 
@@ -41,8 +50,8 @@ bool isGenericTrackFolder(const QString& value)
 
 QStringList folderParts(const QString& relativeDir)
 {
-    return relativeDir.split(QRegularExpression(QStringLiteral(R"([/\\]+)")),
-                             Qt::SkipEmptyParts);
+    static const QRegularExpression slashes(QStringLiteral(R"([/\\]+)"));
+    return relativeDir.split(slashes, Qt::SkipEmptyParts);
 }
 
 QString folderDisc(const QStringList& parts)
@@ -113,14 +122,15 @@ QStringList splitFields(const QString& text)
     spaced.append(text.mid(start));
     // A truncated name can leave a bracket open ("(Theme From The Legend O -
     // Pat Benatar"): then the brackets say nothing and every " - " separates.
+    static const QRegularExpression spacedDash(QStringLiteral(R"(\s+-\s+)"));
     if (depth > 0)
-        spaced = text.split(QRegularExpression(QStringLiteral(R"(\s+-\s+)")), Qt::SkipEmptyParts);
+        spaced = text.split(spacedDash, Qt::SkipEmptyParts);
     for (const QString& rawPiece : std::as_const(spaced)) {
         const QString piece = rawPiece.trimmed();
         if (piece.isEmpty())
             continue;
-        const QStringList parts = piece.split(QRegularExpression(QStringLiteral(R"(\s*-{2,}\s*)")),
-                                              Qt::SkipEmptyParts);
+        static const QRegularExpression doubleDash(QStringLiteral(R"(\s*-{2,}\s*)"));
+        const QStringList parts = piece.split(doubleDash, Qt::SkipEmptyParts);
         bool allNamed = parts.size() > 1;
         for (const QString& part : parts)
             allNamed = allNamed && part.contains(letter);
@@ -139,8 +149,9 @@ QStringList splitFields(const QString& text)
 
 bool underscoresSeparateFields(const QString& stem)
 {
+    static const QRegularExpression underscoreDash(QStringLiteral(R"(_-_|_-\s|\s-_)"));
     if (!stem.contains(QLatin1Char(' ')) || !stem.contains(QLatin1Char('_'))
-        || stem.contains(QRegularExpression(QStringLiteral(R"(_-_|_-\s|\s-_)"))))
+        || stem.contains(underscoreDash))
         return false;
     if (stem.count(QLatin1Char('_')) > 4)
         return false;
@@ -236,7 +247,8 @@ ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
         }
     }
     if (!parsed.discId.isEmpty()) {
-        remainder.remove(QRegularExpression(QStringLiteral(R"(^\s*-+\s*)")));
+        static const QRegularExpression leadingDashes(QStringLiteral(R"(^\s*-+\s*)"));
+        remainder.remove(leadingDashes);
         remainder = collapseWhitespace(remainder);
         parsed.fields = splitFields(remainder);
         parsed.kind = parsed.fields.isEmpty() ? ParsedName::Kind::DiscTrackOnly
@@ -254,7 +266,7 @@ ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
         const QString packedPrefix = match.captured(1).toUpper();
         const QString folderPrefix = discPrefix(fromFolder);
         QString folderDigits = fromFolder;
-        folderDigits.remove(QRegularExpression(QStringLiteral(R"(\D)")));
+        folderDigits.remove(nonDigit());
         const QString packedDigits = match.captured(2);
         const bool prefixAgrees = packedPrefix.startsWith(folderPrefix)
             || folderPrefix.startsWith(packedPrefix);
@@ -277,7 +289,7 @@ ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
     match = discNumberTrack.match(parsed.cleaned);
     if (match.hasMatch() && !fromFolder.isEmpty()) {
         QString folderDigits = fromFolder;
-        folderDigits.remove(QRegularExpression(QStringLiteral(R"(\D)")));
+        folderDigits.remove(nonDigit());
         if (!folderDigits.isEmpty()
             && folderDigits.toULongLong() == match.captured(1).toULongLong()) {
             setDisc(parsed, fromFolder, QStringLiteral("folder"));
@@ -346,7 +358,7 @@ ParsedName parseCleanedName(const QString& relativeDir, const QString& stem,
         if (!fromFolder.isEmpty()) {
             setDisc(parsed, fromFolder, QStringLiteral("folder"));
             QString folderDigits = fromFolder;
-            folderDigits.remove(QRegularExpression(QStringLiteral(R"(\D)")));
+            folderDigits.remove(nonDigit());
             if (!folderDigits.isEmpty() && digits.startsWith(folderDigits)
                 && digits.size() > folderDigits.size() && digits.size() - folderDigits.size() <= 2)
                 parsed.track = digits.mid(folderDigits.size()).toInt();

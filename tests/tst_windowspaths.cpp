@@ -189,9 +189,18 @@ void TestWindowsPaths::containment()
     QFETCH(QString, root);
     QFETCH(bool, inside);
     QCOMPARE(Catalogue::pathIsInsideOrEqual(candidate, root), inside);
-    // The check used before writing agrees wherever Windows can say where
-    // a path is (and errs towards "inside" where it cannot).
-    QCOMPARE(Catalogue::mayBeInsideOrEqual(candidate, root), inside);
+    // The check used before writing agrees; it also errs towards "inside"
+    // for a place on a drive that is not there (E:, G: on a test machine).
+    bool driveAbsent = false;
+#ifdef Q_OS_WIN
+    const QString absolute = QFileInfo(candidate).absoluteFilePath();
+    driveAbsent = absolute.size() >= 3 && absolute.at(1) == QLatin1Char(':')
+        && !QFileInfo::exists(absolute.left(3));
+#endif
+    if (driveAbsent)
+        QVERIFY(Catalogue::mayBeInsideOrEqual(candidate, root));
+    else
+        QCOMPARE(Catalogue::mayBeInsideOrEqual(candidate, root), inside);
 }
 
 void TestWindowsPaths::storageRefusedInsideRoot_data()

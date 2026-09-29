@@ -204,6 +204,9 @@ int main(int argc, char* argv[])
         window.resize(QSize(theme::px(1280), theme::px(800))
                           .boundedTo(screen.isValid() ? screen.size() : QSize(4000, 4000)));
         const QByteArray geometry = QByteArray::fromBase64(settings.text(pref::WindowGeometry).toLatin1());
+        // The interface size is fitted to the screen before the window first
+        // appears (and again once it is shown, in its real state).
+        window.setKeepScaleWithinScreen(true);
         if (settings.flag(pref::StartFullscreen, true)) {
             window.showFullScreen();
         } else {
