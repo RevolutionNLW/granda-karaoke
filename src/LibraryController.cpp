@@ -416,9 +416,8 @@ namespace {
 
 bool titleScreenFileAllowed(const QString& path, const QStringList& roots, QString* error)
 {
-    const QString file = Catalogue::canonicalPath(path);
     for (const QString& root : roots) {
-        if (Catalogue::pathIsInsideOrEqual(file, Catalogue::canonicalPath(root))) {
+        if (Catalogue::mayBeInsideOrEqual(path, root)) {
             if (error)
                 *error = QStringLiteral("Files inside the music folder are never written or read "
                                         "here; choose another place.");
