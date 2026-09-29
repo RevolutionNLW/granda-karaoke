@@ -63,7 +63,7 @@ private slots:
     void displaySleepReleasedOnDestruction();
 
 private:
-    void startPlaying();
+    void startPlaying(const QString& path = {});
     void createWindow(bool clearSettings);
 
     QTemporaryDir m_dir;
@@ -116,9 +116,9 @@ void TestMainWindow::cleanup()
     m_store.reset();
 }
 
-void TestMainWindow::startPlaying()
+void TestMainWindow::startPlaying(const QString& path)
 {
-    QVERIFY(m_window->openSong(m_songPath));
+    QVERIFY(m_window->openSong(path.isEmpty() ? m_songPath : path));
     QTest::mouseClick(m_window->playButton(), Qt::LeftButton);
     QCOMPARE(m_player->state(), State::Playing);
 }
@@ -498,15 +498,23 @@ void TestMainWindow::rejectedOpenErrorClearsOnStateChange()
     const QString path = badDir.filePath("Damaged.mp3");
     QVERIFY(QFile::copy(m_songPath, path));
     QVERIFY(testmedia::writeFile(badDir.filePath("Damaged.cdg"), QByteArray(24000, '\x5a')));
+    // Stopping needs a song that is still playing after the dialog, however
+    // slow the machine; finishing needs one short enough to wait for.
+    QString song = m_songPath;
+    if (!finishNaturally) {
+        song = badDir.filePath("Very Long Song.mp3");
+        QVERIFY(testmedia::writeMp3(song, 30000));
+        QVERIFY(testmedia::writeCdg(badDir.filePath("Very Long Song.cdg"), testmedia::markerCdg(30000, 300)));
+    }
     m_window->setShowErrorDialogs(true);
-    startPlaying();
+    startPlaying(song);
     QTRY_VERIFY_WITH_TIMEOUT(m_player->positionMs() > 100, 3000);
     QSignalSpy states(m_player.get(), &KaraokePlayer::stateChanged);
     QVERIFY(!m_window->openSong(path));
     const QString rejectedError = m_window->statusText();
     QVERIFY(rejectedError.contains("empty or damaged"));
     QCOMPARE(m_player->state(), State::Playing);
-    QCOMPARE(m_player->song().mp3Path, m_songPath);
+    QCOMPARE(m_player->song().mp3Path, song);
     QCOMPARE(states.count(), 0);
 
     const auto boxes = m_window->findChildren<QMessageBox*>();
