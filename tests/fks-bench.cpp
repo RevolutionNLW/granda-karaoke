@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QRegularExpression>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -47,6 +48,24 @@ int main(int argc, char* argv[])
         letters += folded.size();
     }
     report("strings: fold, normalise, split, count (20k titles)", timer.elapsed());
+
+    // The same pattern made afresh for every title, and made once.
+    timer.restart();
+    int matches = 0;
+    for (int i = 0; i < kRows; ++i) {
+        const QString text = QStringLiteral("Suspicious Minds (Karaoke Version) W/ Vocals %1").arg(i);
+        matches += text.contains(QRegularExpression(QStringLiteral(R"(\s+(?:W\s*[~/-]?\s*VOCALS?)\s*\d+$)"),
+                                                    QRegularExpression::CaseInsensitiveOption));
+    }
+    report("regex: new pattern object for each of 20k titles", timer.elapsed());
+    timer.restart();
+    static const QRegularExpression once(QStringLiteral(R"(\s+(?:W\s*[~/-]?\s*VOCALS?)\s*\d+$)"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    for (int i = 0; i < kRows; ++i) {
+        const QString text = QStringLiteral("Suspicious Minds (Karaoke Version) W/ Vocals %1").arg(i);
+        matches += text.contains(once);
+    }
+    report("regex: one pattern object for 20k titles", timer.elapsed());
 
     QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("bench"));
     db.setDatabaseName(QDir(args.at(1)).filePath(QStringLiteral("bench.sqlite")));
@@ -115,7 +134,7 @@ int main(int argc, char* argv[])
 
     q.finish();
     db.close();
-    std::printf("(%lld letters, %lld distinct words)\n", static_cast<long long>(letters),
-                static_cast<long long>(words.size()));
+    std::printf("(%lld letters, %lld distinct words, %d matches)\n", static_cast<long long>(letters),
+                static_cast<long long>(words.size()), matches);
     return 0;
 }
