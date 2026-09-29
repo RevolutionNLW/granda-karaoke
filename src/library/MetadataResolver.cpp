@@ -94,7 +94,7 @@ QString collapseWhitespace(QString value)
 {
     value.replace(QChar(0x00a0), QLatin1Char(' '));
     // Patterns are made once: making one costs far more on Windows.
-    static const QRegularExpression whitespace(QStringLiteral(R"(\s+)"));
+    static thread_local const QRegularExpression whitespace(QStringLiteral(R"(\s+)"));
     value.replace(whitespace, QStringLiteral(" "));
     return value.trimmed();
 }
@@ -240,7 +240,7 @@ QString personalFirstNames(const QString& right)
 
 bool looksLikePersonalName(const QString& value)
 {
-    static const QRegularExpression digit(QStringLiteral(R"(\d)"));
+    static thread_local const QRegularExpression digit(QStringLiteral(R"(\d)"));
     if (value.count(QLatin1Char(',')) != 1 || value.contains(digit))
         return false;
     const qsizetype comma = value.indexOf(QLatin1Char(','));
@@ -663,8 +663,8 @@ bool applySidecars(QSqlDatabase database, qint64 rootId, QList<Candidate>& candi
 bool isCodeField(const QString& value)
 {
     QString field = value.trimmed();
-    static const QRegularExpression proPrefix(QStringLiteral(R"(^\(\s*pro\s*\)\s*)"),
-                                              QRegularExpression::CaseInsensitiveOption);
+    static thread_local const QRegularExpression proPrefix(
+        QStringLiteral(R"(^\(\s*pro\s*\)\s*)"), QRegularExpression::CaseInsensitiveOption);
     field.remove(proPrefix);
     if (field.contains(QLatin1Char(' ')))
         return false;
@@ -1159,8 +1159,8 @@ bool usableTagValue(const QString& value, const Candidate& candidate)
     if (isPlaceholderTagValue(value))
         return false;
     const QString key = normalizeForSearch(value);
-    static const QRegularExpression letter(QStringLiteral(R"(\p{L})"),
-                                           QRegularExpression::UseUnicodePropertiesOption);
+    static thread_local const QRegularExpression letter(
+        QStringLiteral(R"(\p{L})"), QRegularExpression::UseUnicodePropertiesOption);
     if (key.isEmpty() || !key.contains(letter))
         return false;
     static const QRegularExpression discLike(QStringLiteral(R"(^[a-z]{1,8}\s?\d{2,}(?:\s?\d+)?$)"));
