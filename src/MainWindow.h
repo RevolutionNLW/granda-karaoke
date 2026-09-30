@@ -108,6 +108,7 @@ protected:
     void runAction(const QString& id);
     void applyPreference(const QString& key);
     void applyDisplaySleep();
+    void updateKeyColumn();
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void changeEvent(QEvent* event) override;

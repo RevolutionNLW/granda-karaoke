@@ -122,7 +122,7 @@ int main(int argc, char* argv[])
     }
     GstSongKeyEngine engine;
     QTextStream out(stdout);
-    out << "ms\tstatus\tkey\tconfidence\tcorrelation\trunner_up\tmargin\tagreement\ttuning_cents\tseconds\texpected\trelation\tfile\n";
+    out << "ms\tstatus\tkey\tconfidence\tcorrelation\trunner_up\tmargin\tagreement\ttuning_cents\tseconds\texpected\trelation\tfile\tparallel_margin\ttuning_consistency\tchroma_C_to_B\n";
     qint64 totalMs = 0;
     double totalSeconds = 0.0;
     int analysed = 0;
@@ -163,7 +163,11 @@ int main(int argc, char* argv[])
             << '\t' << name(result.runnerUp) << '\t' << QString::number(result.margin, 'f', 2) << '\t'
             << QString::number(result.agreement, 'f', 2) << '\t' << QString::number(result.tuningCents, 'f', 1)
             << '\t' << QString::number(result.seconds, 'f', 0) << '\t' << expectedName << '\t' << related
-            << '\t' << path << '\n';
+            << '\t' << path << '\t' << QString::number(result.parallelMargin, 'f', 2) << '\t'
+            << QString::number(result.tuningConsistency, 'f', 2) << '\t';
+        for (std::size_t i = 0; i < result.chroma.size(); ++i)
+            out << (i ? "," : "") << QString::number(result.chroma[i], 'f', 4);
+        out << '\n';
         out.flush();
     }
 

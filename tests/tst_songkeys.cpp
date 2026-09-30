@@ -34,6 +34,7 @@
 #include <QUuid>
 
 #include <atomic>
+#include <limits>
 #include <mutex>
 
 using music::KeyAnalysis;
@@ -205,7 +206,7 @@ void TestSongKeys::initTestCase()
     QVERIFY(QDir().mkpath(m_fixtures));
     for (const Fixture& fixture : kFixtures) {
         const QString path = QDir(m_fixtures).filePath(QString::fromLatin1(fixture.name) + QStringLiteral(".mp3"));
-        QVERIFY2(keyaudio::writeMp3(path, bandIn(fixture.tonic, fixture.minor, 45), kRate), fixture.name);
+        QVERIFY2(keyaudio::writeMp3(path, bandIn(fixture.tonic, fixture.minor, 70), kRate), fixture.name);
     }
 }
 
@@ -248,6 +249,8 @@ void TestSongKeys::keyNamesAreFamiliarAndParse()
     QCOMPARE(parsed("B#"), QStringLiteral("C"));
     QCOMPARE(parsed("Fb"), QStringLiteral("E"));
     QCOMPARE(parsed("Bb major"), QStringLiteral("Bb"));
+    QCOMPARE(parsed("CM"), QStringLiteral("C"));  // capital M is major, as on chord charts
+    QCOMPARE(parsed("Cm"), QStringLiteral("Cm"));
     for (const char* bad : {"", "H", "Cx", "C#x", "m", "#"})
         QVERIFY2(!MusicalKey::parse(bad), bad);
 }
@@ -332,6 +335,12 @@ void TestSongKeys::detectorStaysQuietWithoutAClearKey_data()
     QTest::addRow("C and D alternating") << 5 << -1;
     QTest::addRow("nearly silent hum") << 6 << int(KeyAnalysis::Status::Silent);
     QTest::addRow("nothing at all") << 7 << int(KeyAnalysis::Status::TooShort);
+    QTest::addRow("a DC offset and nothing else") << 8 << int(KeyAnalysis::Status::Silent);
+    QTest::addRow("a sub-bass hum below the band") << 9 << -1;
+    QTest::addRow("drums alone") << 10 << -1;
+    QTest::addRow("a quarter-tone off A 440") << 11 << -1;
+    QTest::addRow("Am-G-F-G loop") << 12 << -1;
+    QTest::addRow("damaged samples (NaN)") << 13 << -1;
 }
 
 void TestSongKeys::detectorStaysQuietWithoutAClearKey()
@@ -362,6 +371,41 @@ void TestSongKeys::detectorStaysQuietWithoutAClearKey()
             synth.chord({60, 64, 67}, 2.0, 0.0005);  // about -60 dBFS
         break;
     case 7: break;
+    case 8: synth.out.assign(std::size_t(60 * kRate), 0.01F); break;
+    case 9:
+        // A pure 30 Hz hum, all below the band analysed.
+        for (std::size_t i = 0, n = std::size_t(60 * kRate); i < n; ++i)
+            synth.out.push_back(float(0.5 * std::sin(2.0 * std::numbers::pi * 30.0 * double(i) / kRate)));
+        break;
+    case 10: {
+        synth.out.assign(std::size_t(60 * kRate), 0.0F);
+        keyaudio::Random rng(7);
+        const std::size_t beat = std::size_t(0.5 * kRate);
+        for (std::size_t b = 0; b * beat < synth.out.size(); ++b) {
+            for (std::size_t i = 0; i < std::size_t(0.15 * kRate) && b * beat + i < synth.out.size(); ++i) {
+                const double envelope = std::exp(-double(i) / (0.03 * kRate));
+                synth.out[b * beat + i] += float((b % 2 ? 0.25 : 0.12) * envelope * rng.gaussian());
+                if (b % 2 == 0)
+                    synth.out[b * beat + i] += float(0.4 * envelope
+                        * std::sin(2.0 * std::numbers::pi * (60.0 + 40.0 * envelope) * double(i) / kRate));
+            }
+        }
+        break;
+    }
+    case 11: keyaudio::progression(synth, 60, false, 90, 2.0, 50.0); break;
+    case 12:
+        for (int i = 0; i < 40; ++i) {
+            synth.chord(keyaudio::triad(57, true), 2.0);
+            synth.chord(keyaudio::triad(55, false), 2.0);
+            synth.chord(keyaudio::triad(53, false), 2.0);
+            synth.chord(keyaudio::triad(55, false), 2.0);
+        }
+        break;
+    case 13:
+        keyaudio::progression(synth, 60, false, 60);
+        for (std::size_t i = 0; i < synth.out.size(); i += 1000)
+            synth.out[i] = std::numeric_limits<float>::quiet_NaN();
+        break;
     }
     const KeyAnalysis result = KeyDetector::analyse(synth.out);
     if (status < 0)
@@ -383,6 +427,17 @@ void TestSongKeys::detectorChoosesTheMainKey()
         const KeyAnalysis result = KeyDetector::analyse(synth.out);
         QVERIFY2(result.status == KeyAnalysis::Status::Confident, qPrintable(describe(result)));
         QCOMPARE(keyName(result), QStringLiteral("G"));
+    }
+    // A long drums-only break or a sub-bass hum does not pull the key
+    // elsewhere: the answer is the music's key or none.
+    {
+        keyaudio::Synth synth(kRate);
+        keyaudio::band(synth, 55, false, 60);
+        for (std::size_t i = 0, n = std::size_t(40 * kRate); i < n; ++i)  // a 45 Hz hum
+            synth.out.push_back(float(0.5 * std::sin(2.0 * std::numbers::pi * 45.0 * double(i) / kRate)));
+        const KeyAnalysis result = KeyDetector::analyse(synth.out);
+        QVERIFY2(result.status != KeyAnalysis::Status::Confident || keyName(result) == QStringLiteral("G"),
+                 qPrintable(describe(result)));
     }
     // A last-chorus key change up a tone: the key sung longest is the main one.
     {
@@ -439,10 +494,10 @@ void TestSongKeys::engineReadsKeysFromMp3s()
         QVERIFY2(result.status == KeyAnalysis::Status::Confident,
                  qPrintable(QString::fromLatin1(fixture.name) + QLatin1Char(' ') + describe(result)));
         QCOMPARE(keyName(result), QString::fromLatin1(fixture.name));
-        // 45 s asked for; the chords are whole 2-second steps.
-        QVERIFY2(result.seconds > 44.0 && result.seconds < 47.0, qPrintable(QString::number(result.seconds)));
+        // 70 s asked for; the chords are whole 2-second steps.
+        QVERIFY2(result.seconds > 69.0 && result.seconds < 72.0, qPrintable(QString::number(result.seconds)));
     }
-    qInfo("Decoded and analysed %d 45-second MP3s in %lld ms (%lld ms each)",
+    qInfo("Decoded and analysed %d 70-second MP3s in %lld ms (%lld ms each)",
           int(std::size(kFixtures)), totalMs, totalMs / qint64(std::size(kFixtures)));
 }
 
@@ -460,9 +515,9 @@ void TestSongKeys::engineReportsUnreadableAndDamagedFiles()
     QVERIFY(testmedia::writeFile(dir.filePath(QStringLiteral("empty.mp3")), {}));
     QCOMPARE(run(dir.filePath(QStringLiteral("empty.mp3"))), SongKeyEngine::Outcome::Unreadable);
     QByteArray noise(200000, '\0');
-    std::mt19937 rng(3);
+    keyaudio::Random rng(3);
     for (char& c : noise)
-        c = char(rng() & 0xff);
+        c = char(rng.next() & 0xff);
     // Random bytes that happen to look like MP3 frames may decode to noise:
     // either way no key can come of them.
     QVERIFY(testmedia::writeFile(dir.filePath(QStringLiteral("noise.mp3")), noise));
@@ -480,7 +535,7 @@ void TestSongKeys::engineReportsUnreadableAndDamagedFiles()
     const QByteArray bytes = whole.readAll();
     QVERIFY(testmedia::writeFile(dir.filePath(QStringLiteral("cut.mp3")), bytes.left(bytes.size() / 3)));
     QCOMPARE(run(dir.filePath(QStringLiteral("cut.mp3")), &result), SongKeyEngine::Outcome::Analysed);
-    QVERIFY(result.seconds < 20.0);
+    QVERIFY(result.seconds < 30.0);
     QVERIFY(result.status != KeyAnalysis::Status::Confident);
     // Names in any script (the file is opened by URI, as the player does).
     const QString accented = dir.filePath(QStringLiteral("Café Ñandú – 歌.mp3"));
@@ -659,6 +714,13 @@ void TestSongKeys::playbackPausesAnalysisAndItResumesLater()
     QTRY_VERIFY_WITH_TIMEOUT(endless->working.load(), 5000);
     QCOMPARE(endless->calls.load(), calls + 1);
 
+    // Opening a song gets it off the drive at once too, and it waits.
+    timer.restart();
+    controller.holdSongKeysForSong();
+    QTRY_VERIFY_WITH_TIMEOUT(!endless->working.load(), 2000);
+    QVERIFY2(timer.elapsed() < kPromptMs, qPrintable(QString::number(timer.elapsed())));
+    QTRY_VERIFY_WITH_TIMEOUT(endless->working.load(), 5000);
+
     // Turned off: it stops too.
     controller.setSongKeyAnalysisEnabled(false);
     QTRY_VERIFY_WITH_TIMEOUT(!endless->working.load(), 2000);
@@ -782,27 +844,33 @@ void TestSongKeys::libraryAndPlayerBarShowTheKeys()
     SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
     MainWindow window(&player, &settings, &controller);
     window.setShowErrorDialogs(false);
+    window.resize(1280, 800);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     QVERIFY(window.openSong(mp3));
     QVERIFY(!window.songKeyLabel()->isVisible());  // not analysed yet
+    // No empty Key column while there is nothing to show in it.
+    QTreeView* results = window.libraryView()->resultsList();
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QVERIFY(results->isColumnHidden(LibraryResultsModel::KeyColumn));
 
     controller.setSongKeyAnalysisEnabled(true);  // the real GStreamer engine
+    QVERIFY(!results->isColumnHidden(LibraryResultsModel::KeyColumn));
     QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
     QTRY_VERIFY_WITH_TIMEOUT(window.songKeyLabel()->isVisible(), 5000);
-    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("(C)"));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C"));
     QCOMPARE(window.songKeyLabel()->toolTip(), QStringLiteral("Original key: C"));
     QCOMPARE(window.keyValueLabel()->text(), QStringLiteral("0"));  // Key is still the transpose
     QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
     QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
     QCOMPARE(window.keyValueLabel()->text(), QStringLiteral("+2"));
-    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("(C → D)"));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C → D"));
     QCOMPARE(window.songKeyLabel()->toolTip(), QStringLiteral("Original key: C\nCurrent key: D (+2)"));
     QTest::mouseClick(window.keyDownButton(), Qt::LeftButton);
     QTest::mouseClick(window.keyDownButton(), Qt::LeftButton);
     QTest::mouseClick(window.keyDownButton(), Qt::LeftButton);
     QTest::mouseClick(window.keyDownButton(), Qt::LeftButton);
-    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("(C → Bb)"));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C → Bb"));
     QCOMPARE(window.songKeyLabel()->toolTip(), QStringLiteral("Original key: C\nCurrent key: Bb (-2)"));
 
     // A song with no clear key (two seconds of one tone) shows none.

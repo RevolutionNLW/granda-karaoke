@@ -56,8 +56,13 @@ QString describe(GstMessage* message, bool* readFailure)
     gchar* debug = nullptr;
     gst_message_parse_error(message, &error, &debug);
     // A file that cannot be opened or read is a reading problem (perhaps the
-    // drive went away); anything else means the file holds no usable audio.
-    *readFailure = error && error->domain == GST_RESOURCE_ERROR;
+    // drive went away), and so is a decoder missing from this installation:
+    // neither is the file's fault, so neither is recorded against it.
+    // Anything else means the file holds no usable audio.
+    *readFailure = error
+        && (error->domain == GST_RESOURCE_ERROR
+            || (error->domain == GST_CORE_ERROR && error->code == GST_CORE_ERROR_MISSING_PLUGIN)
+            || (error->domain == GST_STREAM_ERROR && error->code == GST_STREAM_ERROR_CODEC_NOT_FOUND));
     const QString text = QString::fromUtf8(error ? error->message : "unknown error");
     g_clear_error(&error);
     g_free(debug);
@@ -91,10 +96,10 @@ SongKeyEngine::Outcome GstSongKeyEngine::analyse(const QString& path,
                       .arg(QString::fromUtf8(error ? error->message : "?"));
         g_clear_error(&error);
         if (pipeline)
-            gst_object_unref(pipeline);
-        // Not the file's fault: nothing is recorded against it.
-        return Outcome::Unreadable;
+            gst_object_unref(gst_object_ref_sink(pipeline));
+        return Outcome::EngineUnavailable;
     }
+    gst_object_ref_sink(pipeline);
 
     Feed feed;
     feed.limit = std::size_t(kMaxSeconds) * music::kKeyAnalysisSampleRate;

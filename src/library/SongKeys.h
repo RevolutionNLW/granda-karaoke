@@ -24,7 +24,9 @@ public:
         Analysed,     // result is filled in (any status)
         NotAudio,     // the file was read but holds no usable audio
         Unreadable,   // the file could not be read (perhaps the drive went away)
+                      // or a decoder it needs is missing: tried again next session
         Interrupted,  // stop() asked to stop; nothing is known
+        EngineUnavailable,  // the audio components themselves failed: stop trying
     };
 
     virtual ~SongKeyEngine() = default;

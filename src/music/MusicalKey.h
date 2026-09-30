@@ -27,7 +27,8 @@ struct MusicalKey {
     // Never B#, E#, Cb or Fb.
     std::string name() const;
     // Accepts the names above and their enharmonic twins ("A#", "Gbm",
-    // "C#" ...), with "m", "min" or " minor" for minor keys.
+    // "C#" ...), with "m", "min" or " minor" for minor keys ("M", "maj" or
+    // " major" for major).
     static std::optional<MusicalKey> parse(std::string_view text);
 
     friend bool operator==(const MusicalKey&, const MusicalKey&) = default;

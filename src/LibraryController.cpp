@@ -1036,9 +1036,19 @@ void LibraryController::setSongKeyAnalysisEnabled(bool enabled)
 
 bool LibraryController::keyBatchAllowed() const
 {
+    // Whether the music drive is there is left to the batch (on the worker
+    // thread): a drive that stopped answering never holds up the interface.
     return m_keysEnabled && m_scanner && isAvailable() && !m_scanning && !m_keyBatchInFlight
-        && m_pendingRoot.isEmpty() && !m_pendingReprocess && !m_playbackActive
-        && isRootConnected();
+        && m_pendingRoot.isEmpty() && !m_pendingReprocess && !m_playbackActive;
+}
+
+void LibraryController::holdSongKeysForSong()
+{
+    if (!m_keysEnabled || !m_scanner)
+        return;
+    if (m_keyBatchInFlight)
+        m_scanner->setKeyYield(true);
+    scheduleKeyBatch(m_keyTimings.afterPlaybackMs);
 }
 
 void LibraryController::scheduleKeyBatch(int delayMs)
@@ -1062,6 +1072,7 @@ void LibraryController::startKeyBatch()
         return;
     }
     m_keyBatchInFlight = true;
+    m_keyChainDone = false;
     m_scanner->setKeyYield(false);
     LibraryScanner* scanner = m_scanner;
     std::shared_ptr<SongKeyEngine> engine = m_keyEngine;
@@ -1100,11 +1111,15 @@ void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
     if (decoded + reused > 0)
         emit songKeysChanged();
     emit songKeySummaryChanged();
+    m_keyChainDone = reason == QLatin1String("done");
     if (reason == QLatin1String("more"))
         scheduleKeyBatch(m_keyTimings.restMs);
     else if (reason == QLatin1String("stopped"))
         scheduleKeyBatch(m_keyTimings.retryMs);
-    // "done", "offline" and "unavailable" wait for the next scan to finish.
+    // "done", "offline" and "unavailable" (no decoder, or no lasting cache)
+    // wait for the next scan to finish; the decoder is then made afresh.
+    if (reason == QLatin1String("unavailable"))
+        m_keyEngine.reset();
 }
 
 void LibraryController::requestSongKeySummary()
@@ -1156,6 +1171,10 @@ QString LibraryController::songKeyStatusText() const
         return found;
     if (counts.remaining() == 0)
         return found + QStringLiteral(" All done.");
+    if (m_keyChainDone && !m_keyBatchInFlight) {
+        return found + QStringLiteral(" Done for now: %L1 could not be read and will be tried again "
+                                      "next time.").arg(counts.remaining());
+    }
     QString doing;
     if (m_playbackActive)
         doing = QStringLiteral("Paused while a song plays.");

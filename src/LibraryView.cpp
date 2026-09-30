@@ -373,7 +373,16 @@ void LibraryView::applyColumnWidths()
     const int label = m_results->isColumnHidden(LibraryResultsModel::LabelColumn)
         ? 0 : columns->sectionSize(LibraryResultsModel::LabelColumn);
     const bool room = (width - fixed) / 2 >= label;
-    m_results->setColumnHidden(LibraryResultsModel::KeyColumn, !(m_keyColumnWanted && room));
+    m_results->setColumnHidden(LibraryResultsModel::KeyColumn,
+                               !(m_keyColumnWanted && m_keyColumnAvailable && room));
+}
+
+void LibraryView::setKeyColumnAvailable(bool available)
+{
+    if (available == m_keyColumnAvailable)
+        return;
+    m_keyColumnAvailable = available;
+    applyColumnWidths();
 }
 
 void LibraryView::setColumnVisible(int column, bool visible)

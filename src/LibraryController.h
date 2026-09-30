@@ -164,6 +164,9 @@ public:
     {
         return m_keySongsTimed > 0 ? m_keyMsTimed / m_keySongsTimed : 0;
     }
+    // A song is being opened: key analysis gets off the drive now and waits
+    // a while (Play usually follows; playback then keeps it stopped).
+    void holdSongKeysForSong();
     // One line for Settings: how far analysis has got, and what it is doing.
     QString songKeyStatusText() const;
     // The song's key if it is known well enough to show.
@@ -260,7 +263,7 @@ private:
     SongKeyEngineFactory m_keyEngineFactory;
     SongKeyTimings m_keyTimings;
     std::optional<SongKeySummary> m_keySummary;
-    QString m_keyState;   // why analysis is not running now (for Settings)
+    bool m_keyChainDone = false;  // the last batch found nothing left to try
     qint64 m_keyMsTimed = 0;
     qint64 m_keySongsTimed = 0;
 };

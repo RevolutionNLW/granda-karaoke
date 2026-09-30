@@ -51,6 +51,9 @@ public:
     void setPlayingSongId(qint64 songId);
     // Label and Plays can be hidden (Settings); Artist, Song and Disc stay.
     void setColumnVisible(int column, bool visible);
+    // Whether any song key can be shown (analysis on, or keys already known):
+    // the Key column stays out of the way until then.
+    void setKeyColumnAvailable(bool available);
 
 signals:
     void singRequested(qint64 songId);
@@ -96,6 +99,7 @@ private:
     bool m_playlistAvailable = false;
     bool m_active = true;
     bool m_keyColumnWanted = true;  // the user's choice; see applyColumnWidths()
+    bool m_keyColumnAvailable = false;
     // The (trimmed) search text the results show, so typing only spaces
     // does not search again and lose the list's place.
     QString m_shownQuery;

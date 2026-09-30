@@ -65,6 +65,9 @@ std::optional<MusicalKey> MusicalKey::parse(std::string_view text)
         text.remove_prefix(1);
 
     bool minor = false;
+    if (text == "M") {
+        return MusicalKey{wrap(tonic), false};  // capital M: major, as chord charts write it
+    }
     if (!text.empty()) {
         std::string rest;
         for (const char c : text)

@@ -138,9 +138,11 @@ refuse a v5 catalogue as newer than supported; restore that backup to go back.
 The library can show each song's **musical key** (C, F#m, Bb ...) in a **Key** column,
 worked out from the music itself (never from file names or tags). This is the key of the
 karaoke track as recorded, which may differ from the original hit record. It is not the
-player bar's Key control, which shifts the song by semitones: beside that control the
-player bar shows the song's key and the key heard, e.g. `(C → D)` at +2, with
-"Original key: C / Current key: D (+2)" in its tooltip. Keys are always spelt the
+player bar's Key control, which shifts the song by semitones: the Now Playing line shows
+the song's key and the key heard, e.g. `Key C → D` at +2, with "Original key: C /
+Current key: D (+2)" in its tooltip, and changes as Key is pressed. The Key column stays
+hidden until analysis is on or keys are known, and gives way on a small screen at a large
+interface size so Artist and Song keep their room. Keys are always spelt the
 familiar way (Db, Eb, F#, Ab, Bb; C#m, Ebm, F#m, G#m, Bbm), never B#, E#, Cb or Fb.
 
 Working keys out means reading every song, so it is **off until turned on** in
@@ -164,7 +166,9 @@ profiles). No extra library or plugin is needed on macOS or Windows.
 two songs in three on pop music, and most mistakes are the relative major/minor (C for
 Am), a fifth away (G for C) or major for minor. So a key is shown only when the evidence
 is clear: a strong match, clearly better than any other key (major versus minor included),
-consistent through the song, and tuning not near a quarter-tone. Everything else stays
+consistent through the song, and tuning not near a quarter-tone. Only passages with a
+clear note in the 60 Hz to 2 kHz band count: silence, hiss, drums alone, a hum or a DC
+offset never produce a key. Everything else stays
 blank, as do songs shorter than 30 s, mostly silent, or unreadable. Songs that modulate
 get the key heard longest. The thresholds were set on synthetic music and must be checked
 against real songs (see below) before they are trusted.
@@ -174,7 +178,9 @@ catalogue rebuilds, keyed by the MP3's audio content with its tags ignored: a mo
 renamed or retagged song keeps its key without being read again, and a rebuilt catalogue
 only reads 128 KiB of each song to find its key again. Each row keeps the key, status
 (`confident`, `uncertain`, `silent`, `too_short`, `not_audio`), a confidence, the analysis
-version and the evidence (correlations, runner-up, margin, agreement, tuning). Raising
+version and the evidence (correlations, runner-up, margins, agreement, tuning and the
+song's whole 12-note profile, so the decision can be re-tuned later without decoding the
+songs again). Raising
 `kSongKeyAnalysisVersion` re-analyses in the background, showing the old key meanwhile.
 A damaged file is recorded and not tried again; a file that cannot be read (the drive
 went away) is tried again next session. Nothing is ever written to the music folder.

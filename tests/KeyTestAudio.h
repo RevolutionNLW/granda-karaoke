@@ -15,17 +15,37 @@
 #include <cmath>
 #include <cstdint>
 #include <numbers>
-#include <random>
 #include <vector>
 
 namespace keyaudio {
+
+// Random numbers that are the same on every platform (the standard library's
+// distributions differ between implementations).
+struct Random {
+    explicit Random(std::uint64_t seed) : state(seed * 2654435761u + 1) {}
+    std::uint64_t state;
+    std::uint64_t next()
+    {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    }
+    double uniform() { return double(next() >> 11) * (1.0 / 9007199254740992.0); }  // [0, 1)
+    int below(int n) { return int(next() % std::uint64_t(n)); }
+    double gaussian()
+    {
+        const double u = std::max(uniform(), 1e-300);
+        return std::sqrt(-2.0 * std::log(u)) * std::cos(2.0 * std::numbers::pi * uniform());
+    }
+};
 
 struct Synth {
     explicit Synth(int sampleRate) : rate(sampleRate) {}
 
     int rate;
     std::vector<float> out;
-    std::mt19937 rng{42};
+    Random rng{42};
 
     static double frequency(int midi, double cents = 0.0)
     {
@@ -39,7 +59,6 @@ struct Synth {
         const std::size_t count = std::size_t(seconds * rate);
         const std::size_t start = out.size();
         out.resize(start + count, 0.0F);
-        std::uniform_real_distribution<double> phaseOf(0.0, 2.0 * std::numbers::pi);
         for (const int note : notes) {
             const double base = frequency(note, cents);
             for (int harmonic = 1; harmonic <= 6; ++harmonic) {
@@ -47,7 +66,7 @@ struct Synth {
                 if (f > rate / 2.2)
                     break;
                 const double a = amplitude / harmonic;
-                const double phase = phaseOf(rng);
+                const double phase = 2.0 * std::numbers::pi * rng.uniform();
                 for (std::size_t i = 0; i < count; ++i) {
                     const double envelope = std::min({1.0, double(i) / (0.02 * rate),
                                                       double(count - i) / (0.05 * rate)});
@@ -60,9 +79,8 @@ struct Synth {
     void silence(double seconds) { out.resize(out.size() + std::size_t(seconds * rate), 0.0F); }
     void noise(double seconds, double amplitude)
     {
-        std::normal_distribution<float> value(0.0F, float(amplitude));
         for (std::size_t i = 0, n = std::size_t(seconds * rate); i < n; ++i)
-            out.push_back(value(rng));
+            out.push_back(float(amplitude * rng.gaussian()));
     }
 };
 
@@ -104,13 +122,12 @@ inline void band(Synth& synth, int tonic, bool minor, double seconds)
     Synth chords(synth.rate);
     progression(chords, tonic, minor, seconds);
     std::vector<float> mix = chords.out;
-    std::mt19937 rng(7);
-    std::normal_distribution<float> noise(0.0F, 1.0F);
+    Random rng(7);
     const std::size_t beat = std::size_t(0.5 * synth.rate);
     for (std::size_t b = 0; b * beat < mix.size(); ++b) {
         for (std::size_t i = 0; i < std::size_t(0.15 * synth.rate) && b * beat + i < mix.size(); ++i) {
             const double envelope = std::exp(-double(i) / (0.03 * synth.rate));
-            mix[b * beat + i] += float((b % 2 ? 0.25 : 0.12) * envelope * noise(rng));
+            mix[b * beat + i] += float((b % 2 ? 0.25 : 0.12) * envelope * rng.gaussian());
             if (b % 2 == 0)
                 mix[b * beat + i] += float(0.4 * envelope
                                            * std::sin(2.0 * std::numbers::pi * (60.0 + 40.0 * envelope)
@@ -119,10 +136,9 @@ inline void band(Synth& synth, int tonic, bool minor, double seconds)
     }
     static const int majorScale[] = {0, 2, 4, 5, 7, 9, 11};
     static const int minorScale[] = {0, 2, 3, 5, 7, 8, 10};
-    std::uniform_int_distribution<int> degree(0, 6);
     Synth melody(synth.rate);
     while (melody.out.size() < mix.size())
-        melody.chord({tonic + 12 + (minor ? minorScale : majorScale)[degree(rng)]}, 0.25, 0.08);
+        melody.chord({tonic + 12 + (minor ? minorScale : majorScale)[rng.below(7)]}, 0.25, 0.08);
     for (std::size_t i = 0; i < mix.size(); ++i)
         mix[i] += melody.out[i];
     synth.out.insert(synth.out.end(), mix.begin(), mix.end());

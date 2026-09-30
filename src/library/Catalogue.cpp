@@ -2218,18 +2218,22 @@ std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) con
 {
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
+        // The copy that would play (as playbackPathsFor chooses it), and
+        // only its own key: never another recording's.
         "SELECT k.status,k.key_index,k.confidence FROM songs so "
         "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
-        "JOIN files mf ON mf.id=s.mp3_file_id "
-        "JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
-        "WHERE so.id=? AND mf.content_sha256 IS NOT NULL "
+        "JOIN library_roots r ON r.id=s.root_id "
+        "JOIN files mf ON mf.id=s.mp3_file_id JOIN files gf ON gf.id=s.graphics_file_id "
+        "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
+        "WHERE so.id=? AND mf.present=1 AND gf.present=1 AND r.active=1 "
+        "AND (s.playable=1 OR s.unplayable_reason='root_offline') "
         "ORDER BY CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,s.id LIMIT 1"));
     query.addBindValue(songId);
     if (!query.exec()) {
         setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
         return std::nullopt;
     }
-    if (!query.next())
+    if (!query.next() || query.value(0).isNull())
         return std::nullopt;
     SongKeyInfo info;
     info.status = query.value(0).toString();

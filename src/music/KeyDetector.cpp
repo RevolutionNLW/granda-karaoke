@@ -17,10 +17,15 @@ constexpr std::size_t kHop = 4096;
 constexpr double kMinFrequency = 60.0;    // just under B1
 constexpr double kMaxFrequency = 2000.0;  // about B6
 constexpr std::size_t kMaxPeaksPerFrame = 60;
-constexpr double kPeakFloor = 1e-3;       // -60 dB below the frame's strongest peak
+constexpr double kPeakFloor = 1e-2;       // -40 dB below the frame's strongest peak
+// A frame counts only if its strongest note stands well clear (18 dB) of the
+// typical level of the band: drums alone, hiss or a hum below the band are
+// not music to judge a key by.
+constexpr double kMinProminence = 8.0;
 
-// Loud enough to count: above -50 dBFS, and within 26 dB of the song's
-// loud passages (so fades and near-silent intros do not count).
+// Loud enough to count: sound between kMinFrequency and kMaxFrequency above
+// -50 dBFS, and within 26 dB of the song's loud passages (so fades and
+// near-silent intros do not count).
 constexpr double kAbsoluteGate = 0.00316;
 constexpr double kRelativeGate = 0.05;
 // Too little to judge a song's main key by.
@@ -160,6 +165,7 @@ struct Ranking {
     int second = -1;
     double bestScore = -2.0;
     double secondScore = -2.0;
+    std::array<double, 24> scores{};
 };
 
 Ranking rankKeys(const Chroma& chroma)
@@ -168,6 +174,7 @@ Ranking rankKeys(const Chroma& chroma)
     for (int index = 0; index < 24; ++index) {
         const bool minor = index >= 12;
         const double score = pearson(chroma, minor ? kMinorProfile : kMajorProfile, index % 12);
+        ranking.scores[static_cast<std::size_t>(index)] = score;
         if (score > ranking.bestScore) {
             ranking.second = ranking.best;
             ranking.secondScore = ranking.bestScore;
@@ -226,21 +233,40 @@ double KeyDetector::seconds() const
 void KeyDetector::processFrame()
 {
     Frame frame;
-    double energy = 0.0;
+    // Any DC offset is removed first: it is no part of the music.
+    double mean = 0.0;
     for (const float sample : m_window)
-        energy += double(sample) * double(sample);
-    frame.rms = static_cast<float>(std::sqrt(energy / double(kFrameSize)));
-    if (frame.rms <= 0.0F || !std::isfinite(frame.rms)) {
-        frame.rms = 0.0F;
-        m_frames.push_back(std::move(frame));
+        mean += double(sample);
+    mean /= double(kFrameSize);
+    if (!std::isfinite(mean)) {
+        m_frames.push_back(std::move(frame));  // damaged samples: the frame does not count
         return;
     }
+    for (float& sample : m_window)
+        sample = static_cast<float>(double(sample) - mean);
 
     Spectrum& s = spectrum();
     s.compute(m_window.data());
     const double binHz = double(kKeyAnalysisSampleRate) / double(kFrameSize);
     const std::size_t first = std::max<std::size_t>(2, std::size_t(kMinFrequency / binHz));
     const std::size_t last = std::min(s.magnitude.size() - 2, std::size_t(kMaxFrequency / binHz) + 1);
+
+    // The level of the band analysed, as the RMS of a signal holding just
+    // that band (Parseval, one-sided spectrum, corrected for the Hann
+    // window's power of 3/8).
+    double bandPower = 0.0;
+    for (std::size_t k = first; k <= last; ++k)
+        bandPower += s.magnitude[k] * s.magnitude[k];
+    const double level = std::sqrt(2.0 * bandPower / (double(kFrameSize) * double(kFrameSize) * 0.375));
+    if (!(level > 0.0) || !std::isfinite(level)) {
+        m_frames.push_back(std::move(frame));
+        return;
+    }
+    frame.rms = static_cast<float>(level);
+    std::vector<double> band(s.magnitude.begin() + static_cast<std::ptrdiff_t>(first),
+                             s.magnitude.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    std::nth_element(band.begin(), band.begin() + static_cast<std::ptrdiff_t>(band.size() / 2), band.end());
+    const double typical = band[band.size() / 2];
 
     struct Candidate {
         double bin;
@@ -261,6 +287,10 @@ void KeyDetector::processFrame()
         const double amplitude = std::exp(b - 0.25 * (a - c) * shift);
         candidates.push_back({double(k) + shift, amplitude});
         strongest = std::max(strongest, amplitude);
+    }
+    if (strongest < typical * kMinProminence) {
+        m_frames.push_back(std::move(frame));  // no clear note: not counted
+        return;
     }
     if (candidates.size() > kMaxPeaksPerFrame) {
         std::nth_element(candidates.begin(), candidates.begin() + kMaxPeaksPerFrame, candidates.end(),
@@ -318,15 +348,18 @@ KeyAnalysis KeyDetector::finish()
     // The song's tuning: the weighted circular mean of how far every peak
     // lies from the nearest equal-tempered semitone of A = 440 Hz.
     std::complex<double> tuningSum;
+    double tuningWeight = 0.0;
     for (const Frame* frame : voiced) {
         for (const Peak& peak : frame->peaks) {
             const double offset = double(peak.pitch) - std::round(double(peak.pitch));
             tuningSum += double(peak.weight) * std::polar(1.0, 2.0 * std::numbers::pi * offset);
+            tuningWeight += double(peak.weight);
         }
     }
     const double tuning = std::abs(tuningSum) > 0.0
         ? std::arg(tuningSum) / (2.0 * std::numbers::pi) : 0.0;  // semitones, -0.5..0.5
     result.tuningCents = tuning * 100.0;
+    result.tuningConsistency = tuningWeight > 0.0 ? std::abs(tuningSum) / tuningWeight : 0.0;
 
     // Pitch-class profiles: each peak goes to its nearest semitone, weighted
     // down the further it lies between two. Each counted frame adds the same
@@ -365,6 +398,12 @@ KeyAnalysis KeyDetector::finish()
     if (inWindow >= kWindowFrames / 2)
         windows.push_back(window);
 
+    double totalSum = 0.0;
+    for (const double value : total)
+        totalSum += value;
+    for (std::size_t i = 0; i < 12; ++i)
+        result.chroma[i] = totalSum > 0.0 ? total[i] / totalSum : 0.0;
+
     const Ranking ranking = rankKeys(total);
     result.key = MusicalKey::fromIndex(ranking.best);
     result.runnerUp = MusicalKey::fromIndex(ranking.second);
@@ -379,15 +418,23 @@ KeyAnalysis KeyDetector::finish()
     // Confident only when the best key matches well, clearly better than any
     // other (major/minor included), holds through most of a song long enough
     // to tell, and the tuning leaves no doubt which semitone each note is.
-    const double margin = ranking.bestScore < 1.0 && ranking.secondScore < 1.0
-        ? (ranking.bestScore - ranking.secondScore) / (1.0 - ranking.secondScore) : 0.0;
+    const auto marginOver = [&ranking](double other) {
+        return other < 1.0 ? (ranking.bestScore - other) / (1.0 - other) : 0.0;
+    };
+    const double margin = marginOver(ranking.secondScore);
     result.margin = margin;
+    // The same tonic in the other mode (C for Cm), wherever it ranks.
+    const int parallelIndex = ranking.best >= 12 ? ranking.best - 12 : ranking.best + 12;
+    result.parallelMargin = marginOver(ranking.scores[static_cast<std::size_t>(parallelIndex)]);
+    // A song too short to judge in parts has less evidence of holding its key.
     const bool judgeAgreement = windows.size() >= 3;
-    const bool parallel = ranking.second >= 0 && ranking.second % 12 == ranking.best % 12;
     result.confidence = clamp01((ranking.bestScore - 0.5) / 0.35) * clamp01(margin / 0.4)
-        * (judgeAgreement ? result.agreement : 1.0);
+        * (judgeAgreement ? result.agreement : 0.75);
+    // In practice the confidence floor is the strictest test: with full
+    // agreement it needs a match of at least about 0.64 and a margin of
+    // about 0.16; the separate floors below only guard its edges.
     const bool confident = ranking.bestScore >= kMinCorrelation && margin >= kMinMargin
-        && (!parallel || margin >= kMinParallelMargin)
+        && result.parallelMargin >= kMinParallelMargin
         && (!judgeAgreement || result.agreement >= kMinAgreement)
         && std::abs(result.tuningCents) <= kMaxTuningCents
         && result.confidence >= kMinConfidence;

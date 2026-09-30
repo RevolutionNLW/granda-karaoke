@@ -33,6 +33,7 @@
 #include <QThread>
 
 #include <array>
+#include <cmath>
 #include <utility>
 
 namespace {
@@ -1803,11 +1804,18 @@ QString keyDetailJson(const music::KeyAnalysis& analysis)
     detail.insert(QStringLiteral("correlation"), analysis.correlation);
     detail.insert(QStringLiteral("runnerUpCorrelation"), analysis.runnerUpCorrelation);
     detail.insert(QStringLiteral("margin"), analysis.margin);
+    detail.insert(QStringLiteral("parallelMargin"), analysis.parallelMargin);
     detail.insert(QStringLiteral("agreement"), analysis.agreement);
     detail.insert(QStringLiteral("windows"), analysis.windows);
     detail.insert(QStringLiteral("tuningCents"), analysis.tuningCents);
     detail.insert(QStringLiteral("seconds"), analysis.seconds);
     detail.insert(QStringLiteral("voicedSeconds"), analysis.voicedSeconds);
+    detail.insert(QStringLiteral("tuningConsistency"), analysis.tuningConsistency);
+    // The whole profile, so the decision can be re-tuned without decoding again.
+    QJsonArray chroma;
+    for (const double value : analysis.chroma)
+        chroma.append(std::round(value * 10000.0) / 10000.0);
+    detail.insert(QStringLiteral("chroma"), chroma);
     return QString::fromUtf8(QJsonDocument(detail).toJson(QJsonDocument::Compact));
 }
 
@@ -1965,11 +1973,14 @@ void LibraryScanner::analyseSongKeys(std::shared_ptr<SongKeyEngine> engine)
         QString detail;
         QElapsedTimer timer;
         timer.start();
-        ++m_sourceFileReads;
         const SongKeyEngine::Outcome outcome = engine->analyse(path, stop, &analysis, &detail);
         switch (outcome) {
         case SongKeyEngine::Outcome::Interrupted:
             reason = QStringLiteral("stopped");
+            break;
+        case SongKeyEngine::Outcome::EngineUnavailable:
+            qWarning().noquote() << "Song keys: the audio decoder is unavailable:" << detail;
+            reason = QStringLiteral("unavailable");
             break;
         case SongKeyEngine::Outcome::Unreadable:
             if (rootGone(root.path, counts)) {
@@ -2005,5 +2016,7 @@ void LibraryScanner::analyseSongKeys(std::shared_ptr<SongKeyEngine> engine)
         if (reason != QLatin1String("more"))
             break;
     }
-    finish(reason, Catalogue::songKeySummaryOn(database, &error));
+    // Counting takes a moment on a large library: not when asked to stop.
+    finish(reason, reason == QLatin1String("stopped") ? std::nullopt
+                                                      : Catalogue::songKeySummaryOn(database, &error));
 }

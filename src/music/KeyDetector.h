@@ -39,10 +39,15 @@ struct KeyAnalysis {
     double correlation = 0.0;       // best key's match, -1..1
     double runnerUpCorrelation = 0.0;
     double margin = 0.0;            // (best - runner-up) / (1 - runner-up)
+    double parallelMargin = 0.0;    // the same, over the best key's other mode (C / Cm)
     double confidence = 0.0;        // 0..1, from match, margin and consistency
     double agreement = 0.0;         // share of windows whose own key is the main key
     int windows = 0;                // windows judged
     double tuningCents = 0.0;       // the song's offset from A = 440 Hz
+    double tuningConsistency = 0.0; // 0..1: how closely the notes agree on it
+    // The song's pitch-class profile (C..B, summing to 1), kept with the
+    // result so the decision can be re-tuned later without decoding again.
+    std::array<double, 12> chroma{};
     double seconds = 0.0;           // audio analysed
     double voicedSeconds = 0.0;     // audio loud enough to count
 };
@@ -71,7 +76,7 @@ private:
     };
     struct Frame {
         std::vector<Peak> peaks;
-        float rms = 0.0F;
+        float rms = 0.0F;  // level of the band analysed (0: not counted)
     };
 
     void processFrame();
