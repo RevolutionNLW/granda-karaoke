@@ -115,6 +115,18 @@ public:
     }
 };
 
+// An installation whose audio decoder does not work.
+class BrokenEngine final : public SongKeyEngine {
+public:
+    std::atomic_int calls = 0;
+    Outcome analyse(const QString&, const std::function<bool()>&, KeyAnalysis*, QString* detail) override
+    {
+        ++calls;
+        *detail = QStringLiteral("no decoder");
+        return Outcome::EngineUnavailable;
+    }
+};
+
 // Every file under a folder with its size and modification time.
 QMap<QString, QPair<qint64, qint64>> snapshot(const QString& root)
 {
@@ -187,6 +199,7 @@ private slots:
     void playbackPausesAnalysisAndItResumesLater();
     void closingDuringAnalysisStopsPromptly();
     void analysisIsOffUntilTurnedOn();
+    void aBrokenDecoderStopsAnalysisWithoutBlamingSongs();
     void libraryAndPlayerBarShowTheKeys();
 
 private:
@@ -795,6 +808,42 @@ void TestSongKeys::analysisIsOffUntilTurnedOn()
     QCOMPARE(controller.songKeySummary()->analysed, 0);
     QCOMPARE(engine->calls.load(), 0);
     QVERIFY(controller.songKeyStatusText().contains(QStringLiteral("0 of 1")));
+}
+
+void TestSongKeys::aBrokenDecoderStopsAnalysisWithoutBlamingSongs()
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    QVERIFY(QDir().mkpath(root));
+    for (const QString& name : {QStringLiteral("KT007-01 - Synth Band - One"), QStringLiteral("KT007-02 - Synth Band - Two")}) {
+        QVERIFY(QFile::copy(QDir(m_fixtures).filePath(QStringLiteral("C.mp3")), root + QLatin1Char('/') + name + QStringLiteral(".mp3")));
+        QVERIFY(testmedia::writeCdg(root + QLatin1Char('/') + name + QStringLiteral(".cdg"), testmedia::markerCdg(3000, 500)));
+    }
+    auto broken = std::make_shared<BrokenEngine>();
+    std::atomic_int made = 0;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    controller.setSongKeyEngineFactory([broken, &made] { ++made; return broken; });
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    QSignalSpy summary(&controller, &LibraryController::songKeySummaryChanged);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(broken->calls.load() == 1 && !controller.isAnalysingSongKeys(), 10000);
+    QTest::qWait(1000);
+    QCOMPARE(broken->calls.load(), 1);  // stopped at the first song, not tried on every one
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QVERIFY2(controller.songKeyStatusText().contains(QStringLiteral("cannot be worked out")),
+             qPrintable(controller.songKeyStatusText()));
+    // Nothing was recorded against the songs.
+    QCOMPARE(rowCount(temporary.filePath(QStringLiteral("app/enrichment-cache.sqlite")),
+                      QStringLiteral("SELECT count(*) FROM song_keys")), 0);
+    // After the next scan the decoder is made afresh and tried again.
+    const qsizetype scans = finished.count();
+    controller.requestRefreshScan();
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() > scans, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(broken->calls.load() == 2, 10000);
+    QCOMPARE(made.load(), 2);
 }
 
 void TestSongKeys::libraryAndPlayerBarShowTheKeys()

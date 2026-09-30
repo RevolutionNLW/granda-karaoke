@@ -264,6 +264,7 @@ private:
     SongKeyTimings m_keyTimings;
     std::optional<SongKeySummary> m_keySummary;
     bool m_keyChainDone = false;  // the last batch found nothing left to try
+    bool m_keyUnavailable = false;  // the last batch could not work at all
     qint64 m_keyMsTimed = 0;
     qint64 m_keySongsTimed = 0;
 };

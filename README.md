@@ -162,13 +162,16 @@ counting the same (so silent or spoken intros, fades and a last-chorus key chang
 decide it), and compared with major and minor key templates (Sha'ath's audio-derived
 profiles). No extra library or plugin is needed on macOS or Windows.
 
-**Limits.** Automatic key finding is imperfect; typical detectors are right for roughly
-two songs in three on pop music, and most mistakes are the relative major/minor (C for
-Am), a fifth away (G for C) or major for minor. So a key is shown only when the evidence
+**Limits.** Automatic key finding is imperfect, and simple detectors of this kind are
+wrong for a sizeable share of pop songs; how often here has still to be measured on real
+songs. Most mistakes are the relative major/minor (C for Am), a fifth away (G for C) or
+major for minor. So a key is shown only when the evidence
 is clear: a strong match, clearly better than any other key (major versus minor included),
 consistent through the song, and tuning not near a quarter-tone. Only passages with a
-clear note in the 60 Hz to 2 kHz band count: silence, hiss, drums alone, a hum or a DC
-offset never produce a key. Everything else stays
+clear note in the 60 Hz to 2 kHz band count, so silence, hiss, drums alone, a DC offset
+and a hum below the band are not counted. (A mains buzz with strong harmonics inside the
+band is a real series of notes and can still suggest a key; it matters only for a file
+with nothing else in it.) Everything else stays
 blank, as do songs shorter than 30 s, mostly silent, or unreadable. Songs that modulate
 get the key heard longest. The thresholds were set on synthetic music and must be checked
 against real songs (see below) before they are trusted.

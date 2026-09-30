@@ -2218,7 +2218,7 @@ std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) con
 {
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
-        // The copy that would play (as playbackPathsFor chooses it), and
+        // The copy that would play (as activePlaybackPathsFor chooses it), and
         // only its own key: never another recording's.
         "SELECT k.status,k.key_index,k.confidence FROM songs so "
         "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "

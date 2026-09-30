@@ -14,7 +14,8 @@
 
 // Raise when the detector changes: songs analysed by an older version are
 // analysed again (their old key is shown until then).
-inline constexpr int kSongKeyAnalysisVersion = 1;
+// 2: frames judged by the band's energy with a clear note; profile kept.
+inline constexpr int kSongKeyAnalysisVersion = 2;
 
 // Reads and analyses one song file. The implementation decodes with the
 // platform's audio components; the scanner only sees this interface.

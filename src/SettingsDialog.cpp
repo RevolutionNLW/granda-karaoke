@@ -1293,8 +1293,9 @@ QWidget* SettingsDialog::buildMetadata()
     addSection(layout, QStringLiteral("Song keys"), page);
     addHint(layout, QStringLiteral("Works out each song's musical key from its music, for the Key "
                                    "column. Every song is read from the music drive, about half a "
-                                   "second to a second each, so a large library takes many hours "
-                                   "(roughly 8 to 15 for 50,000 songs); it is done a "
+                                   "second to a second each on a typical computer, so a large "
+                                   "library takes many hours (perhaps 8 to 15 for 50,000 songs, "
+                                   "depending on the computer and drive); it is done a "
                                    "little at a time, pauses while a song plays and carries on next "
                                    "time. Nothing is written to the music drive. A key is shown only "
                                    "when it is clear; some songs will stay blank."), page);

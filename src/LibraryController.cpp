@@ -1055,6 +1055,8 @@ void LibraryController::scheduleKeyBatch(int delayMs)
 {
     if (!m_keysEnabled || !m_keyTimer || !m_scanner)
         return;
+    // More work may have come (a scan, turned on again): "done" is stale.
+    m_keyChainDone = false;
     // Never sooner than a wait already asked for (e.g. after playback).
     if (m_keyTimer->isActive())
         delayMs = std::max(delayMs, m_keyTimer->remainingTime());
@@ -1073,6 +1075,7 @@ void LibraryController::startKeyBatch()
     }
     m_keyBatchInFlight = true;
     m_keyChainDone = false;
+    m_keyUnavailable = false;
     m_scanner->setKeyYield(false);
     LibraryScanner* scanner = m_scanner;
     std::shared_ptr<SongKeyEngine> engine = m_keyEngine;
@@ -1112,6 +1115,7 @@ void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
         emit songKeysChanged();
     emit songKeySummaryChanged();
     m_keyChainDone = reason == QLatin1String("done");
+    m_keyUnavailable = reason == QLatin1String("unavailable");
     if (reason == QLatin1String("more"))
         scheduleKeyBatch(m_keyTimings.restMs);
     else if (reason == QLatin1String("stopped"))
@@ -1171,6 +1175,10 @@ QString LibraryController::songKeyStatusText() const
         return found;
     if (counts.remaining() == 0)
         return found + QStringLiteral(" All done.");
+    if (m_keyUnavailable && !m_keyBatchInFlight) {
+        return found + QStringLiteral(" Stopped: song keys cannot be worked out just now (see "
+                                      "the log). It tries again after the next library scan.");
+    }
     if (m_keyChainDone && !m_keyBatchInFlight) {
         return found + QStringLiteral(" Done for now: %L1 could not be read and will be tried again "
                                       "next time.").arg(counts.remaining());

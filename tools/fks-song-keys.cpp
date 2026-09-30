@@ -122,7 +122,7 @@ int main(int argc, char* argv[])
     }
     GstSongKeyEngine engine;
     QTextStream out(stdout);
-    out << "ms\tstatus\tkey\tconfidence\tcorrelation\trunner_up\tmargin\tagreement\ttuning_cents\tseconds\texpected\trelation\tfile\tparallel_margin\ttuning_consistency\tchroma_C_to_B\n";
+    out << "ms\tstatus\tkey\tconfidence\tcorrelation\trunner_up\tmargin\tagreement\ttuning_cents\tseconds\texpected\trelation\tfile\tparallel_margin\ttuning_consistency\tchroma_C_to_B_or_reason\n";
     qint64 totalMs = 0;
     double totalSeconds = 0.0;
     int analysed = 0;
@@ -136,9 +136,15 @@ int main(int argc, char* argv[])
         timer.start();
         const auto outcome = engine.analyse(path, {}, &result, &detail);
         const qint64 ms = timer.elapsed();
+        if (outcome == SongKeyEngine::Outcome::EngineUnavailable
+            || outcome == SongKeyEngine::Outcome::Interrupted) {
+            QTextStream(stderr) << "The audio decoder is unavailable: " << detail << '\n';
+            return 1;
+        }
         if (outcome != SongKeyEngine::Outcome::Analysed) {
+            // The same columns as a result row, with the reason last.
             out << ms << '\t' << (outcome == SongKeyEngine::Outcome::NotAudio ? "not_audio" : "unreadable")
-                << "\t-\t\t\t\t\t\t\t\t\t\t" << path << '\t' << detail << '\n';
+                << "\t-\t\t\t\t\t\t\t\t\t\t" << path << "\t\t\t" << detail << '\n';
             continue;
         }
         ++analysed;
