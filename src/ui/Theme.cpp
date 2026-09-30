@@ -56,6 +56,7 @@ QLabel#settingValue {
     color: #f5f1ea; font-size: 14px; font-weight: 700;
     min-width: VALUE_MIN_WIDTH;
 }
+QLabel#songKeyInfo { color: #b9b5ae; font-size: 13px; }
 QFrame#barSeparator { background: #2c2f35; max-width: 1px; min-width: 1px; }
 
 /* ---- Buttons ------------------------------------------------------- */

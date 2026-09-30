@@ -16,6 +16,7 @@
 
 class LibraryScanner;
 class QTimer;
+class SongKeyEngine;
 
 struct PlaylistSongResolution {
     qint64 songId = 0;
@@ -146,7 +147,42 @@ public:
     // The song's current trusted values from the user-owned store (empty if none).
     MetadataOverride existingTrusted(qint64 songId) const;
 
+    // Background key analysis (see library/SongKeys.h). Off unless the user
+    // turns it on: it reads every song's audio from the music drive, which
+    // takes hours for a large library. While on it works in short batches
+    // between other library work, pauses while a song plays (and for a
+    // while after), and carries on in later sessions where it left off.
+    void setSongKeyAnalysisEnabled(bool enabled);
+    bool songKeyAnalysisEnabled() const { return m_keysEnabled; }
+    bool isAnalysingSongKeys() const { return m_keyBatchInFlight; }
+    // The last progress counted (by a batch, or requestSongKeySummary()).
+    std::optional<SongKeySummary> songKeySummary() const { return m_keySummary; }
+    // Counts progress on a worker thread; songKeySummaryChanged() brings it.
+    void requestSongKeySummary();
+    // Average time to analyse one song this session (0 until measured).
+    qint64 songKeyMsPerSong() const
+    {
+        return m_keySongsTimed > 0 ? m_keyMsTimed / m_keySongsTimed : 0;
+    }
+    // One line for Settings: how far analysis has got, and what it is doing.
+    QString songKeyStatusText() const;
+    // The song's key if it is known well enough to show.
+    std::optional<SongKeyInfo> songKey(qint64 songId) const;
+    // Tests only: the engine used instead of the GStreamer one, and shorter waits.
+    using SongKeyEngineFactory = std::function<std::shared_ptr<SongKeyEngine>()>;
+    void setSongKeyEngineFactory(SongKeyEngineFactory factory) { m_keyEngineFactory = std::move(factory); }
+    struct SongKeyTimings {
+        int startMs = 15000;         // after being turned on or the program starting
+        int restMs = 2000;           // between batches
+        int afterPlaybackMs = 45000; // after a song stops (Autoplay may start the next)
+        int retryMs = 60000;         // after a batch was interrupted for another reason
+    };
+    void setSongKeyTimings(const SongKeyTimings& timings) { m_keyTimings = timings; }
+
 signals:
+    // Keys of some songs became known: shown keys should be looked up again.
+    void songKeysChanged();
+    void songKeySummaryChanged();
     void stateChanged();
     void catalogueChanged();
     void progressChanged(const QString& phase, qint64 done, qint64 total);
@@ -172,6 +208,10 @@ private:
     void finishReviewSummary(const std::optional<ReviewSummary>& summary, quint64 generation);
     void startScan(const QString& rootPath);
     void startPendingWork();
+    void scheduleKeyBatch(int delayMs);
+    void startKeyBatch();
+    bool keyBatchAllowed() const;
+    void onKeyBatchFinished(const QVariantMap& summary);
 
     Catalogue m_catalogue;
     mutable QList<CatalogueSearchRow> m_browseRows;
@@ -211,4 +251,16 @@ private:
     bool m_summaryRunning = false;
     bool m_summaryWanted = false;
     ReviewSummaryReader m_summaryReader;
+    bool m_keysEnabled = false;
+    bool m_keyBatchInFlight = false;
+    bool m_keySummaryRunning = false;
+    bool m_playbackActive = false;
+    QTimer* m_keyTimer = nullptr;
+    std::shared_ptr<SongKeyEngine> m_keyEngine;
+    SongKeyEngineFactory m_keyEngineFactory;
+    SongKeyTimings m_keyTimings;
+    std::optional<SongKeySummary> m_keySummary;
+    QString m_keyState;   // why analysis is not running now (for Settings)
+    qint64 m_keyMsTimed = 0;
+    qint64 m_keySongsTimed = 0;
 };

@@ -32,6 +32,7 @@ QVariant LibraryResultsModel::headerData(int section, Qt::Orientation orientatio
     case SongColumn: return QStringLiteral("SONG");
     case ArtistColumn: return QStringLiteral("ARTIST");
     case LabelColumn: return QStringLiteral("LABEL");
+    case KeyColumn: return QStringLiteral("KEY");
     case DiscColumn: return QStringLiteral("DISC ID");
     case PlaysColumn: return QStringLiteral("PLAYS");
     default: return {};
@@ -58,6 +59,7 @@ QVariant LibraryResultsModel::data(const QModelIndex& index, int role) const
         switch (index.column()) {
         case ArtistColumn: return row.displayArtist;
         case LabelColumn: return row.label;
+        case KeyColumn: return songKey(row.songId);
         case DiscColumn: return compactDiscId(row);
         case PlaysColumn: {
             const int plays = playCount(row.songId);
@@ -73,6 +75,8 @@ QVariant LibraryResultsModel::data(const QModelIndex& index, int role) const
         return playCount(row.songId);
     case PlayingRole:
         return m_playingSongId != 0 && row.songId == m_playingSongId;
+    case KeyRole:
+        return songKey(row.songId);
     case SongIdRole:
         return row.songId;
     case ArtistRole:
@@ -90,7 +94,7 @@ QMap<int, QVariant> LibraryResultsModel::itemData(const QModelIndex& index) cons
 {
     QMap<int, QVariant> roles;
     const int modelRoles[] = {Qt::DisplayRole, SongIdRole, ArtistRole, DiscRole, MoreRole,
-                              LabelRole, DiscIdRole, PlaysRole, PlayingRole};
+                              LabelRole, DiscIdRole, PlaysRole, PlayingRole, KeyRole};
     for (const int role : modelRoles) {
         const QVariant value = data(index, role);
         if (value.isValid())
@@ -140,6 +144,7 @@ void LibraryResultsModel::setRows(const QList<CatalogueSearchRow>& rows, bool sh
         m_rows.push_back(row);
     m_showMoreRow = showMoreRow;
     m_playCountCache.clear();
+    m_keyCache.clear();
     endResetModel();
 }
 
@@ -149,6 +154,13 @@ void LibraryResultsModel::forgetPlayCount(qint64 songId)
     const int row = rowForSongId(songId);
     if (row >= 0)
         emit dataChanged(index(row, PlaysColumn), index(row, PlaysColumn), {Qt::DisplayRole, PlaysRole});
+}
+
+void LibraryResultsModel::forgetKeys()
+{
+    m_keyCache.clear();
+    if (songCount() > 0)
+        emit dataChanged(index(0, KeyColumn), index(songCount() - 1, KeyColumn), {Qt::DisplayRole, KeyRole});
 }
 
 void LibraryResultsModel::setPlayingSongId(qint64 songId)
@@ -173,6 +185,18 @@ int LibraryResultsModel::playCount(qint64 songId) const
     const int plays = m_playCounts(songId);
     m_playCountCache.insert(songId, plays);
     return plays;
+}
+
+QString LibraryResultsModel::songKey(qint64 songId) const
+{
+    if (!m_keys || songId == 0)
+        return {};
+    const auto cached = m_keyCache.constFind(songId);
+    if (cached != m_keyCache.constEnd())
+        return *cached;
+    const QString key = m_keys(songId);
+    m_keyCache.insert(songId, key);
+    return key;
 }
 
 QString LibraryResultsModel::compactDiscId(const CatalogueSearchRow& row)

@@ -2,6 +2,7 @@
 
 #include "library/FilenameParser.h"
 #include "library/MetadataResolver.h"
+#include "library/SongKeys.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -624,6 +625,13 @@ QString Catalogue::prepareEnrichmentCache(const QString& path)
                        "frames_json TEXT,created_at INTEGER NOT NULL,"
                        "PRIMARY KEY(cdg_quick_sha256,cdg_size,engine))"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS enrich.idx_title_screens_size ON title_screens(cdg_size)"),
+        // Song keys worked out from the audio, keyed by the MP3's audio
+        // content (mp3AudioDigest: tags excluded), so a moved, renamed or
+        // retagged copy shares the result. version is the analysis version
+        // (kSongKeyAnalysisVersion); older rows are redone in the background.
+        QStringLiteral("CREATE TABLE IF NOT EXISTS enrich.song_keys(mp3_audio_sha256 BLOB PRIMARY KEY,"
+                       "version INTEGER NOT NULL,status TEXT NOT NULL,key_index INTEGER,"
+                       "confidence REAL,detail_json TEXT,analysed_at INTEGER NOT NULL)"),
         QStringLiteral("PRAGMA enrich.user_version=1"),
     };
     for (const QString& statement : statements) {
@@ -2198,6 +2206,104 @@ std::optional<ReviewSummary> Catalogue::readReviewSummary(const QString& databas
                 result = summary;
             } else if (error) {
                 *error = query.lastError().text();
+            }
+            database.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(name);
+    return result;
+}
+
+std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) const
+{
+    QSqlQuery query(m_database);
+    query.prepare(QStringLiteral(
+        "SELECT k.status,k.key_index,k.confidence FROM songs so "
+        "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+        "JOIN files mf ON mf.id=s.mp3_file_id "
+        "JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
+        "WHERE so.id=? AND mf.content_sha256 IS NOT NULL "
+        "ORDER BY CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,s.id LIMIT 1"));
+    query.addBindValue(songId);
+    if (!query.exec()) {
+        setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
+        return std::nullopt;
+    }
+    if (!query.next())
+        return std::nullopt;
+    SongKeyInfo info;
+    info.status = query.value(0).toString();
+    info.keyIndex = query.value(1).isNull() ? -1 : query.value(1).toInt();
+    info.confidence = query.value(2).toDouble();
+    return info;
+}
+
+std::optional<SongKeySummary> Catalogue::songKeySummaryOn(const QSqlDatabase& database,
+                                                          QString* error)
+{
+    QSqlQuery query(database);
+    query.prepare(QStringLiteral(
+        "SELECT count(*),"
+        "sum(CASE WHEN k.version>=? THEN 1 ELSE 0 END),"
+        "sum(CASE WHEN k.status='confident' THEN 1 ELSE 0 END) FROM "
+        "(SELECT DISTINCT m.id AS file_id,m.content_sha256 AS digest FROM sources s "
+        "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+        "JOIN files m ON m.id=s.mp3_file_id "
+        "WHERE s.kind='loose_cdg' AND s.playable=1 AND m.present=1) t "
+        "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=t.digest"));
+    query.addBindValue(kSongKeyAnalysisVersion);
+    if (!query.exec() || !query.next()) {
+        if (error)
+            *error = query.lastError().text();
+        return std::nullopt;
+    }
+    SongKeySummary summary;
+    summary.total = query.value(0).toLongLong();
+    summary.analysed = query.value(1).toLongLong();
+    summary.confident = query.value(2).toLongLong();
+    return summary;
+}
+
+std::optional<SongKeySummary> Catalogue::readSongKeySummary(const QString& databasePath,
+                                                            QString* error)
+{
+    const QString name = QStringLiteral("fks-song-key-summary-%1")
+                             .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    std::optional<SongKeySummary> result;
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        database.setDatabaseName(databasePath);
+        database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=5000"));
+        if (!database.open()) {
+            if (error)
+                *error = database.lastError().text();
+        } else {
+            // Attached read-only like the connection itself. Without a cache
+            // file nothing has been analysed yet.
+            const QString cachePath = QFileInfo(databasePath).dir().filePath(
+                QStringLiteral("enrichment-cache.sqlite"));
+            QSqlQuery attach(database);
+            attach.prepare(QStringLiteral("ATTACH DATABASE ? AS enrich"));
+            attach.addBindValue(cachePath);
+            if (QFileInfo::exists(cachePath) && attach.exec()) {
+                result = songKeySummaryOn(database, error);
+                if (!result && error && error->contains(QLatin1String("no such table"))) {
+                    error->clear();
+                    result = SongKeySummary{};
+                }
+            } else {
+                QSqlQuery count(database);
+                count.prepare(QStringLiteral(
+                    "SELECT count(DISTINCT m.id) FROM sources s "
+                    "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+                    "JOIN files m ON m.id=s.mp3_file_id "
+                    "WHERE s.kind='loose_cdg' AND s.playable=1 AND m.present=1"));
+                if (count.exec() && count.next()) {
+                    result = SongKeySummary{};
+                    result->total = count.value(0).toLongLong();
+                } else if (error) {
+                    *error = count.lastError().text();
+                }
             }
             database.close();
         }

@@ -216,8 +216,10 @@ SettingsDialog::SettingsDialog(Context context, QWidget* parent)
         const QString page = currentPage();
         if (page == QLatin1String("Library"))
             refreshLibraryStatus();
-        else if (page == QLatin1String("Metadata"))
+        else if (page == QLatin1String("Metadata")) {
             refreshMetadataCounts();
+            refreshSongKeyStatus();
+        }
     });
     m_nav->setCurrentRow(0);
     connect(m_context.preferences, &AppPreferences::changed, this, [this] { refreshControls(); });
@@ -311,6 +313,8 @@ QLineEdit* SettingsDialog::shortcutFilter() { ensureBuilt(pageIndex(QStringLiter
 QKeySequenceEdit* SettingsDialog::shortcutEditor() { ensureBuilt(pageIndex(QStringLiteral("Shortcuts"))); return m_shortcutEditor; }
 QLabel* SettingsDialog::shortcutMessage() { ensureBuilt(pageIndex(QStringLiteral("Shortcuts"))); return m_shortcutMessage; }
 QLabel* SettingsDialog::metadataCounts() { ensureBuilt(pageIndex(QStringLiteral("Metadata"))); return m_metadataCounts; }
+QCheckBox* SettingsDialog::songKeysCheckBox() { ensureBuilt(pageIndex(QStringLiteral("Metadata"))); return m_songKeys; }
+QLabel* SettingsDialog::songKeyStatus() { ensureBuilt(pageIndex(QStringLiteral("Metadata"))); return m_songKeyStatus; }
 
 QString SettingsDialog::currentPage() const
 {
@@ -458,13 +462,14 @@ QWidget* SettingsDialog::buildAppearance()
     addSection(layout, QStringLiteral("Library columns"), page);
     flag(QStringLiteral("Show the Label column"), pref::ShowLabelColumn);
     flag(QStringLiteral("Show the Plays column"), pref::ShowPlaysColumn);
+    flag(QStringLiteral("Show the Key column"), pref::ShowKeyColumn);
 
     layout->addStretch();
     auto* restore = makeButton(QStringLiteral("Restore Appearance Defaults"), page,
                                QStringLiteral("ghostButton"));
     connect(restore, &QPushButton::clicked, this, [prefs] {
         for (const QString& key : {pref::ScalePercent, pref::CompactRows, pref::AlternateRows,
-                                   pref::ShowLabelColumn, pref::ShowPlaysColumn})
+                                   pref::ShowLabelColumn, pref::ShowPlaysColumn, pref::ShowKeyColumn})
             prefs->reset(key);
     });
     layout->addWidget(restore, 0, Qt::AlignLeft);
@@ -1285,6 +1290,38 @@ QWidget* SettingsDialog::buildMetadata()
         refreshMetadataStatus();
     });
 
+    addSection(layout, QStringLiteral("Song keys"), page);
+    addHint(layout, QStringLiteral("Works out each song's musical key from its music, for the Key "
+                                   "column. Every song is read from the music drive, about half a "
+                                   "second to a second each, so a large library takes many hours "
+                                   "(roughly 8 to 15 for 50,000 songs); it is done a "
+                                   "little at a time, pauses while a song plays and carries on next "
+                                   "time. Nothing is written to the music drive. A key is shown only "
+                                   "when it is clear; some songs will stay blank."), page);
+    m_songKeys = new QCheckBox(QStringLiteral("Work out song keys in the background"), page);
+    m_songKeys->setEnabled(available);
+    layout->addWidget(m_songKeys);
+    {
+        AppPreferences* prefs = m_context.preferences;
+        connect(m_songKeys, &QCheckBox::toggled, prefs, [prefs](bool on) {
+            prefs->setFlag(pref::AnalyseSongKeys, on);
+        });
+        QCheckBox* box = m_songKeys;
+        m_refreshers.append([box, prefs] {
+            const QSignalBlocker blocker(box);
+            box->setChecked(prefs->flag(pref::AnalyseSongKeys, false));
+        });
+    }
+    m_songKeyStatus = makeLabel(QString(), page, QStringLiteral("settingsHint"));
+    m_songKeyStatus->setWordWrap(true);
+    layout->addWidget(m_songKeyStatus);
+    if (controller) {
+        connect(controller, &LibraryController::songKeySummaryChanged, this, [this] {
+            if (currentPage() == QLatin1String("Metadata"))
+                refreshSongKeyStatus();
+        });
+    }
+
     addSection(layout, QStringLiteral("Title-screen text"), page);
     addHint(layout, QStringLiteral("Words read from songs' title screens can be saved to a file and "
                                    "read on another computer (the files are matched by content, "
@@ -1361,6 +1398,17 @@ QWidget* SettingsDialog::buildMetadata()
     refreshMetadataStatus();
     layout->addStretch();
     return page;
+}
+
+void SettingsDialog::refreshSongKeyStatus()
+{
+    LibraryController* controller = m_context.libraryController;
+    if (!m_songKeyStatus || !controller || !controller->isAvailable())
+        return;
+    // Counted on a worker thread the first time; the page never waits.
+    if (!controller->songKeySummary())
+        controller->requestSongKeySummary();
+    m_songKeyStatus->setText(controller->songKeyStatusText());
 }
 
 void SettingsDialog::refreshMetadataCounts()

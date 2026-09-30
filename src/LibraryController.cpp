@@ -1,6 +1,7 @@
 #include "LibraryController.h"
 
 #include "BackgroundWork.h"
+#include "SongKeyAnalyser.h"
 
 #include "library/CatalogueTools.h"
 #include "library/FilenameParser.h"
@@ -14,6 +15,7 @@
 #include <QMutexLocker>
 #include <QDateTime>
 #include <QLoggingCategory>
+#include <QPointer>
 #include <QTimer>
 
 namespace {
@@ -141,6 +143,13 @@ LibraryController::LibraryController(const QString& databasePath,
     m_scannerThread.setObjectName(QStringLiteral("LibraryScanner"));
     m_scannerThread.start();
 
+    // Key analysis runs on the same worker, between its other jobs.
+    connect(m_scanner, &LibraryScanner::songKeyBatchFinished,
+            this, &LibraryController::onKeyBatchFinished);
+    m_keyTimer = new QTimer(this);
+    m_keyTimer->setSingleShot(true);
+    connect(m_keyTimer, &QTimer::timeout, this, &LibraryController::startKeyBatch);
+
     // A catalogue written by older resolver rules, or an interrupted reprocess,
     // is brought up to date in the background. It only reads the database, so
     // it also runs while the music drive is disconnected.
@@ -179,10 +188,13 @@ LibraryController::~LibraryController()
 
 bool LibraryController::stopScanner(int timeoutMs)
 {
+    if (m_keyTimer)
+        m_keyTimer->stop();
     if (m_scanner) {
         // Asked while its thread still runs its event loop, so the scanner
         // cannot have been deleted yet. It is deleted on its own thread as
         // that thread ends; from here on nothing uses it or queues work.
+        m_scanner->setKeyYield(true);
         m_scanner->requestCancel();
         m_scanner = nullptr;
         m_scannerThread.quit();
@@ -754,6 +766,7 @@ void LibraryController::requestMetadataReprocess()
 {
     if (!m_scanner || !isAvailable())
         return;
+    m_scanner->setKeyYield(true);  // a key batch in progress ends at once
     if (m_scanning) {
         m_pendingReprocess = true;
         return;
@@ -903,12 +916,25 @@ void LibraryController::setPlaybackActive(bool active)
 {
     if (m_scanner)
         m_scanner->setPaused(active);
+    if (active == m_playbackActive)
+        return;
+    m_playbackActive = active;
+    // Key analysis stops for the song (the scanner's pause ends its batch)
+    // and waits a while after it: Autoplay may be about to start the next.
+    if (active) {
+        if (m_keyTimer)
+            m_keyTimer->stop();
+    } else {
+        scheduleKeyBatch(m_keyTimings.afterPlaybackMs);
+    }
+    emit songKeySummaryChanged();
 }
 
 void LibraryController::startScan(const QString& rootPath)
 {
     if (!m_scanner || rootPath.isEmpty())
         return;
+    m_scanner->setKeyYield(true);  // a key batch in progress ends at once
     if (m_scanning) {
         if (m_scanningRoot == rootPath)
             return;
@@ -984,5 +1010,168 @@ void LibraryController::startPendingWork()
     if (m_pendingReprocess) {
         m_pendingReprocess = false;
         QTimer::singleShot(0, this, &LibraryController::requestMetadataReprocess);
+        return;
     }
+    // Songs a scan added (or a drive that came back) may need keys.
+    scheduleKeyBatch(m_keyTimings.startMs);
+}
+
+void LibraryController::setSongKeyAnalysisEnabled(bool enabled)
+{
+    if (enabled == m_keysEnabled)
+        return;
+    m_keysEnabled = enabled;
+    qCInfo(lcLibraryController) << "Song key analysis" << (enabled ? "turned on" : "turned off");
+    if (enabled) {
+        scheduleKeyBatch(m_keyTimings.startMs);
+        requestSongKeySummary();
+    } else {
+        if (m_keyTimer)
+            m_keyTimer->stop();
+        if (m_scanner && m_keyBatchInFlight)
+            m_scanner->setKeyYield(true);
+    }
+    emit songKeySummaryChanged();
+}
+
+bool LibraryController::keyBatchAllowed() const
+{
+    return m_keysEnabled && m_scanner && isAvailable() && !m_scanning && !m_keyBatchInFlight
+        && m_pendingRoot.isEmpty() && !m_pendingReprocess && !m_playbackActive
+        && isRootConnected();
+}
+
+void LibraryController::scheduleKeyBatch(int delayMs)
+{
+    if (!m_keysEnabled || !m_keyTimer || !m_scanner)
+        return;
+    // Never sooner than a wait already asked for (e.g. after playback).
+    if (m_keyTimer->isActive())
+        delayMs = std::max(delayMs, m_keyTimer->remainingTime());
+    m_keyTimer->start(delayMs);
+}
+
+void LibraryController::startKeyBatch()
+{
+    if (!keyBatchAllowed())
+        return;  // whatever holds it up starts the chain again when it ends
+    if (!m_keyEngine)
+        m_keyEngine = m_keyEngineFactory ? m_keyEngineFactory() : createSongKeyEngine();
+    if (!m_keyEngine) {
+        qCWarning(lcLibraryController) << "Song keys cannot be worked out here: no audio decoder";
+        return;
+    }
+    m_keyBatchInFlight = true;
+    m_scanner->setKeyYield(false);
+    LibraryScanner* scanner = m_scanner;
+    std::shared_ptr<SongKeyEngine> engine = m_keyEngine;
+    QMetaObject::invokeMethod(m_scanner, [scanner, engine] { scanner->analyseSongKeys(engine); },
+                              Qt::QueuedConnection);
+    emit songKeySummaryChanged();
+}
+
+void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
+{
+    if (!m_scanner)
+        return;  // closing
+    m_keyBatchInFlight = false;
+    const QString reason = summary.value(QStringLiteral("reason")).toString();
+    const qint64 decoded = summary.value(QStringLiteral("decoded")).toLongLong();
+    const qint64 reused = summary.value(QStringLiteral("reused")).toLongLong();
+    const qint64 failed = summary.value(QStringLiteral("failed")).toLongLong();
+    const qint64 decodeMs = summary.value(QStringLiteral("decodeMs")).toLongLong();
+    if (summary.contains(QStringLiteral("total"))) {
+        SongKeySummary counts;
+        counts.total = summary.value(QStringLiteral("total")).toLongLong();
+        counts.analysed = summary.value(QStringLiteral("analysed")).toLongLong();
+        counts.confident = summary.value(QStringLiteral("confident")).toLongLong();
+        m_keySummary = counts;
+    }
+    m_keyMsTimed += decodeMs;
+    m_keySongsTimed += decoded;
+    if (decoded + reused + failed > 0) {
+        qCInfo(lcLibraryController).noquote()
+            << "Song keys:" << decoded << "analysed," << reused << "already known," << failed
+            << "unreadable;" << (decoded > 0 ? decodeMs / decoded : 0) << "ms per song;"
+            << (m_keySummary ? QStringLiteral("%1 of %2 done").arg(m_keySummary->analysed).arg(m_keySummary->total)
+                             : QString())
+            << "(" << reason << ")";
+    }
+    if (decoded + reused > 0)
+        emit songKeysChanged();
+    emit songKeySummaryChanged();
+    if (reason == QLatin1String("more"))
+        scheduleKeyBatch(m_keyTimings.restMs);
+    else if (reason == QLatin1String("stopped"))
+        scheduleKeyBatch(m_keyTimings.retryMs);
+    // "done", "offline" and "unavailable" wait for the next scan to finish.
+}
+
+void LibraryController::requestSongKeySummary()
+{
+    if (!isAvailable() || m_keySummaryRunning)
+        return;
+    m_keySummaryRunning = true;
+    const QString path = m_catalogue.databasePath();
+    const QPointer<LibraryController> self(this);
+    background::run(QStringLiteral("SongKeySummary"), [self, path] {
+        QString error;
+        const std::optional<SongKeySummary> summary = Catalogue::readSongKeySummary(path, &error);
+        if (!summary)
+            qCWarning(lcLibraryController).noquote() << "Could not count song keys:" << error;
+        if (QCoreApplication* app = QCoreApplication::instance()) {
+            QMetaObject::invokeMethod(app, [self, summary] {
+                if (!self)
+                    return;
+                self->m_keySummaryRunning = false;
+                if (summary)
+                    self->m_keySummary = summary;
+                emit self->songKeySummaryChanged();
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+std::optional<SongKeyInfo> LibraryController::songKey(qint64 songId) const
+{
+    if (!isAvailable() || songId <= 0)
+        return std::nullopt;
+    QString error;
+    std::optional<SongKeyInfo> key = m_catalogue.songKey(songId, &error);
+    if (!error.isEmpty())
+        qCWarning(lcLibraryController).noquote() << error;
+    return key && key->shown() ? key : std::nullopt;
+}
+
+QString LibraryController::songKeyStatusText() const
+{
+    if (!m_keySummary)
+        return m_keySummaryRunning ? QStringLiteral("Counting songs...") : QString();
+    const SongKeySummary& counts = *m_keySummary;
+    if (counts.total == 0)
+        return QStringLiteral("No songs to analyse yet.");
+    const QString found = QStringLiteral("%L1 of %L2 songs analysed; keys shown for %L3.")
+                              .arg(counts.analysed).arg(counts.total).arg(counts.confident);
+    if (!m_keysEnabled)
+        return found;
+    if (counts.remaining() == 0)
+        return found + QStringLiteral(" All done.");
+    QString doing;
+    if (m_playbackActive)
+        doing = QStringLiteral("Paused while a song plays.");
+    else if (m_scanning)
+        doing = QStringLiteral("Waiting for the library scan.");
+    else if (!isRootConnected())
+        doing = QStringLiteral("Waiting for the music drive.");
+    else if (m_keyBatchInFlight)
+        doing = QStringLiteral("Working.");
+    else
+        doing = QStringLiteral("Resting.");
+    QString left;
+    if (const qint64 perSong = songKeyMsPerSong(); perSong > 0) {
+        const qint64 minutes = std::max<qint64>(1, counts.remaining() * perSong / 60000);
+        left = minutes >= 120 ? QStringLiteral(" About %L1 hours left.").arg((minutes + 30) / 60)
+                              : QStringLiteral(" About %L1 minutes left.").arg(minutes);
+    }
+    return found + left + QLatin1Char(' ') + doing;
 }

@@ -21,6 +21,10 @@ inline const QString CompactRows = QStringLiteral("ui.compactRows");
 inline const QString AlternateRows = QStringLiteral("ui.alternateRows");
 inline const QString ShowLabelColumn = QStringLiteral("ui.showLabelColumn");
 inline const QString ShowPlaysColumn = QStringLiteral("ui.showPlaysColumn");
+inline const QString ShowKeyColumn = QStringLiteral("ui.showKeyColumn");
+// Work out song keys in the background (off unless turned on: it reads every
+// song from the music drive).
+inline const QString AnalyseSongKeys = QStringLiteral("library.analyseSongKeys");
 // "remember" (default), "on" or "off".
 inline const QString AutoplayAtStartup = QStringLiteral("playback.autoplayAtStartup");
 inline const QString DefaultKey = QStringLiteral("playback.defaultKey");

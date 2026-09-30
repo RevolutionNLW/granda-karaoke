@@ -68,6 +68,9 @@ public:
     QPushButton* tempoUpButton() const { return m_tempoUpButton; }
     QPushButton* tempoResetButton() const { return m_tempoResetButton; }
     QLabel* keyValueLabel() const { return m_keyValueLabel; }
+    // The loaded song's own key and the key heard with Key applied (hidden
+    // while the song's key is not known).
+    QLabel* songKeyLabel() const { return m_songKeyLabel; }
     QLabel* tempoValueLabel() const { return m_tempoValueLabel; }
     QString statusText() const;
     QString songText() const;
@@ -175,6 +178,7 @@ private:
     QPushButton* m_pauseButton;
     QPushButton* m_stopButton;
     QLabel* m_keyValueLabel;
+    QLabel* m_songKeyLabel = nullptr;
     QLabel* m_tempoValueLabel;
     QPushButton* m_keyDownButton;
     QPushButton* m_keyUpButton;
@@ -196,6 +200,10 @@ private:
     bool m_playStartPending = false;
     // The home-screen widget that had the keyboard before the lyrics opened.
     QPointer<QWidget> m_homeFocus;
+    // The loaded song's key (-1 unknown), looked up once per song and again
+    // when keys change, not on every position update.
+    int m_songKeyIndex = -1;
+    qint64 m_songKeyForId = -1;
     // songTitle() is looked up once per song, not on every position update.
     QString m_title;
     QString m_titlePath;

@@ -95,6 +95,7 @@ private:
     FolderChooser m_folderChooser;
     bool m_playlistAvailable = false;
     bool m_active = true;
+    bool m_keyColumnWanted = true;  // the user's choice; see applyColumnWidths()
     // The (trimmed) search text the results show, so typing only spaces
     // does not search again and lose the list's place.
     QString m_shownQuery;

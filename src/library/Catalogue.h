@@ -78,6 +78,26 @@ struct ReviewSummary {
     qint64 manual = 0;
 };
 
+// A song's key, as worked out from its audio (see library/SongKeys.h).
+struct SongKeyInfo {
+    QString status;      // "confident", "uncertain", "silent", "too_short", "not_audio"
+    int keyIndex = -1;   // 0-23 (music::MusicalKey::index), -1 for none
+    double confidence = 0.0;
+
+    // Only a confident key is ever shown.
+    bool shown() const { return status == QLatin1String("confident") && keyIndex >= 0; }
+};
+
+// How far key analysis has got in the active music folder: MP3s of playable
+// songs, those analysed by the current version, and those with a shown key.
+struct SongKeySummary {
+    qint64 total = 0;
+    qint64 analysed = 0;
+    qint64 confident = 0;
+
+    qint64 remaining() const { return total > analysed ? total - analysed : 0; }
+};
+
 struct PlaybackPaths {
     QString mp3Path;
     QString graphicsPath;
@@ -193,6 +213,13 @@ public:
     // raw file/folder/tag data and the evidence behind the automatic result.
     QVariantMap reviewDetail(qint64 songId, QString* error = nullptr) const;
     bool hasSongs(QString* error = nullptr) const;
+    // The key of the MP3 the song would play (its preferred source first),
+    // if one has been worked out.
+    std::optional<SongKeyInfo> songKey(qint64 songId, QString* error = nullptr) const;
+    // Key-analysis progress of a catalogue file, on a read-only connection
+    // of its own: safe to call on a worker thread.
+    static std::optional<SongKeySummary> readSongKeySummary(const QString& databasePath,
+                                                            QString* error = nullptr);
 
     QByteArray computeSha256(qint64 fileId, QString* error = nullptr);
     bool mergeLooseDuplicates(qint64 firstSourceId, qint64 secondSourceId,
@@ -220,6 +247,10 @@ private:
     friend class MetadataResolver;
 
     static QString playlistSongLookupSql();
+    // The MP3s key analysis covers (see SongKeySummary), counted on any
+    // connection that has the enrichment cache attached as "enrich".
+    static std::optional<SongKeySummary> songKeySummaryOn(const QSqlDatabase& database,
+                                                          QString* error);
 
     bool ensureSchema(QString* error);
     bool backupBeforeV5Migration(int currentVersion, bool existedNonEmpty,

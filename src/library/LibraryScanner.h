@@ -2,12 +2,14 @@
 
 #include <QElapsedTimer>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QVariantMap>
 
 #include <atomic>
 #include <memory>
 
+class SongKeyEngine;
 class TitleScreenOcrEngine;
 
 struct ScanOptions {
@@ -50,6 +52,16 @@ public:
     void setPaused(bool paused) { m_paused.store(paused); }
     bool isPaused() const { return m_paused.load(); }
     quint64 sourceFileReads() const { return m_sourceFileReads; }
+    // Asks a running key-analysis batch to end after (or during) the current
+    // song, so other work queued on this thread can start. Safe from any
+    // thread. The controller clears it before queueing the next batch.
+    void setKeyYield(bool yield) { m_keyYield.store(yield); }
+    // One short batch of background key analysis in the active music folder
+    // (at most about kKeyBatchMs of work), on this worker's thread. Ends
+    // early when asked to yield or cancel, or when playback starts, and
+    // always emits songKeyBatchFinished().
+    void analyseSongKeys(std::shared_ptr<SongKeyEngine> engine);
+    static constexpr int kKeyBatchMs = 8000;
 
 public slots:
     void scan(const QString& rootPath);
@@ -62,6 +74,11 @@ signals:
     void finished(const QVariantMap& summary);
     void failed(const QString& message);
     void libraryReady();
+    // "reason": "more" (work left), "done" (nothing left to try),
+    // "stopped" (yield, cancel or playback), "offline", "unavailable";
+    // plus the counts of SongKeySummary ("total", "analysed", "confident")
+    // and of this batch ("decoded", "reused", "failed", "decodeMs").
+    void songKeyBatchFinished(const QVariantMap& summary);
 
 private:
     bool shouldStop() const;
@@ -99,6 +116,10 @@ private:
     std::atomic_bool m_cancelled = false;
     std::atomic_bool m_paused = false;
     std::atomic_bool m_titleScreensRequested = false;
+    std::atomic_bool m_keyYield = false;
+    // MP3 files that could not be read this session (not recorded, so a
+    // later session tries again); key batches pass over them.
+    QSet<qint64> m_keySkip;
     QElapsedTimer m_scanTimer;
     QElapsedTimer m_progressTimer;
     quint64 m_sourceFileReads = 0;

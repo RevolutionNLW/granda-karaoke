@@ -12,6 +12,7 @@
 #include "playlist/PlaylistStore.h"
 #include "AppPreferences.h"
 #include "SettingsDialog.h"
+#include "library/SongKeys.h"
 #include "ui/Controls.h"
 #include "ui/Shortcuts.h"
 #include "ui/ElidedLabel.h"
@@ -237,6 +238,10 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
             updateControls();
         };
         connect(m_libraryController, &LibraryController::catalogueChanged, this, retitle);
+        connect(m_libraryController, &LibraryController::songKeysChanged, this, [this] {
+            m_songKeyForId = -1;
+            updateControls();
+        });
         connect(m_libraryController, &LibraryController::libraryReady, this, retitle);
         // Enter is decided here first (see eventFilter).
         m_library->searchBox()->installEventFilter(this);
@@ -255,7 +260,8 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     else
         m_preferences->reset(pref::AudioOutput);  // this session starts on the usual output
     connect(m_preferences, &AppPreferences::changed, this, &MainWindow::applyPreference);
-    for (const QString& key : {pref::ShowLabelColumn, pref::ShowPlaysColumn, pref::ConfirmRemoveSong})
+    for (const QString& key : {pref::ShowLabelColumn, pref::ShowPlaysColumn, pref::ShowKeyColumn,
+                               pref::ConfirmRemoveSong, pref::AnalyseSongKeys})
         applyPreference(key);
     // Everything above is stated at 100%: bring it to the interface scale.
     theme::rescale(this);
@@ -339,6 +345,10 @@ QWidget* MainWindow::buildPlayerBar()
     QHBoxLayout* keyRow = makeStepper(QStringLiteral("Key:"), m_keyDownButton, m_keyValueLabel,
                                       m_keyUpButton, m_keyResetButton);
     m_keyValueLabel->setText(QStringLiteral("0"));
+    // Beside the Key control: the song's own key and the key sung in.
+    m_songKeyLabel = makeLabel(QString(), bar, QStringLiteral("songKeyInfo"));
+    m_songKeyLabel->setVisible(false);
+    keyRow->addWidget(m_songKeyLabel);
     QHBoxLayout* tempoRow = makeStepper(QStringLiteral("Tempo:"), m_tempoDownButton,
                                         m_tempoValueLabel, m_tempoUpButton, m_tempoResetButton);
     m_tempoValueLabel->setText(QStringLiteral("100%"));
@@ -533,6 +543,11 @@ void MainWindow::applyPreference(const QString& key)
     } else if (key == pref::ShowPlaysColumn && m_library) {
         m_library->setColumnVisible(LibraryResultsModel::PlaysColumn,
                                     m_preferences->flag(key, true));
+    } else if (key == pref::ShowKeyColumn && m_library) {
+        m_library->setColumnVisible(LibraryResultsModel::KeyColumn,
+                                    m_preferences->flag(key, true));
+    } else if (key == pref::AnalyseSongKeys && m_libraryController) {
+        m_libraryController->setSongKeyAnalysisEnabled(m_preferences->flag(key, false));
     } else if (key == pref::ConfirmRemoveSong && m_playlistView) {
         m_playlistView->setConfirmRemove(m_preferences->flag(key, true));
     } else if (key == pref::Volume) {
@@ -1296,6 +1311,28 @@ void MainWindow::updateControls()
     const int key = hasSong ? m_player->keySemitones() : 0;
     const int tempo = hasSong ? m_player->tempoPercent() : 100;
     m_keyValueLabel->setText(key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key));
+    // Original key -> current key, only for a song whose key is known
+    // (never for a maintenance preview).
+    const qint64 keySongId = hasSong && !m_previewing ? m_playSongId : 0;
+    if (keySongId != m_songKeyForId) {
+        m_songKeyForId = keySongId;
+        m_songKeyIndex = -1;
+        if (keySongId > 0 && m_libraryController) {
+            if (const std::optional<SongKeyInfo> info = m_libraryController->songKey(keySongId))
+                m_songKeyIndex = info->keyIndex;
+        }
+    }
+    if (m_songKeyIndex >= 0) {
+        const QString original = songKeyName(m_songKeyIndex);
+        const QString current = transposedKeyName(m_songKeyIndex, key);
+        const QString shift = key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key);
+        m_songKeyLabel->setText(key == 0 ? QStringLiteral("(%1)").arg(original)
+                                         : QStringLiteral("(%1 \u2192 %2)").arg(original, current));
+        m_songKeyLabel->setToolTip(key == 0
+            ? QStringLiteral("Original key: %1").arg(original)
+            : QStringLiteral("Original key: %1\nCurrent key: %2 (%3)").arg(original, current, shift));
+    }
+    m_songKeyLabel->setVisible(m_songKeyIndex >= 0);
     m_tempoValueLabel->setText(QStringLiteral("%1%").arg(tempo));
     // Key/Tempo belong to singing, not to a maintenance preview.
     const bool adjustable = hasSong && !m_previewing;

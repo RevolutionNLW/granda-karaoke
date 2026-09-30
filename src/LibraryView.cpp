@@ -2,6 +2,7 @@
 
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
+#include "library/SongKeys.h"
 #include "ui/Controls.h"
 #include "ui/ElidedLabel.h"
 #include "ui/Theme.h"
@@ -90,7 +91,7 @@ public:
         }
         const int column = index.column();
         const bool secondary = column == Model::LabelColumn || column == Model::DiscColumn
-            || column == Model::PlaysColumn;
+            || column == Model::PlaysColumn || column == Model::KeyColumn;
         painter->setPen(strong ? theme::color::selectionText
                                : secondary ? theme::color::secondaryText : theme::color::text);
         QFont font = option.font;
@@ -205,6 +206,10 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         m_resultsModel->setPlayCountProvider([controller](qint64 songId) {
             return controller->playStats(songId).playCount;
         });
+        m_resultsModel->setKeyProvider([controller](qint64 songId) {
+            const std::optional<SongKeyInfo> key = controller->songKey(songId);
+            return key ? songKeyName(key->keyIndex) : QString();
+        });
     }
     m_results->setModel(m_resultsModel);
     m_results->setObjectName(QStringLiteral("libraryResults"));
@@ -232,6 +237,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     columns->setSectionResizeMode(LibraryResultsModel::ArtistColumn, QHeaderView::Stretch);
     columns->setSectionResizeMode(LibraryResultsModel::SongColumn, QHeaderView::Stretch);
     columns->setSectionResizeMode(LibraryResultsModel::LabelColumn, QHeaderView::Fixed);
+    columns->setSectionResizeMode(LibraryResultsModel::KeyColumn, QHeaderView::Fixed);
     columns->setSectionResizeMode(LibraryResultsModel::DiscColumn, QHeaderView::Fixed);
     columns->setSectionResizeMode(LibraryResultsModel::PlaysColumn, QHeaderView::Fixed);
     // Artist first, as people look for songs by singer.
@@ -327,6 +333,8 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                 this, &LibraryView::updateState);
         connect(m_controller, &LibraryController::playStatsChanged,
                 m_resultsModel, &LibraryResultsModel::forgetPlayCount);
+        connect(m_controller, &LibraryController::songKeysChanged,
+                m_resultsModel, &LibraryResultsModel::forgetKeys);
         connect(m_controller, &LibraryController::catalogueChanged,
                 this, &LibraryView::refreshSearch);
         connect(m_controller, &LibraryController::libraryReady,
@@ -350,11 +358,33 @@ void LibraryView::applyColumnWidths()
     columns->resizeSection(LibraryResultsModel::LabelColumn, share(18, 100, 180));
     columns->resizeSection(LibraryResultsModel::DiscColumn, share(15, 106, 140));
     columns->resizeSection(LibraryResultsModel::PlaysColumn, theme::px(64));
+    // Room for the widest key ("G#m", "Bbm") and the caption. The Key column
+    // gives way when Artist and Song would be left narrower than Label (a
+    // small screen at a large interface size); the player bar still shows
+    // the key of the song being sung.
+    const int keyWidth = theme::px(52);
+    columns->resizeSection(LibraryResultsModel::KeyColumn, keyWidth);
+    int fixed = keyWidth;
+    for (const int column : {int(LibraryResultsModel::LabelColumn), int(LibraryResultsModel::DiscColumn),
+                             int(LibraryResultsModel::PlaysColumn)}) {
+        if (!m_results->isColumnHidden(column))
+            fixed += columns->sectionSize(column);
+    }
+    const int label = m_results->isColumnHidden(LibraryResultsModel::LabelColumn)
+        ? 0 : columns->sectionSize(LibraryResultsModel::LabelColumn);
+    const bool room = (width - fixed) / 2 >= label;
+    m_results->setColumnHidden(LibraryResultsModel::KeyColumn, !(m_keyColumnWanted && room));
 }
 
 void LibraryView::setColumnVisible(int column, bool visible)
 {
+    if (column == LibraryResultsModel::KeyColumn) {
+        m_keyColumnWanted = visible;
+        applyColumnWidths();
+        return;
+    }
     m_results->setColumnHidden(column, !visible);
+    applyColumnWidths();
 }
 
 void LibraryView::setActive(bool active)

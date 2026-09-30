@@ -8,6 +8,7 @@
 #include "library/MetadataResolver.h"
 #include "library/MetadataOverrideStore.h"
 #include "library/SidecarParser.h"
+#include "library/SongKeys.h"
 #include "library/TitleScreenText.h"
 #include "library/UserStateStore.h"
 #include "cdg/CdgDecoder.h"
@@ -18,6 +19,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -1787,4 +1789,221 @@ bool LibraryScanner::readTitleScreens(Catalogue& catalogue, qint64 rootId,
     counts.insert(QStringLiteral("titleScreensWithFrames"), recognised);
     counts.insert(QStringLiteral("titleScreensWithoutFrame"), withoutTitleScreen);
     return true;
+}
+
+namespace {
+
+QString keyDetailJson(const music::KeyAnalysis& analysis)
+{
+    QJsonObject detail;
+    if (analysis.key)
+        detail.insert(QStringLiteral("key"), QString::fromStdString(analysis.key->name()));
+    if (analysis.runnerUp)
+        detail.insert(QStringLiteral("runnerUp"), QString::fromStdString(analysis.runnerUp->name()));
+    detail.insert(QStringLiteral("correlation"), analysis.correlation);
+    detail.insert(QStringLiteral("runnerUpCorrelation"), analysis.runnerUpCorrelation);
+    detail.insert(QStringLiteral("margin"), analysis.margin);
+    detail.insert(QStringLiteral("agreement"), analysis.agreement);
+    detail.insert(QStringLiteral("windows"), analysis.windows);
+    detail.insert(QStringLiteral("tuningCents"), analysis.tuningCents);
+    detail.insert(QStringLiteral("seconds"), analysis.seconds);
+    detail.insert(QStringLiteral("voicedSeconds"), analysis.voicedSeconds);
+    return QString::fromUtf8(QJsonDocument(detail).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
+
+void LibraryScanner::analyseSongKeys(std::shared_ptr<SongKeyEngine> engine)
+{
+    QVariantMap summary;
+    qint64 decoded = 0;
+    qint64 reused = 0;
+    qint64 failed = 0;
+    qint64 decodeMs = 0;
+    const auto finish = [&](const QString& reason, const std::optional<SongKeySummary>& progress) {
+        summary.insert(QStringLiteral("reason"), reason);
+        summary.insert(QStringLiteral("decoded"), decoded);
+        summary.insert(QStringLiteral("reused"), reused);
+        summary.insert(QStringLiteral("failed"), failed);
+        summary.insert(QStringLiteral("decodeMs"), decodeMs);
+        if (progress) {
+            summary.insert(QStringLiteral("total"), progress->total);
+            summary.insert(QStringLiteral("analysed"), progress->analysed);
+            summary.insert(QStringLiteral("confident"), progress->confident);
+        }
+        emit songKeyBatchFinished(summary);
+    };
+    // Its own stop test: never the scan's time limit, and playback, a
+    // yield request or closing all end the batch rather than wait in it.
+    const auto stop = [this] {
+        return m_cancelled.load() || m_keyYield.load() || m_paused.load();
+    };
+    if (!engine || stop()) {
+        finish(engine ? QStringLiteral("stopped") : QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    Catalogue catalogue(m_databasePath, m_cacheDirectory);
+    QString error;
+    if (!catalogue.open(&error, m_knownRoots)) {
+        qWarning().noquote() << "Song keys: could not open the catalogue:" << error;
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    // Results that would be lost at the end of the session are not worth
+    // the drive's time.
+    if (!catalogue.enrichmentCacheIsDurable()) {
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    QSqlDatabase database = catalogue.database();
+    const CatalogueRoot root = catalogue.activeRoot(&error);
+    if (root.id == 0 || !QFileInfo(root.path).isDir()) {
+        finish(root.id == 0 ? QStringLiteral("done") : QStringLiteral("offline"),
+               Catalogue::songKeySummaryOn(database, &error));
+        return;
+    }
+
+    // The next MP3s without a current result: most-sung songs first, then
+    // folder by folder (kind to a spinning drive).
+    QStringList skipped;
+    for (const qint64 id : std::as_const(m_keySkip))
+        skipped.append(QString::number(id));
+    QSqlQuery targets(database);
+    targets.prepare(QStringLiteral(
+        "SELECT m.id,m.rel_path,m.content_sha256,max(COALESCE(p.play_count,0)) AS plays "
+        "FROM sources s JOIN files m ON m.id=s.mp3_file_id "
+        "LEFT JOIN song_plays p ON p.song_id=s.song_id "
+        "WHERE s.root_id=? AND s.kind='loose_cdg' AND s.playable=1 AND m.present=1 "
+        "AND (m.content_sha256 IS NULL OR NOT EXISTS(SELECT 1 FROM enrich.song_keys k "
+        "WHERE k.mp3_audio_sha256=m.content_sha256 AND k.version>=?))%1 "
+        "GROUP BY m.id ORDER BY plays DESC,m.rel_dir,m.id LIMIT 40")
+        .arg(skipped.isEmpty() ? QString()
+                               : QStringLiteral(" AND m.id NOT IN (%1)").arg(skipped.join(QLatin1Char(',')))));
+    targets.addBindValue(root.id);
+    targets.addBindValue(kSongKeyAnalysisVersion);
+    if (!targets.exec()) {
+        qWarning().noquote() << "Song keys:" << queryError(targets, QStringLiteral("could not list songs"));
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    struct Target { qint64 id; QString relPath; QByteArray digest; };
+    QList<Target> list;
+    while (targets.next())
+        list.append({targets.value(0).toLongLong(), targets.value(1).toString(), targets.value(2).toByteArray()});
+    targets.finish();
+
+    // Each result is written on its own (no transaction is ever held across
+    // a decode), so other connections are never kept waiting.
+    const auto store = [&](const QByteArray& digest, const QString& status, int keyIndex,
+                           double confidence, const QString& detail) {
+        QSqlQuery insert(database);
+        insert.prepare(QStringLiteral(
+            "INSERT OR REPLACE INTO enrich.song_keys(mp3_audio_sha256,version,status,key_index,"
+            "confidence,detail_json,analysed_at) VALUES(?,?,?,?,?,?,?)"));
+        insert.addBindValue(digest);
+        insert.addBindValue(kSongKeyAnalysisVersion);
+        insert.addBindValue(status);
+        insert.addBindValue(keyIndex >= 0 ? QVariant(keyIndex) : QVariant(QMetaType::fromType<int>()));
+        insert.addBindValue(confidence);
+        insert.addBindValue(detail);
+        insert.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        if (!insert.exec()) {
+            qWarning().noquote() << "Song keys:" << queryError(insert, QStringLiteral("could not store a result"));
+            return false;
+        }
+        return true;
+    };
+
+    QElapsedTimer batch;
+    batch.start();
+    QString reason = list.isEmpty() ? QStringLiteral("done") : QStringLiteral("more");
+    QVariantMap counts;
+    for (const Target& target : std::as_const(list)) {
+        if (stop()) {
+            reason = QStringLiteral("stopped");
+            break;
+        }
+        if (batch.hasExpired(kKeyBatchMs))
+            break;
+        const QString path = QDir(root.path).filePath(target.relPath);
+        // The digest is taken afresh (128 KiB), so a file changed since the
+        // last scan can never be given another file's key.
+        QByteArray digest;
+        ++m_sourceFileReads;
+        if (!mp3AudioDigest(path, &digest)) {
+            if (rootGone(root.path, counts)) {
+                reason = QStringLiteral("offline");
+                break;
+            }
+            m_keySkip.insert(target.id);
+            ++failed;
+            continue;
+        }
+        if (digest != target.digest) {
+            QSqlQuery update(database);
+            update.prepare(QStringLiteral("UPDATE files SET content_sha256=? WHERE id=?"));
+            update.addBindValue(digest);
+            update.addBindValue(target.id);
+            if (!update.exec()) {
+                // Perhaps a scan holds the catalogue: this file waits for later.
+                qWarning().noquote() << "Song keys:" << queryError(update, QStringLiteral("could not store a digest"));
+                m_keySkip.insert(target.id);
+                continue;
+            }
+        }
+        QSqlQuery known(database);
+        known.prepare(QStringLiteral("SELECT 1 FROM enrich.song_keys WHERE mp3_audio_sha256=? AND version>=?"));
+        known.addBindValue(digest);
+        known.addBindValue(kSongKeyAnalysisVersion);
+        if (known.exec() && known.next()) {
+            ++reused;  // the same audio, already analysed (a copy, or a rebuilt catalogue)
+            continue;
+        }
+        known.finish();
+
+        music::KeyAnalysis analysis;
+        QString detail;
+        QElapsedTimer timer;
+        timer.start();
+        ++m_sourceFileReads;
+        const SongKeyEngine::Outcome outcome = engine->analyse(path, stop, &analysis, &detail);
+        switch (outcome) {
+        case SongKeyEngine::Outcome::Interrupted:
+            reason = QStringLiteral("stopped");
+            break;
+        case SongKeyEngine::Outcome::Unreadable:
+            if (rootGone(root.path, counts)) {
+                reason = QStringLiteral("offline");
+                break;
+            }
+            qInfo().noquote() << "Song keys: could not read" << target.relPath << "-" << detail;
+            m_keySkip.insert(target.id);
+            ++failed;
+            break;
+        case SongKeyEngine::Outcome::NotAudio: {
+            // Recorded, so it is not tried again until the file or the
+            // analysis changes.
+            qInfo().noquote() << "Song keys: no usable audio in" << target.relPath << "-" << detail;
+            QJsonObject failure;
+            failure.insert(QStringLiteral("error"), detail);
+            if (!store(digest, QStringLiteral("not_audio"), -1, 0.0,
+                       QString::fromUtf8(QJsonDocument(failure).toJson(QJsonDocument::Compact))))
+                m_keySkip.insert(target.id);
+            ++failed;
+            break;
+        }
+        case SongKeyEngine::Outcome::Analysed:
+            decodeMs += timer.elapsed();
+            if (store(digest, QString::fromLatin1(music::statusName(analysis.status)),
+                      analysis.key ? analysis.key->index() : -1, analysis.confidence,
+                      keyDetailJson(analysis)))
+                ++decoded;
+            else
+                m_keySkip.insert(target.id);
+            break;
+        }
+        if (reason != QLatin1String("more"))
+            break;
+    }
+    finish(reason, Catalogue::songKeySummaryOn(database, &error));
 }

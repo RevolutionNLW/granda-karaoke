@@ -22,11 +22,13 @@ public:
         LabelRole,
         DiscIdRole,  // compact disc-track, e.g. "SF123-04"
         PlaysRole,   // times sung (0 when never)
-        PlayingRole  // this version is the song now playing
+        PlayingRole, // this version is the song now playing
+        KeyRole      // the song's musical key, e.g. "F#m" (empty when not known)
     };
     // Columns in model order; the table shows Artist first.
-    enum Column { SongColumn, ArtistColumn, LabelColumn, DiscColumn, PlaysColumn, ColumnCount };
+    enum Column { SongColumn, ArtistColumn, LabelColumn, KeyColumn, DiscColumn, PlaysColumn, ColumnCount };
     using PlayCountProvider = std::function<int(qint64 songId)>;
+    using KeyProvider = std::function<QString(qint64 songId)>;
 
     static constexpr auto SongMimeType = "application/x-fks-song-id";
 
@@ -50,16 +52,22 @@ public:
     // until forgetPlayCounts().
     void setPlayCountProvider(PlayCountProvider provider) { m_playCounts = std::move(provider); }
     void forgetPlayCount(qint64 songId);
+    // Keys likewise: looked up for rows on screen, remembered until forgetKeys().
+    void setKeyProvider(KeyProvider provider) { m_keys = std::move(provider); }
+    void forgetKeys();
     void setPlayingSongId(qint64 songId);
 
 private:
     static QString discAndTrack(const CatalogueSearchRow& row);
     static QString compactDiscId(const CatalogueSearchRow& row);
     int playCount(qint64 songId) const;
+    QString songKey(qint64 songId) const;
 
     std::vector<CatalogueSearchRow> m_rows;
     bool m_showMoreRow = false;
     PlayCountProvider m_playCounts;
     mutable QHash<qint64, int> m_playCountCache;
+    KeyProvider m_keys;
+    mutable QHash<qint64, QString> m_keyCache;
     qint64 m_playingSongId = 0;
 };
