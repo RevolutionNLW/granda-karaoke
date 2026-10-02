@@ -19,6 +19,10 @@ struct MetadataOverride {
     std::optional<QString> series;
     std::optional<QString> trustedDiscId;
     std::optional<int> trustedTrack;
+    // The key the backing track is recorded in, as chosen by the user
+    // (0-23, music::MusicalKey::index). Never the Key +/- transpose, which is
+    // kept separately with Key/Tempo; shown in place of a detected key.
+    std::optional<int> originalKey;
     QString origin = QStringLiteral("manual");  // "manual" or "import"
     qint64 createdAt = 0;
     qint64 updatedAt = 0;
@@ -32,7 +36,7 @@ struct MetadataOverride {
 
     bool hasValues() const
     {
-        return artist || title || label || series || trustedDiscId || trustedTrack;
+        return artist || title || label || series || trustedDiscId || trustedTrack || originalKey;
     }
 };
 
@@ -45,7 +49,7 @@ public:
     // can never re-apply a value the user has just changed or cleared.
     static QMutex& synchronisation();
 
-    static constexpr int SchemaVersion = 2;
+    static constexpr int SchemaVersion = 3;
 
     explicit MetadataOverrideStore(QString databasePath);
     ~MetadataOverrideStore();

@@ -18,6 +18,8 @@
 #include <QPointer>
 #include <QTimer>
 
+#include <utility>
+
 namespace {
 Q_LOGGING_CATEGORY(lcLibraryController, "fks.library.controller")
 
@@ -734,6 +736,7 @@ bool LibraryController::chooseRoot(const QString& path, QString* error)
     emit catalogueChanged();
     m_rootWasConnected = true;
     emit stateChanged();
+    requestSongKeySummary();  // another folder: other songs, other keys
     startScan(m_catalogue.activeRoot().path);
     return true;
 }
@@ -874,6 +877,7 @@ bool LibraryController::setTrustedMetadata(qint64 songId, const MetadataOverride
     value->series = values.series;
     value->trustedDiscId = values.trustedDiscId;
     value->trustedTrack = values.trustedTrack;
+    value->originalKey = values.originalKey;
     value->origin = values.origin;
     value->updatedAt = QDateTime::currentMSecsSinceEpoch();
     if (!m_overrideStore->setOverride(*value, error))
@@ -896,7 +900,7 @@ bool LibraryController::clearManualOverride(qint64 songId, QString* error)
     if (!value)
         return false;
     // "Use Automatic Name" returns the name to automatic; other trusted
-    // values (label, series, disc, track) are kept.
+    // values (label, series, disc, track, original key) are kept.
     MetadataOverride remaining = existingTrusted(songId);
     remaining.artist.reset();
     remaining.title.reset();
@@ -974,6 +978,8 @@ void LibraryController::onFinished(const QVariantMap& summary)
     emit scanFinished(summary);
     emit catalogueChanged();
     emit stateChanged();
+    // Songs found, gone or given back their trusted keys: count keys again.
+    requestSongKeySummary();
     startPendingWork();
 }
 
@@ -1099,6 +1105,7 @@ void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
         counts.total = summary.value(QStringLiteral("total")).toLongLong();
         counts.analysed = summary.value(QStringLiteral("analysed")).toLongLong();
         counts.confident = summary.value(QStringLiteral("confident")).toLongLong();
+        counts.manual = summary.value(QStringLiteral("manual")).toLongLong();
         m_keySummary = counts;
     }
     m_keyMsTimed += decodeMs;
@@ -1128,8 +1135,12 @@ void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
 
 void LibraryController::requestSongKeySummary()
 {
-    if (!isAvailable() || m_keySummaryRunning)
+    if (!isAvailable())
         return;
+    if (m_keySummaryRunning) {
+        m_keySummaryAgain = true;  // something changed during the count
+        return;
+    }
     m_keySummaryRunning = true;
     const QString path = m_catalogue.databasePath();
     const QPointer<LibraryController> self(this);
@@ -1146,6 +1157,8 @@ void LibraryController::requestSongKeySummary()
                 if (summary)
                     self->m_keySummary = summary;
                 emit self->songKeySummaryChanged();
+                if (std::exchange(self->m_keySummaryAgain, false))
+                    self->requestSongKeySummary();
             }, Qt::QueuedConnection);
         }
     });
@@ -1162,6 +1175,65 @@ std::optional<SongKeyInfo> LibraryController::songKey(qint64 songId) const
     return key && key->shown() ? key : std::nullopt;
 }
 
+std::optional<SongKeyInfo> LibraryController::songKeyDetails(qint64 songId) const
+{
+    if (!isAvailable() || songId <= 0)
+        return std::nullopt;
+    QString error;
+    std::optional<SongKeyInfo> key = m_catalogue.songKey(songId, &error);
+    if (!error.isEmpty())
+        qCWarning(lcLibraryController).noquote() << error;
+    return key;
+}
+
+bool LibraryController::setManualOriginalKey(qint64 songId, std::optional<int> keyIndex,
+                                             QString* error)
+{
+    if (keyIndex && (*keyIndex < 0 || *keyIndex > 23)) {
+        if (error)
+            *error = QStringLiteral("Not a song key: %1").arg(*keyIndex);
+        return false;
+    }
+    {
+        QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+        if (!m_overrideStore || !m_overrideStore->isOpen()) {
+            if (error)
+                *error = QStringLiteral("Metadata override store is unavailable");
+            return false;
+        }
+        auto value = m_catalogue.metadataOverrideSnapshot(songId, error);
+        if (!value)
+            return false;
+        // Only the key changes: names and details the user trusted stay.
+        const MetadataOverride existing = existingTrusted(songId);
+        value->artist = existing.artist;
+        value->title = existing.title;
+        value->label = existing.label;
+        value->series = existing.series;
+        value->trustedDiscId = existing.trustedDiscId;
+        value->trustedTrack = existing.trustedTrack;
+        value->origin = existing.origin;
+        value->createdAt = existing.createdAt;
+        value->originalKey = keyIndex;
+        value->updatedAt = QDateTime::currentMSecsSinceEpoch();
+        if (value->hasValues()) {
+            if (!m_overrideStore->setOverride(*value, error)
+                || !m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, error))
+                return false;
+        } else if (!m_overrideStore->clearOverride(value->rootPath, value->mp3RelPath, error)
+                   || !m_catalogue.clearManualOverride(songId, error)) {
+            return false;
+        }
+    }
+    qCInfo(lcLibraryController).noquote()
+        << "Original key of song" << songId << "set by hand to"
+        << (keyIndex ? songKeyName(*keyIndex) : QStringLiteral("none (detected key used)"));
+    // The names are unchanged: the library keeps its place; keys are looked up again.
+    emit songKeysChanged();
+    requestSongKeySummary();
+    return true;
+}
+
 QString LibraryController::songKeyStatusText() const
 {
     if (!m_keySummary)
@@ -1169,8 +1241,10 @@ QString LibraryController::songKeyStatusText() const
     const SongKeySummary& counts = *m_keySummary;
     if (counts.total == 0)
         return QStringLiteral("No songs to analyse yet.");
-    const QString found = QStringLiteral("%L1 of %L2 songs analysed; keys shown for %L3.")
-                              .arg(counts.analysed).arg(counts.total).arg(counts.confident);
+    QString found = QStringLiteral("%L1 of %L2 songs analysed; keys shown for %L3.")
+                        .arg(counts.analysed).arg(counts.total).arg(counts.confident);
+    if (counts.manual > 0)
+        found += QStringLiteral(" %L1 set by hand.").arg(counts.manual);
     if (!m_keysEnabled)
         return found;
     if (counts.remaining() == 0)

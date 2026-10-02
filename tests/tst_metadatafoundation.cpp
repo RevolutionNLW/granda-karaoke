@@ -690,6 +690,46 @@ void TestMetadataFoundation::overrideStoreMigratesFromVersionOne()
     QCOMPARE(*all.first().title, QStringLiteral("My Way"));
     QCOMPARE(all.first().origin, QStringLiteral("manual"));
     QVERIFY(!all.first().label && !all.first().trustedDiscId && !all.first().trustedTrack);
+    QVERIFY(!all.first().originalKey);
+    // Version 3 adds the original key: it is stored and read back, and only
+    // a real key (0-23) is accepted.
+    MetadataOverride value = all.first();
+    value.originalKey = 21;
+    QVERIFY2(store.setOverride(value, &error), qPrintable(error));
+    QCOMPARE(*store.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->originalKey, 21);
+    value.originalKey = 24;
+    QVERIFY(!store.setOverride(value, &error));
+    // A key alone is a value worth keeping.
+    MetadataOverride keyOnly;
+    keyOnly.rootPath = QStringLiteral("/music");
+    keyOnly.mp3RelPath = QStringLiteral("SGB39/3903.mp3");
+    keyOnly.originalKey = 0;
+    QVERIFY(keyOnly.hasValues());
+    QVERIFY2(store.setOverride(keyOnly, &error), qPrintable(error));
+    QCOMPARE(store.all(&error).size(), 2);
+    store.close();
+    // Migrated and at the current version; a version-2 store gains the column too.
+    QSqlDatabase check = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+    check.setDatabaseName(path);
+    QVERIFY(check.open());
+    {
+        QSqlQuery version(check);
+        QVERIFY(version.exec(QStringLiteral("PRAGMA user_version")) && version.next());
+        QCOMPARE(version.value(0).toInt(), MetadataOverrideStore::SchemaVersion);
+        QCOMPARE(MetadataOverrideStore::SchemaVersion, 3);
+        QSqlQuery rebuild(check);
+        QVERIFY(rebuild.exec(QStringLiteral("ALTER TABLE metadata_overrides DROP COLUMN original_key")));
+        QVERIFY(rebuild.exec(QStringLiteral("PRAGMA user_version=2")));
+    }
+    check.close();
+    check = QSqlDatabase();
+    QSqlDatabase::removeDatabase(connection);
+    MetadataOverrideStore fromTwo(path);
+    QVERIFY2(fromTwo.open(&error), qPrintable(error));
+    QCOMPARE(fromTwo.all(&error).size(), 2);
+    QVERIFY(!fromTwo.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->originalKey);
+    QCOMPARE(*fromTwo.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->title,
+             QStringLiteral("My Way"));
 }
 
 #include "tst_metadatafoundation.moc"

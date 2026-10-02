@@ -76,7 +76,7 @@ signals:
     void libraryReady();
     // "reason": "more" (work left), "done" (nothing left to try),
     // "stopped" (yield, cancel or playback), "offline", "unavailable";
-    // plus the counts of SongKeySummary ("total", "analysed", "confident")
+    // plus the counts of SongKeySummary ("total", "analysed", "confident", "manual")
     // and of this batch ("decoded", "reused", "failed", "decodeMs").
     void songKeyBatchFinished(const QVariantMap& summary);
 

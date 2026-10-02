@@ -10,6 +10,7 @@ class LibraryResultsModel;
 class QComboBox;
 class QLabel;
 class QLineEdit;
+class SongKeyPicker;
 class QTreeView;
 class QPushButton;
 class QStackedWidget;
@@ -33,6 +34,7 @@ public:
     QPushButton* chooseFolderButton() const { return m_chooseFolderButton; }
     QPushButton* singButton() const { return m_singButton; }
     QPushButton* addToPlaylistButton() const { return m_addToPlaylistButton; }
+    QPushButton* setKeyButton() const { return m_setKeyButton; }
     QLabel* statusLabel() const { return m_statusLabel; }
     QLabel* hintLabel() const { return m_hintLabel; }
     QLabel* messageLabel() const { return m_messageLabel; }
@@ -54,6 +56,9 @@ public:
     // Whether any song key can be shown (analysis on, or keys already known):
     // the Key column stays out of the way until then.
     void setKeyColumnAvailable(bool available);
+    // Set Song Key: the original key of the selected song, chosen by hand.
+    // Returns the popup (nullptr when no song is selected).
+    SongKeyPicker* openSongKeyPicker();
 
 signals:
     void singRequested(qint64 songId);
@@ -76,6 +81,7 @@ private:
     void moveSelection(int delta);
     void applyColumnWidths();
     void updateSelectionActions();
+    void updateHint();
 
     LibraryController* m_controller;
     QLabel* m_statusLabel;
@@ -89,11 +95,14 @@ private:
     QLineEdit* m_searchBox;
     QComboBox* m_sortBox;
     QLabel* m_hintLabel;
+    class QFrame* m_footer = nullptr;
+    bool m_hintWanted = true;  // shown with an empty search, room permitting
     QTreeView* m_results;
     LibraryResultsModel* m_resultsModel;
     QLabel* m_messageLabel;
     QPushButton* m_singButton;
     QPushButton* m_addToPlaylistButton;
+    QPushButton* m_setKeyButton;
     class QTimer* m_debounce;
     FolderChooser m_folderChooser;
     bool m_playlistAvailable = false;

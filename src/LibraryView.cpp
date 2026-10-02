@@ -2,6 +2,7 @@
 
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
+#include "SongKeyPicker.h"
 #include "library/SongKeys.h"
 #include "ui/Controls.h"
 #include "ui/ElidedLabel.h"
@@ -208,7 +209,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         });
         m_resultsModel->setKeyProvider([controller](qint64 songId) {
             const std::optional<SongKeyInfo> key = controller->songKey(songId);
-            return key ? songKeyName(key->keyIndex) : QString();
+            return key ? songKeyName(key->shownKeyIndex()) : QString();
         });
     }
     m_results->setModel(m_resultsModel);
@@ -255,20 +256,30 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_messageLabel = new QLabel(m_searchPage);
     m_messageLabel->setWordWrap(true);
     m_messageLabel->setStyleSheet(theme::dangerStyle());
+    // Takes the room left in the footer; never asks for any (the buttons do).
+    m_messageLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
     m_addToPlaylistButton = makeLibraryButton(QStringLiteral("Add to Playlist"), m_searchPage);
     m_addToPlaylistButton->setEnabled(false);
     m_singButton = makeLibraryButton(QStringLiteral("Sing This Song"), m_searchPage);
     m_singButton->setEnabled(false);
-    for (QPushButton* button : {m_addToPlaylistButton, m_singButton})
+    // The song's original key, chosen by hand. A button of its own: the Key
+    // cell is only ever shown, so every part of a row behaves the same.
+    m_setKeyButton = makeLibraryButton(QStringLiteral("Set Song Key"), m_searchPage);
+    m_setKeyButton->setEnabled(false);
+    m_setKeyButton->setToolTip(QStringLiteral("Choose the key the selected song's backing track is recorded in"));
+    for (QPushButton* button : {m_setKeyButton, m_addToPlaylistButton, m_singButton})
         button->setObjectName(QStringLiteral("ghostButton"));
     auto* footer = new QFrame(m_searchPage);
     footer->setObjectName(QStringLiteral("paneFooter"));
+    m_footer = footer;
+    footer->installEventFilter(this);
     auto* actions = new QHBoxLayout(footer);
     actions->setContentsMargins(16, 8, 12, 8);
     actions->setSpacing(8);
     actions->addWidget(m_hintLabel);
     actions->addWidget(m_messageLabel, 1);
+    actions->addWidget(m_setKeyButton);
     actions->addWidget(m_addToPlaylistButton);
     actions->addWidget(m_singButton);
 
@@ -319,8 +330,9 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     connect(m_results, &QAbstractItemView::doubleClicked, this,
             [this](const QModelIndex&) { singSelected(); });
     connect(m_chooseFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
-    for (QPushButton* button : {m_singButton, m_addToPlaylistButton})
+    for (QPushButton* button : {m_singButton, m_addToPlaylistButton, m_setKeyButton})
         connect(button, &QPushButton::pressed, this, &LibraryView::interacted);
+    connect(m_setKeyButton, &QPushButton::clicked, this, [this] { openSongKeyPicker(); });
     connect(m_sortBox, &QComboBox::activated, this, &LibraryView::interacted);
     connect(m_singButton, &QPushButton::clicked, this, &LibraryView::singSelected);
     connect(m_addToPlaylistButton, &QPushButton::clicked, this, [this] {
@@ -492,7 +504,8 @@ void LibraryView::refreshSearch()
     const QString text = m_searchBox->text().trimmed();
     m_shownQuery = text;
     m_results->show();
-    m_hintLabel->setVisible(text.isEmpty());
+    m_hintWanted = text.isEmpty();
+    updateHint();
     if (!m_controller || !m_controller->hasActiveRoot()) {
         m_resultsModel->setRows({});
         updateSelectionActions();
@@ -521,8 +534,32 @@ void LibraryView::refreshSearch()
     updateSelectionActions();
 }
 
+void LibraryView::updateHint()
+{
+    // The hint shortens itself as the footer narrows; when only a few letters
+    // would be left (a small window at a large interface size) it steps
+    // aside, so the buttons always have their full width.
+    if (!m_footer) {
+        m_hintLabel->setVisible(m_hintWanted);
+        return;
+    }
+    int room = m_footer->contentsRect().width();
+    if (const QLayout* layout = m_footer->layout()) {
+        const QMargins margins = layout->contentsMargins();
+        room -= margins.left() + margins.right();
+        for (QPushButton* button : {m_setKeyButton, m_addToPlaylistButton, m_singButton}) {
+            if (!button->isHidden())
+                room -= button->sizeHint().width() + layout->spacing();
+        }
+        room -= layout->spacing();  // between the hint and the message
+    }
+    m_hintLabel->setVisible(m_hintWanted && room >= theme::px(48));
+}
+
 bool LibraryView::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_footer && (event->type() == QEvent::Resize || event->type() == QEvent::LayoutRequest))
+        updateHint();
     if (watched == m_results->viewport() && event->type() == QEvent::Resize)
         applyColumnWidths();
     if (watched == m_results->viewport() && event->type() == QEvent::MouseButtonPress
@@ -582,4 +619,28 @@ void LibraryView::updateSelectionActions()
     const bool song = selectedSongId() != 0;
     m_singButton->setEnabled(song);
     m_addToPlaylistButton->setEnabled(song && m_playlistAvailable);
+    m_setKeyButton->setEnabled(song && m_controller);
+}
+
+SongKeyPicker* LibraryView::openSongKeyPicker()
+{
+    const qint64 songId = selectedSongId();
+    if (songId == 0 || !m_controller)
+        return nullptr;
+    const QModelIndex row = m_results->currentIndex().siblingAtColumn(0);
+    const QString artist = row.data(LibraryResultsModel::ArtistRole).toString().trimmed();
+    const QString title = row.data(Qt::DisplayRole).toString().trimmed();
+    const QString song = artist.isEmpty() ? title : artist + QStringLiteral(" \u2013 ") + title;
+    const std::optional<SongKeyInfo> key = m_controller->songKeyDetails(songId);
+    auto* picker = new SongKeyPicker(song, key ? key->manualKeyIndex : -1,
+                                     key ? key->detectedKeyIndex() : -1, this);
+    const auto save = [this, songId](std::optional<int> keyIndex) {
+        QString error;
+        if (!m_controller->setManualOriginalKey(songId, keyIndex, &error))
+            showMessage(QStringLiteral("The song key could not be saved. %1").arg(error));
+    };
+    connect(picker, &SongKeyPicker::keyChosen, this, [save](int keyIndex) { save(keyIndex); });
+    connect(picker, &SongKeyPicker::clearRequested, this, [save] { save(std::nullopt); });
+    picker->popUpAt(m_setKeyButton);
+    return picker;
 }

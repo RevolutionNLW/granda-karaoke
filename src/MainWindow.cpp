@@ -579,7 +579,7 @@ void MainWindow::updateKeyColumn()
         return;
     const auto summary = m_libraryController->songKeySummary();
     m_library->setKeyColumnAvailable(m_libraryController->songKeyAnalysisEnabled()
-                                     || (summary && summary->confident > 0));
+                                     || (summary && (summary->confident > 0 || summary->manual > 0)));
 }
 
 void MainWindow::applyDisplaySleep()
@@ -1338,7 +1338,7 @@ void MainWindow::updateControls()
         m_songKeyIndex = -1;
         if (keySongId > 0 && m_libraryController) {
             if (const std::optional<SongKeyInfo> info = m_libraryController->songKey(keySongId))
-                m_songKeyIndex = info->keyIndex;
+                m_songKeyIndex = info->shownKeyIndex();
         }
     }
     if (m_songKeyIndex >= 0) {

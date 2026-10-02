@@ -1838,6 +1838,7 @@ void LibraryScanner::analyseSongKeys(std::shared_ptr<SongKeyEngine> engine)
             summary.insert(QStringLiteral("total"), progress->total);
             summary.insert(QStringLiteral("analysed"), progress->analysed);
             summary.insert(QStringLiteral("confident"), progress->confident);
+            summary.insert(QStringLiteral("manual"), progress->manual);
         }
         emit songKeyBatchFinished(summary);
     };

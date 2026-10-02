@@ -128,6 +128,8 @@ add_library(fks_core STATIC
     src/SongPair.h
     src/SongKeyAnalyser.cpp
     src/SongKeyAnalyser.h
+    src/SongKeyPicker.cpp
+    src/SongKeyPicker.h
     src/SongSettings.cpp
     src/SongSettings.h
     src/KaraokePlayer.cpp

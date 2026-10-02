@@ -700,12 +700,26 @@ void Catalogue::attachEnrichmentCache(const QStringList& libraryRoots)
 
 bool Catalogue::ensureCurrentTables(QString* error)
 {
-    // Additive tables of schema 5: created in place (no data is changed), so a
-    // catalogue already at version 5 gains them without another migration.
-    return execute(QStringLiteral(
-               "CREATE TABLE IF NOT EXISTS song_plays(song_id INTEGER PRIMARY KEY "
-               "REFERENCES songs(id) ON DELETE CASCADE,play_count INTEGER NOT NULL DEFAULT 0,"
-               "last_played_ms INTEGER)"), error);
+    // Additive tables and columns of schema 5: created in place (no data is
+    // changed), so a catalogue already at version 5 gains them without another
+    // migration, and older programs simply do not use them.
+    if (!execute(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS song_plays(song_id INTEGER PRIMARY KEY "
+            "REFERENCES songs(id) ON DELETE CASCADE,play_count INTEGER NOT NULL DEFAULT 0,"
+            "last_played_ms INTEGER)"), error))
+        return false;
+    // The user's original key for a song, mirrored from the trusted store.
+    QSqlQuery columns(m_database);
+    if (!columns.exec(QStringLiteral("PRAGMA table_info(songs)"))) {
+        setError(sqlError(columns, QStringLiteral("Could not inspect songs")), error);
+        return false;
+    }
+    bool hasOriginalKey = false;
+    while (columns.next())
+        hasOriginalKey = hasOriginalKey || columns.value(1).toString() == QLatin1String("manual_original_key");
+    columns.finish();
+    return hasOriginalKey
+        || execute(QStringLiteral("ALTER TABLE songs ADD COLUMN manual_original_key INTEGER"), error);
 }
 
 bool Catalogue::backupBeforeV5Migration(int currentVersion, bool existedNonEmpty,
@@ -1734,7 +1748,8 @@ QVariant optionalValue(const std::optional<int>& value)
 
 const QString kSetTrusted = QStringLiteral(
     "UPDATE songs SET manual_artist=?,manual_title=?,manual_label=?,manual_series=?,"
-    "manual_disc_id=?,manual_track=?,manual_origin=?,manual_updated_at=? WHERE id=?");
+    "manual_disc_id=?,manual_track=?,manual_original_key=?,manual_origin=?,manual_updated_at=? "
+    "WHERE id=?");
 
 void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updatedAt, qint64 songId)
 {
@@ -1744,6 +1759,7 @@ void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updated
     query.addBindValue(optionalValue(value.series));
     query.addBindValue(optionalValue(value.trustedDiscId));
     query.addBindValue(optionalValue(value.trustedTrack));
+    query.addBindValue(optionalValue(value.originalKey));
     query.addBindValue(value.origin.isEmpty() ? QStringLiteral("manual") : value.origin);
     query.addBindValue(updatedAt > 0 ? updatedAt : QDateTime::currentMSecsSinceEpoch());
     query.addBindValue(songId);
@@ -1751,7 +1767,18 @@ void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updated
 
 const QString kClearTrusted = QStringLiteral(
     "manual_artist=NULL,manual_title=NULL,manual_label=NULL,manual_series=NULL,"
-    "manual_disc_id=NULL,manual_track=NULL,manual_origin=NULL,manual_updated_at=NULL");
+    "manual_disc_id=NULL,manual_track=NULL,manual_original_key=NULL,manual_origin=NULL,"
+    "manual_updated_at=NULL");
+
+// Any trusted value at all: the names and details the resolver uses
+// (MetadataResolver::hasTrustedSql, which alone counts as a name correction)
+// or the user's original key, which leaves the names automatic.
+QString hasAnyTrustedSql(const QString& alias = {})
+{
+    const QString p = alias.isEmpty() ? QString() : alias + QLatin1Char('.');
+    return QStringLiteral("(%1 OR %2manual_original_key IS NOT NULL)")
+        .arg(MetadataResolver::hasTrustedSql(alias), p);
+}
 
 } // namespace
 
@@ -1830,8 +1857,7 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
         return false;
     }
     QSqlQuery manualSongs(m_database);
-    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ")
-                          + MetadataResolver::hasTrustedSql())) {
+    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ") + hasAnyTrustedSql())) {
         m_database.rollback();
         setError(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")), error);
         return false;
@@ -1841,7 +1867,7 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
         changed.append(manualSongs.value(0).toLongLong());
     QSqlQuery clear(m_database);
     if (!clear.exec(QStringLiteral("UPDATE songs SET ") + kClearTrusted + QStringLiteral(" WHERE ")
-                    + MetadataResolver::hasTrustedSql())) {
+                    + hasAnyTrustedSql())) {
         m_database.rollback();
         setError(sqlError(clear, QStringLiteral("Could not reset manual metadata")), error);
         return false;
@@ -2220,7 +2246,7 @@ std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) con
     query.prepare(QStringLiteral(
         // The copy that would play (as activePlaybackPathsFor chooses it), and
         // only its own key: never another recording's.
-        "SELECT k.status,k.key_index,k.confidence FROM songs so "
+        "SELECT k.status,k.key_index,k.confidence,so.manual_original_key FROM songs so "
         "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
         "JOIN library_roots r ON r.id=s.root_id "
         "JOIN files mf ON mf.id=s.mp3_file_id JOIN files gf ON gf.id=s.graphics_file_id "
@@ -2233,14 +2259,34 @@ std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) con
         setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
         return std::nullopt;
     }
-    if (!query.next() || query.value(0).isNull())
+    if (!query.next() || (query.value(0).isNull() && query.value(3).isNull()))
         return std::nullopt;
     SongKeyInfo info;
     info.status = query.value(0).toString();
     info.keyIndex = query.value(1).isNull() ? -1 : query.value(1).toInt();
     info.confidence = query.value(2).toDouble();
+    info.manualKeyIndex = query.value(3).isNull() ? -1 : query.value(3).toInt();
     return info;
 }
+
+namespace {
+
+// Playable songs of the active music folder given an original key by hand
+// (they show a key whatever analysis has found). 0 where the catalogue
+// predates the column.
+qint64 manualKeyCount(const QSqlDatabase& database)
+{
+    QSqlQuery query(database);
+    return query.exec(QStringLiteral(
+               "SELECT count(DISTINCT so.id) FROM songs so JOIN sources s ON s.song_id=so.id "
+               "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+               "WHERE so.manual_original_key IS NOT NULL AND s.kind='loose_cdg' AND s.playable=1"))
+            && query.next()
+        ? query.value(0).toLongLong()
+        : 0;
+}
+
+} // namespace
 
 std::optional<SongKeySummary> Catalogue::songKeySummaryOn(const QSqlDatabase& database,
                                                           QString* error)
@@ -2265,6 +2311,7 @@ std::optional<SongKeySummary> Catalogue::songKeySummaryOn(const QSqlDatabase& da
     summary.total = query.value(0).toLongLong();
     summary.analysed = query.value(1).toLongLong();
     summary.confident = query.value(2).toLongLong();
+    summary.manual = manualKeyCount(database);
     return summary;
 }
 
@@ -2305,6 +2352,7 @@ std::optional<SongKeySummary> Catalogue::readSongKeySummary(const QString& datab
                 if (count.exec() && count.next()) {
                     result = SongKeySummary{};
                     result->total = count.value(0).toLongLong();
+                    result->manual = manualKeyCount(database);
                 } else if (error) {
                     *error = count.lastError().text();
                 }
@@ -2374,8 +2422,8 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
     if (!query.exec(QStringLiteral(
             "SELECT so.id,so.manual_artist,so.manual_title,so.manual_label,so.manual_series,"
             "so.manual_disc_id,so.manual_track,COALESCE(so.manual_origin,'manual'),"
-            "COALESCE(so.manual_updated_at,0) FROM songs so WHERE ")
-            + MetadataResolver::hasTrustedSql(QStringLiteral("so")))) {
+            "COALESCE(so.manual_updated_at,0),so.manual_original_key FROM songs so WHERE ")
+            + hasAnyTrustedSql(QStringLiteral("so")))) {
         setError(sqlError(query, QStringLiteral("Could not read trusted metadata")), error);
         return result;
     }
@@ -2396,6 +2444,8 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
                                                       : std::optional<int>(query.value(6).toInt());
         value->origin = query.value(7).toString();
         value->updatedAt = query.value(8).toLongLong();
+        value->originalKey = query.value(9).isNull() ? std::nullopt
+                                                     : std::optional<int>(query.value(9).toInt());
         result.append(*value);
     }
     return result;
@@ -2405,7 +2455,7 @@ bool Catalogue::hasTrustedMirror(QString* error) const
 {
     QSqlQuery query(m_database);
     if (!query.exec(QStringLiteral("SELECT EXISTS(SELECT 1 FROM songs WHERE ")
-                    + MetadataResolver::hasTrustedSql() + QStringLiteral(")"))
+                    + hasAnyTrustedSql() + QStringLiteral(")"))
         || !query.next()) {
         setError(sqlError(query, QStringLiteral("Could not inspect trusted metadata")), error);
         return false;

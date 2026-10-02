@@ -155,6 +155,18 @@ most of it), so 50,000 songs is roughly 7 hours of work plus reading from the dr
 rests between batches: expect 8 to 15 hours spread over several sessions. Measure on the
 real laptop and drive with `fks-song-keys` (below).
 
+**Set Song Key.** A key can also be chosen by hand: select a song in the library and press
+**Set Song Key** (in the library's footer, beside Add to Playlist). A small popup lists the
+24 keys (major and minor, in the spellings above); one click saves it and closes. It is the
+key the backing track is *recorded* in, before any Key +/- adjustment: a song recorded in C
+and sung at +2 is set to C, and the Now Playing line then shows `Key C → D`. A key chosen by
+hand always wins over the detected one, is never replaced by analysis, and is kept with the
+other trusted corrections in `metadata-overrides.sqlite` (field `original_key`; mirrored in
+the catalogue), so it survives restarts, rescans and catalogue rebuilds. **Clear Manual Key**
+in the same popup goes back to the detected key (or blank). The detected key itself stays in
+`enrichment-cache.sqlite`, untouched. The Key cell in the table is display only: clicking
+anywhere in a row, the Key cell included, just selects the song.
+
 **How.** The MP3 is decoded read-only with the GStreamer components the player already
 uses, to mono at 11 kHz. Spectral peaks between 60 Hz and 2 kHz are gathered into a
 12-note profile, corrected for the recording's tuning, with every loud-enough second
@@ -162,9 +174,9 @@ counting the same (so silent or spoken intros, fades and a last-chorus key chang
 decide it), and compared with major and minor key templates (Sha'ath's audio-derived
 profiles). No extra library or plugin is needed on macOS or Windows.
 
-**Limits.** Automatic key finding is imperfect, and simple detectors of this kind are
-wrong for a sizeable share of pop songs; how often here has still to be measured on real
-songs. Most mistakes are the relative major/minor (C for Am), a fifth away (G for C) or
+**Limits.** Automatic key finding is imperfect. On 30 real karaoke tracks checked by hand
+(independent published keys plus the backing audio itself), 20 keys were shown and 19 were
+exact; one was a fifth away; the rest stayed blank. Most mistakes are the relative major/minor (C for Am), a fifth away (G for C) or
 major for minor. So a key is shown only when the evidence
 is clear: a strong match, clearly better than any other key (major versus minor included),
 consistent through the song, and tuning not near a quarter-tone. Only passages with a

@@ -68,12 +68,14 @@ MetadataOverride overrideFromQuery(const QSqlQuery& query)
     value.trustedDiscId = optionalString(query.value(13));
     value.trustedTrack = optionalInt(query.value(14));
     value.origin = query.value(15).toString();
+    value.originalKey = optionalInt(query.value(16));
     return value;
 }
 
 const QString overrideColumns = QStringLiteral(
     "root_path,mp3_rel_path,artist,title,created_at,updated_at,"
-    "auto_artist,auto_title,disc_id,track,file_name,label,series,set_disc_id,set_track,origin");
+    "auto_artist,auto_title,disc_id,track,file_name,label,series,set_disc_id,set_track,origin,"
+    "original_key");
 
 } // namespace
 
@@ -222,16 +224,21 @@ bool MetadataOverrideStore::ensureSchema(QString* error)
             "artist TEXT,title TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,"
             "auto_artist TEXT,auto_title TEXT,disc_id TEXT,track INTEGER NOT NULL DEFAULT 0,"
             "file_name TEXT,label TEXT,series TEXT,set_disc_id TEXT,set_track INTEGER,"
-            "origin TEXT NOT NULL DEFAULT 'manual',PRIMARY KEY(root_path,mp3_rel_path))"));
+            "origin TEXT NOT NULL DEFAULT 'manual',original_key INTEGER,"
+            "PRIMARY KEY(root_path,mp3_rel_path))"));
     } else {
         // Version 1 held artist/title corrections only.
-        statements << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN label TEXT")
-                   << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN series TEXT")
-                   << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN set_disc_id TEXT")
-                   << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN set_track INTEGER")
-                   << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'");
+        if (current < 2) {
+            statements << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN label TEXT")
+                       << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN series TEXT")
+                       << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN set_disc_id TEXT")
+                       << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN set_track INTEGER")
+                       << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'");
+        }
+        // Version 3 adds the song's original key, as chosen by the user.
+        statements << QStringLiteral("ALTER TABLE metadata_overrides ADD COLUMN original_key INTEGER");
     }
-    statements.append(QStringLiteral("PRAGMA user_version=2"));
+    statements.append(QStringLiteral("PRAGMA user_version=%1").arg(SchemaVersion));
     for (const QString& statement : std::as_const(statements)) {
         if (!query.exec(statement)) {
             m_database.rollback();
@@ -279,6 +286,10 @@ bool MetadataOverrideStore::setOverride(const MetadataOverride& input, QString* 
         setError(QStringLiteral("A metadata override must set at least one value"), error);
         return false;
     }
+    if (input.originalKey && (*input.originalKey < 0 || *input.originalKey > 23)) {
+        setError(QStringLiteral("Not a song key: %1").arg(*input.originalKey), error);
+        return false;
+    }
     if (input.origin != QLatin1String("manual") && input.origin != QLatin1String("import")) {
         setError(QStringLiteral("Unknown metadata origin: %1").arg(input.origin), error);
         return false;
@@ -290,13 +301,14 @@ bool MetadataOverrideStore::setOverride(const MetadataOverride& input, QString* 
     QSqlQuery query(m_database);
     query.prepare(QStringLiteral(
         "INSERT INTO metadata_overrides(root_path,mp3_rel_path,artist,title,created_at,updated_at,"
-        "auto_artist,auto_title,disc_id,track,file_name,label,series,set_disc_id,set_track,origin) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "auto_artist,auto_title,disc_id,track,file_name,label,series,set_disc_id,set_track,origin,"
+        "original_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(root_path,mp3_rel_path) DO UPDATE SET artist=excluded.artist,"
         "title=excluded.title,updated_at=excluded.updated_at,auto_artist=excluded.auto_artist,"
         "auto_title=excluded.auto_title,disc_id=excluded.disc_id,track=excluded.track,"
         "file_name=excluded.file_name,label=excluded.label,series=excluded.series,"
-        "set_disc_id=excluded.set_disc_id,set_track=excluded.set_track,origin=excluded.origin"));
+        "set_disc_id=excluded.set_disc_id,set_track=excluded.set_track,origin=excluded.origin,"
+        "original_key=excluded.original_key"));
     query.addBindValue(root);
     query.addBindValue(relative);
     query.addBindValue(nullableString(input.artist));
@@ -313,6 +325,7 @@ bool MetadataOverrideStore::setOverride(const MetadataOverride& input, QString* 
     query.addBindValue(nullableString(input.trustedDiscId));
     query.addBindValue(nullableInt(input.trustedTrack));
     query.addBindValue(input.origin);
+    query.addBindValue(nullableInt(input.originalKey));
     if (query.exec())
         return true;
     setError(queryError(query, QStringLiteral("Could not save metadata override")), error);

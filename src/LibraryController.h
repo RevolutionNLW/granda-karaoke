@@ -169,8 +169,16 @@ public:
     void holdSongKeysForSong();
     // One line for Settings: how far analysis has got, and what it is doing.
     QString songKeyStatusText() const;
-    // The song's key if it is known well enough to show.
+    // The song's key if it is known well enough to show (the user's original
+    // key first, else a confident detected one).
     std::optional<SongKeyInfo> songKey(qint64 songId) const;
+    // Everything known about the song's key, shown or not (for Set Song Key).
+    std::optional<SongKeyInfo> songKeyDetails(qint64 songId) const;
+    // The original key of the backing track, chosen by the user (0-23, see
+    // music::MusicalKey::index), or none to go back to the detected key. It
+    // is trusted metadata, kept with the user's other corrections; it never
+    // touches the detected key or the song's Key +/- transpose.
+    bool setManualOriginalKey(qint64 songId, std::optional<int> keyIndex, QString* error = nullptr);
     // Tests only: the engine used instead of the GStreamer one, and shorter waits.
     using SongKeyEngineFactory = std::function<std::shared_ptr<SongKeyEngine>()>;
     void setSongKeyEngineFactory(SongKeyEngineFactory factory) { m_keyEngineFactory = std::move(factory); }
@@ -257,6 +265,7 @@ private:
     bool m_keysEnabled = false;
     bool m_keyBatchInFlight = false;
     bool m_keySummaryRunning = false;
+    bool m_keySummaryAgain = false;
     bool m_playbackActive = false;
     QTimer* m_keyTimer = nullptr;
     std::shared_ptr<SongKeyEngine> m_keyEngine;

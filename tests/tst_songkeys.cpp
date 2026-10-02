@@ -11,9 +11,11 @@
 #include "LibraryView.h"
 #include "MainWindow.h"
 #include "SongKeyAnalyser.h"
+#include "SongKeyPicker.h"
 #include "library/SongKeys.h"
 #include "music/KeyDetector.h"
 #include "music/MusicalKey.h"
+#include "ui/Theme.h"
 
 #include "TestMedia.h"
 
@@ -22,6 +24,8 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QLabel>
+#include <QPointer>
+#include <QHeaderView>
 #include <QLineEdit>
 #include <QTreeView>
 #include <QPushButton>
@@ -166,6 +170,49 @@ bool analysedAll(const LibraryController& controller, qint64 total)
         && !controller.isAnalysingSongKeys();
 }
 
+// The key the library shows for a song ("" for none).
+QString shownKey(const LibraryController& controller, qint64 songId)
+{
+    const std::optional<SongKeyInfo> key = controller.songKey(songId);
+    return key ? songKeyName(key->shownKeyIndex()) : QString();
+}
+
+// A music folder with a G major song and a song with no clear key, as used by
+// the manual-key tests. Returns the two MP3 file names.
+QPair<QString, QString> writeManualKeyLibrary(const QString& fixtures, const QString& root)
+{
+    const QString known = QStringLiteral("KT010-01 - Synth Band - G Song.mp3");
+    const QString unknown = QStringLiteral("KT010-02 - Synth Band - Unknown Key.mp3");
+    if (!QDir().mkpath(root) || !QFile::copy(QDir(fixtures).filePath(QStringLiteral("G.mp3")), root + QLatin1Char('/') + known)
+        || !testmedia::writeCdg(root + QStringLiteral("/KT010-01 - Synth Band - G Song.cdg"), testmedia::markerCdg(3000, 500))
+        || !testmedia::writeMp3(root + QLatin1Char('/') + unknown, 2000)
+        || !testmedia::writeCdg(root + QStringLiteral("/KT010-02 - Synth Band - Unknown Key.cdg"),
+                                testmedia::markerCdg(2000, 500)))
+        return {};
+    return {known, unknown};
+}
+
+// The song in the library's results with the given title, or -1.
+int resultRow(LibraryView* view, const QString& title)
+{
+    QAbstractItemModel* model = view->resultsList()->model();
+    for (int row = 0; row < view->songResultCount(); ++row) {
+        if (model->index(row, 0).data().toString() == title)
+            return row;
+    }
+    return -1;
+}
+
+QList<SongKeyPicker*> openPickers()
+{
+    QList<SongKeyPicker*> pickers;
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        if (auto* picker = qobject_cast<SongKeyPicker*>(widget); picker && picker->isVisible())
+            pickers.append(picker);
+    }
+    return pickers;
+}
+
 LibraryController::SongKeyTimings quickTimings()
 {
     LibraryController::SongKeyTimings timings;
@@ -201,6 +248,12 @@ private slots:
     void analysisIsOffUntilTurnedOn();
     void aBrokenDecoderStopsAnalysisWithoutBlamingSongs();
     void libraryAndPlayerBarShowTheKeys();
+    void manualOriginalKeyWinsAndSurvives();
+    void manualOriginalKeyIsSeparateFromTranspose();
+    void manualKeyAloneShowsTheKeyColumn();
+    void setSongKeyPopupChoosesAndClears();
+    void keyCellClickIsLikeTheRestOfTheRow();
+    void setSongKeyFitsTheLibraryFooter();
 
 private:
     QTemporaryDir m_dir;
@@ -932,6 +985,506 @@ void TestSongKeys::libraryAndPlayerBarShowTheKeys()
     QTRY_COMPARE_WITH_TIMEOUT(view->songResultCount(), 1, 3000);
     QCOMPARE(view->resultsList()->model()->index(0, LibraryResultsModel::KeyColumn).data().toString(),
              QStringLiteral("C"));
+}
+
+void TestSongKeys::manualOriginalKeyWinsAndSurvives()
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString catalogue = appDir + QStringLiteral("/library.sqlite");
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    const QString cache = appDir + QStringLiteral("/enrichment-cache.sqlite");
+    const QString storedKeys = QStringLiteral("SELECT count(*) FROM metadata_overrides WHERE original_key=");
+    const QString detectedG = QStringLiteral("SELECT count(*) FROM song_keys WHERE status='confident' AND key_index=7");
+    const QMap<QString, QPair<qint64, qint64>> before = snapshot(root);
+    QString error;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        controller.setSongKeyTimings(quickTimings());
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        QVERIFY(controller.chooseRoot(root));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        controller.setSongKeyAnalysisEnabled(true);
+        QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+        const qint64 song = controller.findSongByMp3Path(root, known);
+        const qint64 other = controller.findSongByMp3Path(root, unknown);
+        QVERIFY(song > 0 && other > 0);
+        QCOMPARE(shownKey(controller, song), QStringLiteral("G"));  // detected
+        QCOMPARE(shownKey(controller, other), QString());
+
+        // A: the user's original key is shown instead; the detected one is kept.
+        QSignalSpy keysChanged(&controller, &LibraryController::songKeysChanged);
+        QSignalSpy catalogueChanged(&controller, &LibraryController::catalogueChanged);
+        QVERIFY2(controller.setManualOriginalKey(song, 0, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        const auto details = controller.songKeyDetails(song);
+        QVERIFY(details && details->isManual());
+        QCOMPARE(details->manualKeyIndex, 0);
+        QCOMPARE(details->detectedKeyIndex(), 7);
+        QCOMPARE(rowCount(cache, detectedG), 1);
+        QCOMPARE(rowCount(overrides, storedKeys + QStringLiteral("0")), 1);
+        QCOMPARE(keysChanged.count(), 1);
+        QCOMPARE(catalogueChanged.count(), 0);  // the library keeps its place
+        // A key is not a name correction, and only real keys are accepted.
+        QCOMPARE(rowCount(catalogue, QStringLiteral("SELECT count(*) FROM songs WHERE manual_title IS NOT NULL "
+                                                    "OR manual_artist IS NOT NULL")), 0);
+        QVERIFY(!controller.setManualOriginalKey(song, 24, &error));
+        QVERIFY(!controller.setManualOriginalKey(song, -1, &error));
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+
+        // E: analysing the song again finds G again, and C still wins.
+        QCOMPARE(rowCount(cache, QStringLiteral("SELECT count(*) FROM song_keys")), 2);
+        {
+            const QString name = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            {
+                QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+                database.setDatabaseName(cache);
+                QVERIFY(database.open());
+                QSqlQuery remove(database);
+                QVERIFY(remove.exec(QStringLiteral("DELETE FROM song_keys")));
+                database.close();
+            }
+            QSqlDatabase::removeDatabase(name);
+        }
+        controller.setSongKeyAnalysisEnabled(false);
+        controller.setSongKeyAnalysisEnabled(true);
+        QTRY_COMPARE_WITH_TIMEOUT(rowCount(cache, QStringLiteral("SELECT count(*) FROM song_keys")), 2LL, 60000);
+        QCOMPARE(rowCount(cache, detectedG), 1);
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        controller.setSongKeyAnalysisEnabled(false);
+
+        // Name corrections and "Use Automatic Name" leave the key alone.
+        QVERIFY2(controller.setManualOverride(song, QStringLiteral("Someone"), QStringLiteral("Something"), &error),
+                 qPrintable(error));
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        QVERIFY2(controller.clearManualOverride(song, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        QCOMPARE(rowCount(overrides, QStringLiteral("SELECT count(*) FROM metadata_overrides WHERE title IS NOT NULL")), 0);
+
+        // A song with no detected key can be given one too.
+        QVERIFY2(controller.setManualOriginalKey(other, 21, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, other), QStringLiteral("Am"));
+
+        // A library check (rescan) re-applies the corrections it keeps.
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, other), QStringLiteral("Am"));
+    }
+    // D: after restarting.
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(shownKey(controller, controller.findSongByMp3Path(root, known)), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, controller.findSongByMp3Path(root, unknown)), QStringLiteral("Am"));
+    }
+    // H: the catalogue is deleted and rebuilt from the music folder.
+    for (const QString& suffix : {QString(), QStringLiteral("-wal"), QStringLiteral("-shm")})
+        QFile::remove(catalogue + suffix);
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        QVERIFY(controller.chooseRoot(root));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 song = controller.findSongByMp3Path(root, known);
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, controller.findSongByMp3Path(root, unknown)), QStringLiteral("Am"));
+        // Analysis finds the detected key again in its cache, without decoding,
+        // and the user's key still wins.
+        auto engine = std::make_shared<CountingEngine>();
+        controller.setSongKeyEngineFactory([engine] { return engine; });
+        controller.setSongKeyTimings(quickTimings());
+        controller.setSongKeyAnalysisEnabled(true);
+        QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyDetails(song)->detectedKeyIndex(), 7, 30000);
+        QCOMPARE(engine->calls.load(), 0);
+        controller.setSongKeyAnalysisEnabled(false);
+        QCOMPARE(shownKey(controller, song), QStringLiteral("C"));
+    }
+    // A lost store is rebuilt from the catalogue's copy, keys included.
+    for (const QString& suffix : {QString(), QStringLiteral("-wal"), QStringLiteral("-shm")})
+        QFile::remove(overrides + suffix);
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(rowCount(overrides, storedKeys + QStringLiteral("0")), 1);
+        QCOMPARE(rowCount(overrides, storedKeys + QStringLiteral("21")), 1);
+        const qint64 song = controller.findSongByMp3Path(root, known);
+        const qint64 other = controller.findSongByMp3Path(root, unknown);
+        // F: clearing goes back to the detected key; the detected key is untouched.
+        QVERIFY2(controller.setManualOriginalKey(song, std::nullopt, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, song), QStringLiteral("G"));
+        QVERIFY(!controller.songKeyDetails(song)->isManual());
+        QCOMPARE(rowCount(cache, detectedG), 1);
+        // G: with nothing detected, clearing leaves the key blank.
+        QVERIFY2(controller.setManualOriginalKey(other, std::nullopt, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, other), QString());
+        QCOMPARE(rowCount(overrides, QStringLiteral("SELECT count(*) FROM metadata_overrides")), 0);
+        QCOMPARE(rowCount(catalogue, QStringLiteral("SELECT count(*) FROM songs WHERE manual_original_key IS NOT NULL")), 0);
+    }
+    QCOMPARE(snapshot(root), before);  // nothing written to the music
+}
+
+void TestSongKeys::manualOriginalKeyIsSeparateFromTranspose()
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {}, overrides);
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+    controller.setSongKeyAnalysisEnabled(false);
+    const qint64 song = controller.findSongByMp3Path(root, known);
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller);
+    window.setShowErrorDialogs(false);
+    window.resize(1280, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QVERIFY(window.openSong(root + QLatin1Char('/') + known));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key G"));  // detected
+
+    // The loaded song's Now Playing key follows a key set by hand at once.
+    QString error;
+    QVERIFY2(controller.setManualOriginalKey(song, 0, &error), qPrintable(error));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C"));
+    const QString storedC = QStringLiteral("SELECT count(*) FROM metadata_overrides WHERE original_key=0");
+    // B: Key +/- changes the key heard, never the original.
+    const auto check = [&](int clicks, QPushButton* button, const QString& expected) {
+        for (int i = 0; i < clicks; ++i)
+            QTest::mouseClick(button, Qt::LeftButton);
+        QCOMPARE(window.songKeyLabel()->text(), expected);
+        QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 0);
+        QCOMPARE(rowCount(overrides, storedC), 1);
+    };
+    check(0, window.keyUpButton(), QStringLiteral("Key C"));
+    check(1, window.keyUpButton(), QStringLiteral("Key C → Db"));
+    check(1, window.keyUpButton(), QStringLiteral("Key C → D"));
+    QCOMPARE(window.keyValueLabel()->text(), QStringLiteral("+2"));
+    check(4, window.keyDownButton(), QStringLiteral("Key C → Bb"));
+    QCOMPARE(window.keyValueLabel()->text(), QStringLiteral("-2"));
+    check(1, window.keyUpButton(), QStringLiteral("Key C → B"));
+    // The original chosen while transposed is still the original.
+    QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
+    QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
+    QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
+    QCOMPARE(window.keyValueLabel()->text(), QStringLiteral("+2"));
+    QVERIFY2(controller.setManualOriginalKey(song, 9, &error), qPrintable(error));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key A → B"));
+    QCOMPARE(player.keySemitones(), 2);  // the transpose is untouched
+    // C: a minor key.
+    QVERIFY2(controller.setManualOriginalKey(song, 21, &error), qPrintable(error));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key Am → Bm"));
+    QTest::mouseClick(window.keyResetButton(), Qt::LeftButton);
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key Am"));
+    QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 21);
+    // Cleared: back to the detected key, still with the transpose applied.
+    QTest::mouseClick(window.keyUpButton(), Qt::LeftButton);
+    QVERIFY2(controller.setManualOriginalKey(song, std::nullopt, &error), qPrintable(error));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key G → Ab"));
+    QCOMPARE(player.keySemitones(), 1);
+}
+
+void TestSongKeys::manualKeyAloneShowsTheKeyColumn()
+{
+    // Analysis never turned on: a key chosen by hand still shows, the Key
+    // column appears for it, Settings counts it, and other trusted values
+    // (an imported label) are kept when it is set and cleared.
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {}, overrides);
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    const qint64 song = controller.findSongByMp3Path(root, unknown);
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller);
+    window.setShowErrorDialogs(false);
+    window.resize(1280, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QTreeView* results = window.libraryView()->resultsList();
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QVERIFY(results->isColumnHidden(LibraryResultsModel::KeyColumn));
+
+    MetadataOverride imported = controller.existingTrusted(song);
+    imported.label = QStringLiteral("Sunfly");
+    imported.origin = QStringLiteral("import");
+    QString error;
+    QVERIFY2(controller.setTrustedMetadata(song, imported, &error), qPrintable(error));
+    QVERIFY2(controller.setManualOriginalKey(song, 2, &error), qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(!results->isColumnHidden(LibraryResultsModel::KeyColumn), 5000);
+    QCOMPARE(controller.songKeySummary()->manual, 1);
+    QVERIFY(controller.songKeyStatusText().contains(QStringLiteral("1 set by hand")));
+    QCOMPARE(shownKey(controller, song), QStringLiteral("D"));
+    QCOMPARE(controller.existingTrusted(song).origin, QStringLiteral("import"));
+    QCOMPARE(*controller.existingTrusted(song).label, QStringLiteral("Sunfly"));
+    window.libraryView()->searchBox()->setText(QStringLiteral("Unknown Key"));
+    QTRY_COMPARE_WITH_TIMEOUT(window.libraryView()->songResultCount(), 1, 3000);
+    QCOMPARE(results->model()->index(0, LibraryResultsModel::KeyColumn).data().toString(), QStringLiteral("D"));
+
+    // Another music folder without keys, and back: the column and the count follow.
+    const QString second = temporary.filePath(QStringLiteral("music2"));
+    QVERIFY(QDir().mkpath(second));
+    QVERIFY(testmedia::writeMp3(second + QStringLiteral("/KT011-01 - Other Band - Plain Song.mp3"), 2000));
+    QVERIFY(testmedia::writeCdg(second + QStringLiteral("/KT011-01 - Other Band - Plain Song.cdg"),
+                                testmedia::markerCdg(2000, 500)));
+    finished.clear();
+    QVERIFY(controller.chooseRoot(second));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary() && controller.songKeySummary()->manual == 0
+                                 && controller.songKeySummary()->total == 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(results->isColumnHidden(LibraryResultsModel::KeyColumn), 5000);
+    QVERIFY(!controller.songKeyStatusText().contains(QStringLiteral("set by hand")));
+    finished.clear();
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary() && controller.songKeySummary()->manual == 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!results->isColumnHidden(LibraryResultsModel::KeyColumn), 5000);
+    QCOMPARE(shownKey(controller, song), QStringLiteral("D"));
+    window.libraryView()->searchBox()->setText(QStringLiteral("Unknown Key"));
+    QTRY_COMPARE_WITH_TIMEOUT(window.libraryView()->songResultCount(), 1, 3000);
+
+    // Cleared: the label stays, the key and the column go.
+    QVERIFY2(controller.setManualOriginalKey(song, std::nullopt, &error), qPrintable(error));
+    QCOMPARE(shownKey(controller, song), QString());
+    QCOMPARE(controller.existingTrusted(song).origin, QStringLiteral("import"));
+    QCOMPARE(*controller.existingTrusted(song).label, QStringLiteral("Sunfly"));
+    QVERIFY(!controller.existingTrusted(song).originalKey);
+    QTRY_VERIFY_WITH_TIMEOUT(results->isColumnHidden(LibraryResultsModel::KeyColumn), 5000);
+    QCOMPARE(controller.songKeySummary()->manual, 0);
+    QCOMPARE(results->model()->index(0, LibraryResultsModel::KeyColumn).data().toString(), QString());
+}
+
+void TestSongKeys::setSongKeyPopupChoosesAndClears()
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite")));
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+    controller.setSongKeyAnalysisEnabled(false);
+    const qint64 song = controller.findSongByMp3Path(root, known);
+
+    LibraryView view(&controller);
+    view.resize(1100, 600);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    view.searchBox()->setText(QStringLiteral("Synth Band"));
+    QTRY_COMPARE_WITH_TIMEOUT(view.songResultCount(), 2, 3000);
+    // Nothing selected: nothing to set.
+    view.resultsList()->setCurrentIndex(QModelIndex());
+    QVERIFY(!view.setKeyButton()->isEnabled());
+    QVERIFY(!view.openSongKeyPicker());
+    QVERIFY(openPickers().isEmpty());
+
+    const int row = resultRow(&view, QStringLiteral("G Song"));
+    QVERIFY(row >= 0);
+    QTreeView* results = view.resultsList();
+    QTest::mouseClick(results->viewport(), Qt::LeftButton, {},
+                      results->visualRect(results->model()->index(row, LibraryResultsModel::ArtistColumn)).center());
+    QCOMPARE(view.selectedSongId(), song);
+    QVERIFY(view.setKeyButton()->isEnabled());
+    const auto keyCell = [&] {
+        return results->model()->index(row, LibraryResultsModel::KeyColumn).data().toString();
+    };
+    QCOMPARE(keyCell(), QStringLiteral("G"));
+
+    // The popup: 24 keys with the program's spellings, the detected one marked
+    // quietly, none chosen yet.
+    QTest::mouseClick(view.setKeyButton(), Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(openPickers().size(), 1, 2000);
+    QPointer<SongKeyPicker> picker = openPickers().first();
+    QVERIFY(picker->findChild<QLabel*>(QStringLiteral("keyPickerTitle")));
+    QCOMPARE(picker->findChild<QLabel*>(QStringLiteral("keyPickerTitle"))->text(),
+             QStringLiteral("Set Original Song Key"));
+    const QStringList spellings = {
+        QStringLiteral("C"), QStringLiteral("Db"), QStringLiteral("D"), QStringLiteral("Eb"),
+        QStringLiteral("E"), QStringLiteral("F"), QStringLiteral("F#"), QStringLiteral("G"),
+        QStringLiteral("Ab"), QStringLiteral("A"), QStringLiteral("Bb"), QStringLiteral("B"),
+        QStringLiteral("Cm"), QStringLiteral("C#m"), QStringLiteral("Dm"), QStringLiteral("Ebm"),
+        QStringLiteral("Em"), QStringLiteral("Fm"), QStringLiteral("F#m"), QStringLiteral("Gm"),
+        QStringLiteral("G#m"), QStringLiteral("Am"), QStringLiteral("Bbm"), QStringLiteral("Bm")};
+    for (int index = 0; index < 24; ++index) {
+        QCOMPARE(picker->keyButton(index)->text(), spellings.at(index));
+        QVERIFY(!picker->keyButton(index)->isChecked());
+        QCOMPARE(picker->keyButton(index)->property("detected").toBool(), index == 7);
+    }
+    QVERIFY(!picker->keyButton(24));
+    QVERIFY(picker->detectedLabel()->text().contains(QStringLiteral("G")));
+    QVERIFY(!picker->clearButton()->isEnabled());
+
+    // Escape closes it and changes nothing.
+    QTest::keyClick(picker, Qt::Key_Escape);
+    QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+    QVERIFY(!controller.songKeyDetails(song)->isManual());
+
+    // One click chooses, saves and closes; the Key cell shows it at once.
+    picker = view.openSongKeyPicker();
+    QVERIFY(picker);
+    QTest::mouseClick(picker->keyButton(0), Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+    QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 0);
+    QCOMPARE(keyCell(), QStringLiteral("C"));
+    QCOMPARE(view.selectedSongId(), song);  // still on the same song
+
+    // Opened again: C is the chosen one; Clear Manual Key goes back to G.
+    picker = view.openSongKeyPicker();
+    QVERIFY(picker);
+    QVERIFY(picker->keyButton(0)->isChecked());
+    QVERIFY(!picker->keyButton(7)->isChecked());
+    QVERIFY(!picker->keyButton(7)->property("detected").toBool());
+    QVERIFY(picker->detectedLabel()->text().contains(QStringLiteral("G")));
+    QVERIFY(picker->clearButton()->isEnabled());
+    QTest::mouseClick(picker->clearButton(), Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+    QVERIFY(!controller.songKeyDetails(song)->isManual());
+    QCOMPARE(keyCell(), QStringLiteral("G"));
+}
+
+void TestSongKeys::keyCellClickIsLikeTheRestOfTheRow()
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite")));
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    const qint64 song = controller.findSongByMp3Path(root, known);
+    QString error;
+    QVERIFY2(controller.setManualOriginalKey(song, 0, &error), qPrintable(error));
+
+    LibraryView view(&controller);
+    view.setKeyColumnAvailable(true);
+    view.resize(1100, 600);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    view.searchBox()->setText(QStringLiteral("Synth Band"));
+    QTRY_COMPARE_WITH_TIMEOUT(view.songResultCount(), 2, 3000);
+    QTreeView* results = view.resultsList();
+    QVERIFY(!results->isColumnHidden(LibraryResultsModel::KeyColumn));
+    QSignalSpy sing(&view, &LibraryView::singRequested);
+    const auto cell = [&](int row, int column) {
+        return results->visualRect(results->model()->index(row, column)).center();
+    };
+    // The Key cell is display only.
+    for (int row = 0; row < 2; ++row)
+        QVERIFY(!(results->model()->flags(results->model()->index(row, LibraryResultsModel::KeyColumn))
+                  & Qt::ItemIsEditable));
+
+    // A click on any part of a row, the Key cell included, just selects it.
+    for (const int column : {int(LibraryResultsModel::KeyColumn), int(LibraryResultsModel::ArtistColumn),
+                             int(LibraryResultsModel::SongColumn), int(LibraryResultsModel::DiscColumn)}) {
+        for (int row = 0; row < 2; ++row) {
+            QTest::mouseClick(results->viewport(), Qt::LeftButton, {}, cell(row, column));
+            QCOMPARE(results->currentIndex().row(), row);
+            QVERIFY(results->selectionModel()->isRowSelected(row, {}));
+            // Not editing: no editor opened in the table.
+            QVERIFY(results->viewport()->findChildren<QLineEdit*>().isEmpty());
+            QVERIFY(!results->isPersistentEditorOpen(results->model()->index(row, column)));
+            QVERIFY(openPickers().isEmpty());
+            QCOMPARE(sing.count(), 0);
+        }
+    }
+    QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 0);  // nothing changed
+    QCOMPARE(results->model()->index(resultRow(&view, QStringLiteral("G Song")),
+                                     LibraryResultsModel::KeyColumn).data().toString(), QStringLiteral("C"));
+
+    // A double-click on the Key cell sings the song, as anywhere in the row.
+    const int row = resultRow(&view, QStringLiteral("G Song"));
+    // (A double-click arrives as a click, then the double-click.)
+    const auto doubleClick = [&](int column) {
+        QTest::mouseClick(results->viewport(), Qt::LeftButton, {}, cell(row, column));
+        QTest::mouseDClick(results->viewport(), Qt::LeftButton, {}, cell(row, column));
+    };
+    doubleClick(LibraryResultsModel::KeyColumn);
+    QTRY_COMPARE_WITH_TIMEOUT(sing.count(), 1, 2000);
+    QCOMPARE(sing.first().first().toLongLong(), song);
+    QTest::qWait(QApplication::doubleClickInterval() + 50);
+    doubleClick(LibraryResultsModel::SongColumn);
+    QTRY_COMPARE_WITH_TIMEOUT(sing.count(), 2, 2000);
+    QCOMPARE(sing.last().first().toLongLong(), song);
+    QVERIFY(openPickers().isEmpty());
+    QVERIFY(results->viewport()->findChildren<QLineEdit*>().isEmpty());
+}
+
+void TestSongKeys::setSongKeyFitsTheLibraryFooter()
+{
+    // J: the button must not make the window larger or squeeze the song table.
+    theme::apply(*qApp);
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite")));
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller);
+    window.setShowErrorDialogs(false);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    LibraryView* view = window.libraryView();
+    view->searchBox()->setText(QStringLiteral("Synth Band"));
+    QTRY_COMPARE_WITH_TIMEOUT(view->songResultCount(), 2, 3000);
+    view->resultsList()->setCurrentIndex(view->resultsList()->model()->index(0, 0));
+    QVERIFY(view->setKeyButton()->isEnabled());
+    QHeaderView* header = view->resultsList()->header();
+    for (const int percent : {80, 90, 100, 125, 150}) {
+        theme::setScalePercent(percent);
+        QCoreApplication::processEvents();
+        const QSize with = window.minimumSizeHint();
+        view->setKeyButton()->hide();
+        const QSize without = window.minimumSizeHint();
+        view->setKeyButton()->show();
+        QCOMPARE(with, without);
+        // A 1366x768 screen (at most; the window's own minimum otherwise).
+        window.resize(QSize(1366, 705).expandedTo(with));
+        QCoreApplication::processEvents();
+        const int artist = header->sectionSize(LibraryResultsModel::ArtistColumn);
+        view->setKeyButton()->hide();
+        QCoreApplication::processEvents();
+        QCOMPARE(header->sectionSize(LibraryResultsModel::ArtistColumn), artist);
+        view->setKeyButton()->show();
+        QCoreApplication::processEvents();
+        // Every footer button is shown whole.
+        for (QPushButton* button : {view->setKeyButton(), view->addToPlaylistButton(), view->singButton()}) {
+            QVERIFY2(button->isVisible() && button->width() >= button->minimumSizeHint().width(),
+                     qPrintable(QStringLiteral("%1 at %2%").arg(button->text()).arg(percent)));
+        }
+        QPointer<SongKeyPicker> picker = view->openSongKeyPicker();
+        QVERIFY(picker);
+        QVERIFY(picker->width() <= 1366 && picker->height() <= 705);
+        picker->close();
+        QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+    }
+    theme::setScalePercent(100);
 }
 
 QTEST_MAIN(TestSongKeys)

@@ -212,6 +212,16 @@ QMenu::item:selected { background: #524330; color: #efab52; }
 QMenu::item:disabled { color: #5c5a56; }
 QMenu::separator { height: 1px; background: #2c2f35; margin: 4px 6px; }
 
+/* ---- Set Original Song Key ---------------------------------------- */
+QFrame#keyPicker { background: #212328; border: 1px solid #3a3d44; }
+#keyPickerTitle { font-size: 15px; font-weight: 700; color: #f5f1ea; }
+#keyPickerSong { font-size: 13px; font-weight: 600; color: #eaa244; }
+#keyPickerHint { font-size: 12px; color: #8d8982; }
+#keyPickerCaption { font-size: 11px; font-weight: 700; color: #8d8982; }
+QPushButton#keyChoice { padding: 0px; font-size: 14px; font-weight: 600; }
+QPushButton#keyChoice:checked { background: #524330; color: #efab52; border-color: #8a6a3c; }
+QPushButton#keyChoice[detected="true"] { border: 1px dashed #8d8982; }
+
 /* ---- Settings ------------------------------------------------------ */
 QListWidget#settingsNav {
     background: #1b1d21;

@@ -78,14 +78,26 @@ struct ReviewSummary {
     qint64 manual = 0;
 };
 
-// A song's key, as worked out from its audio (see library/SongKeys.h).
+// A song's original key: the one chosen by hand, if any, and the one worked
+// out from its audio (see library/SongKeys.h). Both are keys of the backing
+// track itself, never the Key +/- transpose.
 struct SongKeyInfo {
+    // From the audio (empty status: not analysed yet).
     QString status;      // "confident", "uncertain", "silent", "too_short", "not_audio"
     int keyIndex = -1;   // 0-23 (music::MusicalKey::index), -1 for none
     double confidence = 0.0;
+    // Chosen by the user (trusted metadata), -1 for none. Always wins.
+    int manualKeyIndex = -1;
 
-    // Only a confident key is ever shown.
-    bool shown() const { return status == QLatin1String("confident") && keyIndex >= 0; }
+    bool isManual() const { return manualKeyIndex >= 0; }
+    // A detected key is shown only when confident.
+    int detectedKeyIndex() const
+    {
+        return status == QLatin1String("confident") && keyIndex >= 0 ? keyIndex : -1;
+    }
+    // The key to show: the user's, else a confident detected one, else none.
+    int shownKeyIndex() const { return isManual() ? manualKeyIndex : detectedKeyIndex(); }
+    bool shown() const { return shownKeyIndex() >= 0; }
 };
 
 // How far key analysis has got in the active music folder: MP3s of playable
@@ -94,6 +106,7 @@ struct SongKeySummary {
     qint64 total = 0;
     qint64 analysed = 0;
     qint64 confident = 0;
+    qint64 manual = 0;  // songs with an original key chosen by hand
 
     qint64 remaining() const { return total > analysed ? total - analysed : 0; }
 };
