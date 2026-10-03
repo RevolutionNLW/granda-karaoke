@@ -212,6 +212,42 @@ QString ocrEvidence(const QStringList& readings)
         .arg(items.join(QLatin1Char(',')));
 }
 
+// A song's trusted values as the catalogue mirrors them, one string per song.
+QString mirroredTrusted(const QString& cataloguePath, qint64 songId)
+{
+    QString result;
+    const QString connection = QStringLiteral("mirror-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+        database.setDatabaseName(cataloguePath);
+        if (!database.open())
+            qFatal("Could not open the catalogue");
+        QSqlQuery query(database);
+        query.prepare(QStringLiteral(
+            "SELECT manual_artist,manual_title,manual_label,manual_series,manual_disc_id,"
+            "manual_track,manual_original_key,manual_origin FROM songs WHERE id=?"));
+        query.addBindValue(songId);
+        if (!query.exec() || !query.next())
+            qFatal("Could not read the catalogue mirror");
+        QStringList values;
+        for (int column = 0; column < 8; ++column)
+            values.append(query.value(column).isNull() ? QStringLiteral("-") : query.value(column).toString());
+        result = values.join(QLatin1Char('|'));
+        database.close();
+    }
+    QSqlDatabase::removeDatabase(connection);
+    return result;
+}
+
+qint64 storedRowCount(const QString& overridesPath)
+{
+    MetadataOverrideStore store(overridesPath);
+    QString error;
+    if (!store.open(&error))
+        qFatal("Could not open the override store: %s", qPrintable(error));
+    return store.all(&error).size();
+}
+
 } // namespace
 
 class TestMetadataReview : public QObject {
@@ -224,6 +260,9 @@ private slots:
     void nameEditsKeepImportedValues();
     void damagedOverrideStoreIsRebuiltNotErased();
     void syncAndEditsAreSerialised();
+    void aReseedThatStopsPartwayRestoresNothing();
+    void aClearInterruptedByACrashStaysCleared();
+    void correctionsStillFollowAMovedFolderAcrossRestarts();
     void damagedCatalogueInsideLibraryRootIsNeverTouched();
     void pendingJournalCatalogueInsideRootIsRefusedBeforeSqlite();
     void previewNeverCreatesPlaylistContextOrAutoplays();
@@ -566,6 +605,229 @@ void TestMetadataReview::syncAndEditsAreSerialised()
     waitForIdle(controller);
     QCOMPARE(controller.reviewDetail(songId).value(QStringLiteral("title")).toString(),
              QStringLiteral("My Way"));
+}
+
+void TestMetadataReview::aReseedThatStopsPartwayRestoresNothing()
+{
+    // The store is lost and rebuilt from the catalogue's mirror. If that
+    // rebuild stops part-way, the store must be left as it was (empty), not
+    // hold some corrections: a later sync would take a partly filled store
+    // as the whole truth and erase the corrections it is missing.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const QString catalogue = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    for (const QString& stem : {QStringLiteral("3901"), QStringLiteral("3902"), QStringLiteral("3903")}) {
+        writeFile(root + QStringLiteral("/SGB39/") + stem + QStringLiteral(".mp3"), QByteArray(3000, 'a'));
+        writeFile(root + QStringLiteral("/SGB39/") + stem + QStringLiteral(".cdg"), QByteArray(2400, 'b'));
+    }
+    const QMap<QString, QByteArray> music = tree(root);
+    QList<qint64> songs;
+    QStringList trusted;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QVERIFY(controller.chooseRoot(root));
+        waitForIdle(controller);
+        for (const QString& stem : {QStringLiteral("3901"), QStringLiteral("3902"), QStringLiteral("3903")})
+            songs.append(controller.findSongByMp3Path(root, QStringLiteral("SGB39/") + stem + QStringLiteral(".mp3")));
+        QVERIFY(songs.at(0) > 0 && songs.at(1) > 0 && songs.at(2) > 0);
+        QString error;
+        // A name, imported details, and an original key set by hand.
+        QVERIFY2(controller.setManualOverride(songs.at(0), QStringLiteral("Frank Sinatra"),
+                                              QStringLiteral("My Way"), &error), qPrintable(error));
+        MetadataOverride imported;
+        imported.label = QStringLiteral("Legends");
+        imported.series = QStringLiteral("Country Gold");
+        imported.trustedDiscId = QStringLiteral("LEG099");
+        imported.trustedTrack = 7;
+        imported.origin = QStringLiteral("import");
+        QVERIFY2(controller.setTrustedMetadata(songs.at(1), imported, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songs.at(2), 9, &error), qPrintable(error));
+    }
+    for (qint64 song : std::as_const(songs))
+        trusted.append(mirroredTrusted(catalogue, song));
+    QCOMPARE(storedRowCount(overrides), 3);
+
+    // The store is lost. Its replacement accepts one row and then fails, as
+    // a full disk or an I/O error would part-way through the rebuild.
+    for (const QString& suffix : {QString(), QStringLiteral("-wal"), QStringLiteral("-shm")})
+        QFile::remove(overrides + suffix);
+    QCOMPARE(storedRowCount(overrides), 0);
+    withRawConnection(overrides, {QStringLiteral(
+        "CREATE TRIGGER fail_rebuild BEFORE INSERT ON metadata_overrides "
+        "WHEN (SELECT count(*) FROM metadata_overrides) >= 1 "
+        "BEGIN SELECT RAISE(ABORT,'injected write failure'); END")});
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(storedRowCount(overrides), 0);  // all or nothing
+        // Nothing can be corrected until the store is whole again.
+        QString error;
+        QVERIFY(!controller.setManualOverride(songs.at(1), QStringLiteral("Patsy Cline"),
+                                              QStringLiteral("Crazy"), &error));
+        QCOMPARE(storedRowCount(overrides), 0);
+        // A library check keeps every correction the catalogue still holds.
+        controller.requestRefreshScan();
+        QVERIFY(controller.isScanning());
+        waitForIdle(controller);
+        for (int i = 0; i < songs.size(); ++i)
+            QCOMPARE(mirroredTrusted(catalogue, songs.at(i)), trusted.at(i));
+        QCOMPARE(controller.reviewDetail(songs.at(0)).value(QStringLiteral("title")).toString(),
+                 QStringLiteral("My Way"));
+    }
+
+    // Once the store can be written again, the next start restores all of them.
+    withRawConnection(overrides, {QStringLiteral("DROP TRIGGER fail_rebuild")});
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(storedRowCount(overrides), 3);
+        QCOMPARE(*controller.existingTrusted(songs.at(0)).title, QStringLiteral("My Way"));
+        const MetadataOverride details = controller.existingTrusted(songs.at(1));
+        QCOMPARE(*details.label, QStringLiteral("Legends"));
+        QCOMPARE(*details.series, QStringLiteral("Country Gold"));
+        QCOMPARE(*details.trustedDiscId, QStringLiteral("LEG099"));
+        QCOMPARE(*details.trustedTrack, 7);
+        QCOMPARE(details.origin, QStringLiteral("import"));
+        QCOMPARE(*controller.existingTrusted(songs.at(2)).originalKey, 9);
+        controller.requestRefreshScan();
+        QVERIFY(controller.isScanning());
+        waitForIdle(controller);
+        for (int i = 0; i < songs.size(); ++i)
+            QCOMPARE(mirroredTrusted(catalogue, songs.at(i)), trusted.at(i));
+    }
+    QCOMPARE(tree(root), music);
+}
+
+void TestMetadataReview::aClearInterruptedByACrashStaysCleared()
+{
+    // Clearing a correction removes it from the store, then from the
+    // catalogue. If the program stops between the two, the catalogue still
+    // shows the old value; it must not be taken for a lost store and copied
+    // back into it.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const QString catalogue = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    writeFile(root + QStringLiteral("/SGB39/3902.mp3"), QByteArray(3000, 'a'));
+    writeFile(root + QStringLiteral("/SGB39/3902.cdg"), QByteArray(2400, 'b'));
+    const QMap<QString, QByteArray> music = tree(root);
+    qint64 songId = 0;
+    QString automatic;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QVERIFY(controller.chooseRoot(root));
+        waitForIdle(controller);
+        songId = controller.findSongByMp3Path(root, QStringLiteral("SGB39/3902.mp3"));
+        QVERIFY(songId > 0);
+        automatic = controller.reviewDetail(songId).value(QStringLiteral("title")).toString();
+        QString error;
+        QVERIFY2(controller.setManualOverride(songId, QStringLiteral("Frank Sinatra"),
+                                              QStringLiteral("My Way"), &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songId, 9, &error), qPrintable(error));
+    }
+    QVERIFY(automatic != QLatin1String("My Way"));
+    // The user clears the name and the key; the store change is saved and
+    // the program stops before the catalogue's copy is changed.
+    {
+        MetadataOverrideStore store(overrides);
+        QString error;
+        QVERIFY2(store.open(&error), qPrintable(error));
+        const QList<MetadataOverride> rows = store.all(&error);
+        QCOMPARE(rows.size(), 1);
+        QVERIFY2(store.clearOverride(rows.first().rootPath, rows.first().mp3RelPath, &error),
+                 qPrintable(error));
+    }
+    QVERIFY(mirroredTrusted(catalogue, songId).startsWith(QStringLiteral("Frank Sinatra|My Way|")));
+
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(storedRowCount(overrides), 0);
+        // Not shown again, even before the music folder is checked.
+        QCOMPARE(controller.reviewDetail(songId).value(QStringLiteral("title")).toString(), automatic);
+        QVERIFY(!controller.existingTrusted(songId).hasValues());
+        controller.requestRefreshScan();
+        QVERIFY(controller.isScanning());
+        waitForIdle(controller);
+        QCOMPARE(controller.reviewDetail(songId).value(QStringLiteral("title")).toString(), automatic);
+        QCOMPARE(mirroredTrusted(catalogue, songId), QStringLiteral("-|-|-|-|-|-|-|-"));
+    }
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(storedRowCount(overrides), 0);
+        QCOMPARE(controller.reviewDetail(songId).value(QStringLiteral("title")).toString(), automatic);
+    }
+    QCOMPARE(tree(root), music);
+}
+
+void TestMetadataReview::correctionsStillFollowAMovedFolderAcrossRestarts()
+{
+    // The start-up check applies the store as it is and never moves a
+    // correction itself: a music folder that moved (a new drive letter) is
+    // still followed by the scan, and the result survives restarts.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const QString catalogue = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    const QString song = QStringLiteral("SGB39/3902.mp3");
+    writeFile(rootA + QStringLiteral("/SGB39/3901.mp3"), QByteArray(3000, 'c'));
+    writeFile(rootA + QStringLiteral("/SGB39/3901.cdg"), QByteArray(2400, 'd'));
+    writeFile(rootA + QStringLiteral("/SGB39/3902.mp3"), QByteArray(3000, 'a'));
+    writeFile(rootA + QStringLiteral("/SGB39/3902.cdg"), QByteArray(2400, 'b'));
+    qint64 songA = 0;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QVERIFY(controller.chooseRoot(rootA));
+        waitForIdle(controller);
+        songA = controller.findSongByMp3Path(rootA, song);
+        QVERIFY(songA > 0);
+        QString error;
+        QVERIFY2(controller.setManualOverride(songA, QStringLiteral("Frank Sinatra"),
+                                              QStringLiteral("My Way"), &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songA, 9, &error), qPrintable(error));
+    }
+    QVERIFY(QDir().rename(rootA, rootB));
+    const QMap<QString, QByteArray> music = tree(rootB);
+    auto storedRoots = [&] {
+        MetadataOverrideStore store(overrides);
+        QString error;
+        QStringList roots;
+        if (store.open(&error)) {
+            for (const MetadataOverride& value : store.all(&error))
+                roots.append(value.rootPath);
+        }
+        return roots;
+    };
+    {
+        // Restarted before the new folder is chosen: nothing is lost or moved.
+        LibraryController controller(catalogue, {}, overrides);
+        QCOMPARE(controller.reviewDetail(songA).value(QStringLiteral("title")).toString(),
+                 QStringLiteral("My Way"));
+        QCOMPARE(storedRoots(), QStringList{Catalogue::canonicalPath(rootA)});
+        QVERIFY(controller.chooseRoot(rootB));
+        waitForIdle(controller);
+        const qint64 songB = controller.findSongByMp3Path(rootB, song);
+        QVERIFY(songB > 0 && songB != songA);
+        QCOMPARE(controller.reviewDetail(songB).value(QStringLiteral("title")).toString(),
+                 QStringLiteral("My Way"));
+        QCOMPARE(*controller.existingTrusted(songB).originalKey, 9);
+        QCOMPARE(storedRoots(), QStringList{Catalogue::canonicalPath(rootB)});
+    }
+    for (int restart = 0; restart < 2; ++restart) {
+        LibraryController controller(catalogue, {}, overrides);
+        const qint64 songB = controller.findSongByMp3Path(rootB, song);
+        QCOMPARE(controller.reviewDetail(songB).value(QStringLiteral("title")).toString(),
+                 QStringLiteral("My Way"));
+        QCOMPARE(*controller.existingTrusted(songB).originalKey, 9);
+        controller.startConfiguredScan();
+        waitForIdle(controller);
+        QCOMPARE(controller.reviewDetail(songB).value(QStringLiteral("title")).toString(),
+                 QStringLiteral("My Way"));
+        QCOMPARE(storedRoots(), QStringList{Catalogue::canonicalPath(rootB)});
+    }
+    QCOMPARE(tree(rootB), music);
 }
 
 QTEST_MAIN(TestMetadataReview)

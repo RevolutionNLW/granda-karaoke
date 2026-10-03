@@ -8,6 +8,7 @@
 #include <QFileInfo>
 #include <QLoggingCategory>
 #include <QMutex>
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QUuid>
@@ -212,7 +213,7 @@ bool MetadataOverrideStore::ensureSchema(QString* error)
     }
     const int current = version.value(0).toInt();
     if (current == SchemaVersion)
-        return true;
+        return ensureStateTable(error);
     if (!m_database.transaction()) {
         setError(QStringLiteral("Could not begin metadata override schema transaction: %1")
                      .arg(m_database.lastError().text()), error);
@@ -253,7 +254,15 @@ bool MetadataOverrideStore::ensureSchema(QString* error)
                      .arg(m_database.lastError().text()), error);
         return false;
     }
-    return true;
+    return ensureStateTable(error);
+}
+
+bool MetadataOverrideStore::ensureStateTable(QString* error)
+{
+    // Added within schema version 3: an earlier build still opens the store
+    // and ignores the table.
+    return execute(QStringLiteral(
+        "CREATE TABLE IF NOT EXISTS store_state(key TEXT PRIMARY KEY,value TEXT NOT NULL)"), error);
 }
 
 bool MetadataOverrideStore::recoverCorruptDatabase(const QString& detail, QString* error)
@@ -276,6 +285,70 @@ bool MetadataOverrideStore::recoverCorruptDatabase(const QString& detail, QStrin
     qWarning(lcMetadataOverrides).noquote()
         << "Moved corrupt metadata override database to" << moved << "because:" << detail;
     return true;
+}
+
+bool MetadataOverrideStore::isEstablished(QString* error) const
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    QSqlQuery query(m_database);
+    if (!query.exec(QStringLiteral(
+            "SELECT EXISTS(SELECT 1 FROM store_state WHERE key='established') "
+            "OR EXISTS(SELECT 1 FROM metadata_overrides)"))
+        || !query.next()) {
+        setError(queryError(query, QStringLiteral("Could not inspect metadata overrides")), error);
+        return false;
+    }
+    return query.value(0).toBool();
+}
+
+bool MetadataOverrideStore::establish(const QList<MetadataOverride>& values, QString* error)
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("Could not begin restoring metadata overrides: %1")
+                     .arg(m_database.lastError().text()), error);
+        return false;
+    }
+    auto fail = [&](const QString& message) {
+        m_database.rollback();
+        setError(message, error);
+        return false;
+    };
+    if (!values.isEmpty()) {
+        QSqlQuery rows(m_database);
+        if (!rows.exec(QStringLiteral("SELECT EXISTS(SELECT 1 FROM metadata_overrides)"))
+            || !rows.next())
+            return fail(queryError(rows, QStringLiteral("Could not inspect metadata overrides")));
+        if (rows.value(0).toBool())
+            return fail(QStringLiteral("Metadata overrides were not restored: the store is not empty"));
+    }
+    QSet<QString> identities;
+    for (const MetadataOverride& value : values) {
+        // Two values for one song file would leave only one of them.
+        const QString identity = Catalogue::canonicalPath(value.rootPath) + QChar(0x1f)
+            + Catalogue::normalizedPlaylistRelativePath(value.mp3RelPath);
+        if (identities.contains(identity))
+            return fail(QStringLiteral("Metadata overrides were not restored: two corrections "
+                                       "for %1 %2").arg(value.rootPath, value.mp3RelPath));
+        identities.insert(identity);
+        QString message;
+        if (!setOverride(value, &message))
+            return fail(message);
+    }
+    QSqlQuery mark(m_database);
+    if (!mark.exec(QStringLiteral(
+            "INSERT OR IGNORE INTO store_state(key,value) VALUES('established','1')")))
+        return fail(queryError(mark, QStringLiteral("Could not mark metadata overrides")));
+    if (m_database.commit())
+        return true;
+    return fail(QStringLiteral("Could not commit restoring metadata overrides: %1")
+                    .arg(m_database.lastError().text()));
 }
 
 bool MetadataOverrideStore::setOverride(const MetadataOverride& input, QString* error)
@@ -528,5 +601,10 @@ QList<MetadataOverride> MetadataOverrideStore::all(QString* error) const
     }
     while (query.next())
         result.append(overrideFromQuery(query));
+    if (query.lastError().isValid()) {
+        // Never a partial list: it would be taken for every correction there is.
+        setError(queryError(query, QStringLiteral("Could not list metadata overrides")), error);
+        return {};
+    }
     return result;
 }

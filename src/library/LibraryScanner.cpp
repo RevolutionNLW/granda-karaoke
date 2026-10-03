@@ -221,11 +221,17 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     MetadataOverrideStore store(m_overrideStorePath);
     QList<MetadataOverride> overrides;
-    if (syncError.isEmpty() && store.open(&syncError, roots, false))
-        overrides = store.all(&syncError);
-    if (syncError.isEmpty() && overrides.isEmpty() && catalogue.hasTrustedMirror(&syncError))
-        syncError = QStringLiteral("the override store is empty but the catalogue holds "
-                                   "corrections; keeping them");
+    bool established = false;
+    if (syncError.isEmpty() && store.open(&syncError, roots, false)) {
+        established = store.isEstablished(&syncError);
+        if (syncError.isEmpty())
+            overrides = store.all(&syncError);
+    }
+    // A store just created (lost, or damaged and set aside) is not the
+    // truth yet, even after the user cleared their last correction.
+    if (syncError.isEmpty() && !established && catalogue.hasTrustedMirror(&syncError))
+        syncError = QStringLiteral("the override store has not been restored yet but the "
+                                   "catalogue holds corrections; keeping them");
     if (!syncError.isEmpty()) {
         qWarning().noquote() << "Manual metadata corrections were not synchronised:"
                              << syncError;

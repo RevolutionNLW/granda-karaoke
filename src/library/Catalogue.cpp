@@ -1235,6 +1235,14 @@ qint64 Catalogue::findSongByMp3Path(const QString& rootPath, const QString& relP
         }
         while (query.next())
             matches.insert(query.value(0).toLongLong());
+        if (query.lastError().isValid()) {
+            setError(sqlError(query, QStringLiteral("Song path lookup failed")), error);
+            return 0;
+        }
+    }
+    if (rootQuery.lastError().isValid()) {
+        setError(sqlError(rootQuery, QStringLiteral("Song root lookup failed")), error);
+        return 0;
     }
     return matches.size() == 1 ? *matches.constBegin() : 0;
 }
@@ -1265,6 +1273,14 @@ qint64 Catalogue::findUniqueActiveSongByMp3Path(const QString& relPath,
         }
         while (query.next())
             matches.insert(query.value(0).toLongLong());
+        if (query.lastError().isValid()) {
+            setError(sqlError(query, QStringLiteral("Active song path lookup failed")), error);
+            return 0;
+        }
+    }
+    if (rootQuery.lastError().isValid()) {
+        setError(sqlError(rootQuery, QStringLiteral("Active song root lookup failed")), error);
+        return 0;
     }
     return matches.size() == 1 ? *matches.constBegin() : 0;
 }
@@ -1721,7 +1737,9 @@ std::optional<MetadataOverride> Catalogue::metadataOverrideSnapshot(
         return std::nullopt;
     }
     if (!query.next()) {
-        setError(QStringLiteral("Song has no durable loose-file identity"), error);
+        setError(query.lastError().isValid()
+                     ? sqlError(query, QStringLiteral("Could not snapshot song metadata"))
+                     : QStringLiteral("Song has no durable loose-file identity"), error);
         return std::nullopt;
     }
     MetadataOverride result;
@@ -1799,6 +1817,16 @@ bool Catalogue::setTrustedMetadata(qint64 songId, const MetadataOverride& value,
 {
     if (!value.hasValues()) {
         setError(QStringLiteral("A metadata override must set at least one value"), error);
+        return false;
+    }
+    // Only what the override store accepts too, so the mirror can always
+    // restore it.
+    if (value.originalKey && (*value.originalKey < 0 || *value.originalKey > 23)) {
+        setError(QStringLiteral("Not a song key: %1").arg(*value.originalKey), error);
+        return false;
+    }
+    if (value.origin != QLatin1String("manual") && value.origin != QLatin1String("import")) {
+        setError(QStringLiteral("Unknown metadata origin: %1").arg(value.origin), error);
         return false;
     }
     if (!m_database.transaction()) {
@@ -1936,6 +1964,8 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
     QList<qint64> changed;
     while (manualSongs.next())
         changed.append(manualSongs.value(0).toLongLong());
+    if (manualSongs.lastError().isValid())
+        return fail(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")));
     QSqlQuery clear(m_database);
     if (!clear.exec(QStringLiteral("UPDATE songs SET ") + kClearTrusted + QStringLiteral(" WHERE ")
                     + hasAnyTrustedSql()))
@@ -2544,9 +2574,15 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
         return result;
     }
     while (query.next()) {
-        auto value = metadataOverrideSnapshot(query.value(0).toLongLong(), nullptr);
-        if (!value)
-            continue;
+        // Every value or none: the store is rebuilt from this list, and a
+        // value left out of it would then be erased by the next sync.
+        QString snapshotError;
+        auto value = metadataOverrideSnapshot(query.value(0).toLongLong(), &snapshotError);
+        if (!value) {
+            setError(QStringLiteral("Could not read the trusted metadata of song %1: %2")
+                         .arg(query.value(0).toLongLong()).arg(snapshotError), error);
+            return {};
+        }
         auto text = [&](int column) {
             return query.value(column).isNull() ? std::nullopt
                                                 : std::optional<QString>(query.value(column).toString());
@@ -2563,6 +2599,10 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
         value->originalKey = query.value(9).isNull() ? std::nullopt
                                                      : std::optional<int>(query.value(9).toInt());
         result.append(*value);
+    }
+    if (query.lastError().isValid()) {
+        setError(sqlError(query, QStringLiteral("Could not read trusted metadata")), error);
+        return {};
     }
     return result;
 }

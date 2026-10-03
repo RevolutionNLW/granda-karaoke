@@ -150,6 +150,7 @@ private slots:
     void unsafeLegacyCatalogueIsNotTouched();
     void pausedScanDoesNotBlockCorrections();
     void emptyOverrideStoreNeverErasesCorrections();
+    void overrideStoreIsEstablishedAllOrNothing();
     void overrideStoreMigratesFromVersionOne();
     void overridesFollowAMovedMusicFolder();
     void movesNeedTheSameSongAndClearsAreAllOrNothing();
@@ -554,6 +555,110 @@ void TestMetadataFoundation::emptyOverrideStoreNeverErasesCorrections()
     Catalogue catalogue(path);
     QVERIFY2(catalogue.open(&error), qPrintable(error));
     QCOMPARE(catalogue.search(QStringLiteral("frank sinatra my way"), 5, true, &error).size(), 1);
+}
+
+void TestMetadataFoundation::overrideStoreIsEstablishedAllOrNothing()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("library"));
+    QVERIFY(QDir().mkpath(root));
+    auto value = [&](const QString& file, const QString& title) {
+        MetadataOverride result;
+        result.rootPath = root;
+        result.mp3RelPath = file;
+        result.title = title;
+        return result;
+    };
+    QString error;
+
+    // A new store is not established until the application says so.
+    const QString path = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    {
+        MetadataOverrideStore store(path);
+        QVERIFY2(store.open(&error, {root}), qPrintable(error));
+        QVERIFY(!store.isEstablished(&error) && error.isEmpty());
+        // Two values for one song file: nothing is stored.
+        QVERIFY(!store.establish({value(QStringLiteral("a.mp3"), QStringLiteral("A")),
+                                  value(QStringLiteral("b.mp3"), QStringLiteral("B")),
+                                  value(QStringLiteral("./b.mp3"), QStringLiteral("B2"))}, &error));
+        QVERIFY2(error.contains(QStringLiteral("two corrections")), qPrintable(error));
+        QVERIFY(store.all(&error).isEmpty());
+        QVERIFY(!store.isEstablished(&error));
+        // A value the store refuses: nothing is stored either.
+        MetadataOverride invalid = value(QStringLiteral("c.mp3"), QStringLiteral("C"));
+        invalid.originalKey = 24;
+        QVERIFY(!store.establish({value(QStringLiteral("a.mp3"), QStringLiteral("A")), invalid}, &error));
+        QVERIFY2(error.contains(QStringLiteral("Not a song key")), qPrintable(error));
+        QVERIFY(store.all(&error).isEmpty());
+        QVERIFY(!store.isEstablished(&error));
+
+        QVERIFY2(store.establish({value(QStringLiteral("a.mp3"), QStringLiteral("A")),
+                                  value(QStringLiteral("b.mp3"), QStringLiteral("B"))}, &error),
+                 qPrintable(error));
+        QCOMPARE(store.all(&error).size(), 2);
+        // Values are restored into an empty store only.
+        QVERIFY(!store.establish({value(QStringLiteral("c.mp3"), QStringLiteral("C"))}, &error));
+        QCOMPARE(store.all(&error).size(), 2);
+        // Clearing every correction leaves it established.
+        QVERIFY(store.clearOverride(root, QStringLiteral("a.mp3"), &error));
+        QVERIFY(store.clearOverride(root, QStringLiteral("b.mp3"), &error));
+        QVERIFY(store.all(&error).isEmpty());
+        QVERIFY(store.isEstablished(&error));
+    }
+    {
+        MetadataOverrideStore store(path);
+        QVERIFY2(store.open(&error, {root}), qPrintable(error));
+        QVERIFY(store.isEstablished(&error));
+    }
+
+    // A store saved by an earlier version (no state table) that holds rows is
+    // established; an empty one is not.
+    for (const bool withRow : {true, false}) {
+        const QString legacy = temporary.filePath(QStringLiteral("app/legacy-%1.sqlite").arg(withRow));
+        {
+            MetadataOverrideStore store(legacy);
+            QVERIFY2(store.open(&error, {root}), qPrintable(error));
+            if (withRow)
+                QVERIFY2(store.setOverride(value(QStringLiteral("a.mp3"), QStringLiteral("A")), &error),
+                         qPrintable(error));
+        }
+        const QString connection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+            database.setDatabaseName(legacy);
+            QVERIFY(database.open());
+            QSqlQuery query(database);
+            QVERIFY(query.exec(QStringLiteral("DROP TABLE store_state")));
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+        MetadataOverrideStore store(legacy);
+        QVERIFY2(store.open(&error, {root}), qPrintable(error));
+        QCOMPARE(store.isEstablished(&error), withRow);
+        QVERIFY2(store.establish({}, &error), qPrintable(error));
+        QVERIFY(store.clearOverride(root, QStringLiteral("a.mp3"), &error));
+        QVERIFY(store.isEstablished(&error));
+    }
+
+    // The catalogue accepts only what the store can hold, so its mirror can
+    // always be restored.
+    const QString cataloguePath = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    writeFile(root + QStringLiteral("/SGB39/3902.mp3"), QByteArray("audio"));
+    writeFile(root + QStringLiteral("/SGB39/3902.cdg"), QByteArray("lyrics"));
+    QCOMPARE(runScan(cataloguePath, root).value(QStringLiteral("status")).toString(),
+             QStringLiteral("completed"));
+    Catalogue catalogue(cataloguePath);
+    QVERIFY2(catalogue.open(&error), qPrintable(error));
+    const qint64 songId = catalogue.search(QStringLiteral("3902"), 5, true, &error).first().songId;
+    MetadataOverride key;
+    key.originalKey = 24;
+    QVERIFY(!catalogue.setTrustedMetadata(songId, key, 1, &error));
+    MetadataOverride origin;
+    origin.title = QStringLiteral("My Way");
+    origin.origin = QStringLiteral("guess");
+    QVERIFY(!catalogue.setTrustedMetadata(songId, origin, 1, &error));
+    QVERIFY(!catalogue.hasTrustedMirror(&error));
 }
 
 void TestMetadataFoundation::overridesFollowAMovedMusicFolder()

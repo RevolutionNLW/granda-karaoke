@@ -215,6 +215,9 @@ private slots:
     void onFailed(const QString& message);
 
 private:
+    // At start-up: restores a new store from the catalogue's mirror (all or
+    // nothing), or brings the mirror in line with an established store.
+    bool prepareOverrideStore(QString* error);
     // setTrustedMetadata with MetadataOverrideStore::synchronisation() held,
     // so a read of the existing values and the write are one step.
     bool setTrustedMetadataLocked(qint64 songId, const MetadataOverride& values,

@@ -76,6 +76,17 @@ public:
     QString databasePath() const { return m_databasePath; }
     QString lastError() const { return m_lastError; }
 
+    // An established store holds every correction there is: it has rows, or
+    // the application started it (empty, or restored from the catalogue's
+    // mirror). A store that is not established was just created - the file
+    // was lost, or damaged and set aside - and must never be applied to the
+    // catalogue, or its emptiness would erase the corrections mirrored there.
+    bool isEstablished(QString* error = nullptr) const;
+    // Stores every value and marks the store established, in one transaction:
+    // all of them or, on any error, nothing. Values may only be given while
+    // the store is empty; with none it just marks the store.
+    bool establish(const QList<MetadataOverride>& values, QString* error = nullptr);
+
     bool setOverride(const MetadataOverride& value, QString* error = nullptr);
     bool clearOverride(const QString& rootPath, const QString& mp3RelPath,
                        QString* error = nullptr);
@@ -105,6 +116,7 @@ private:
     // Inside an open transaction: removes each copy, which must match exactly one row.
     bool removeCopiesExactly(const QList<MetadataOverride>& copies, QString* error);
     bool ensureSchema(QString* error);
+    bool ensureStateTable(QString* error);
     bool execute(const QString& sql, QString* error = nullptr) const;
     bool recoverCorruptDatabase(const QString& detail, QString* error);
     void setError(const QString& message, QString* error) const;

@@ -222,7 +222,8 @@ public:
                             qint64 updatedAt = 0, QString* error = nullptr);
     bool clearManualOverride(qint64 songId, QString* error = nullptr);
     // The trusted values mirrored in the catalogue, with their song-file keys,
-    // used to re-seed a lost or damaged override store.
+    // used to re-seed a lost or damaged override store. All of them, or on
+    // any error (including a value without a song-file key) none.
     QList<MetadataOverride> trustedMirror(QString* error = nullptr) const;
     bool hasTrustedMirror(QString* error = nullptr) const;
     std::optional<MetadataOverride> metadataOverrideSnapshot(

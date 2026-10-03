@@ -98,20 +98,12 @@ LibraryController::LibraryController(const QString& databasePath,
         if (!m_overrideStore->open(&overrideError, libraryRoots())) {
             qCCritical(lcLibraryController).noquote()
                 << "Metadata overrides are unavailable:" << overrideError;
-        } else if (m_overrideStore->all(&overrideError).isEmpty() && overrideError.isEmpty()
-                   && m_catalogue.hasTrustedMirror()) {
-            // The store was damaged (and set aside) or lost, but the catalogue
-            // still mirrors every correction: rebuild the store from it rather
-            // than letting an empty store erase them.
-            int restored = 0;
-            for (const MetadataOverride& value : m_catalogue.trustedMirror()) {
-                if (m_overrideStore->setOverride(value, &overrideError))
-                    ++restored;
-            }
-            qCWarning(lcLibraryController).noquote()
-                << "Metadata override store was empty or damaged"
-                << (m_overrideStore->recoveredFromCorruption() ? "(damaged copy kept aside);" : ";")
-                << "restored" << restored << "corrections from the catalogue";
+        } else if (!prepareOverrideStore(&overrideError)) {
+            // Corrections cannot be changed this session; the catalogue keeps
+            // showing the ones it mirrors, and the next start tries again.
+            qCCritical(lcLibraryController).noquote()
+                << "Metadata overrides are unavailable:" << overrideError;
+            m_overrideStore->close();
         }
     }
 
@@ -168,6 +160,48 @@ LibraryController::LibraryController(const QString& databasePath,
             || parserVersion < kFilenameParserVersion)) {
         QTimer::singleShot(0, this, &LibraryController::requestMetadataReprocess);
     }
+}
+
+bool LibraryController::prepareOverrideStore(QString* error)
+{
+    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+    const bool established = m_overrideStore->isEstablished(error);
+    if (!error->isEmpty())
+        return false;
+    if (!established) {
+        // The store was damaged (and set aside) or lost, but the catalogue
+        // still mirrors every correction. They are restored together or not
+        // at all: a store holding only some of them would be taken as
+        // complete, and the next sync would erase the others.
+        const QList<MetadataOverride> mirror = m_catalogue.trustedMirror(error);
+        if (!error->isEmpty() || !m_overrideStore->establish(mirror, error))
+            return false;
+        if (!mirror.isEmpty()) {
+            qCWarning(lcLibraryController).noquote()
+                << "Metadata override store was empty or damaged"
+                << (m_overrideStore->recoveredFromCorruption() ? "(damaged copy kept aside);" : ";")
+                << "restored" << mirror.size() << "corrections from the catalogue";
+        }
+        return true;
+    }
+    // A store saved by an earlier version is marked too, so clearing its last
+    // correction is never mistaken for a lost store.
+    if (!m_overrideStore->establish({}, error))
+        return false;
+    // The store is the truth. A change that stopped between the store and
+    // the catalogue (the program closed in between) is completed before the
+    // library is shown. Corrections are not moved to a moved music folder
+    // here; the next scan does that, as it always has.
+    QString syncError;
+    const QList<MetadataOverride> stored = m_overrideStore->all(&syncError);
+    if (syncError.isEmpty())
+        m_catalogue.applyManualOverrides(stored, &syncError,
+                                         [](const MovedMetadataOverride&) { return false; });
+    if (!syncError.isEmpty()) {
+        qCWarning(lcLibraryController).noquote()
+            << "Manual metadata corrections were not synchronised at start-up:" << syncError;
+    }
+    return true;
 }
 
 LibraryController::~LibraryController()
