@@ -927,6 +927,7 @@ void TestMetadataFoundation::overrideStoreMigratesFromVersionOne()
     QTemporaryDir temporary;
     QVERIFY(temporary.isValid());
     const QString path = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    const QString music = Catalogue::canonicalPath(temporary.filePath(QStringLiteral("music")));
     QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
     const QString connection = QStringLiteral("v1-overrides-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
     {
@@ -939,9 +940,13 @@ void TestMetadataFoundation::overrideStoreMigratesFromVersionOne()
             "artist TEXT,title TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,"
             "auto_artist TEXT,auto_title TEXT,disc_id TEXT,track INTEGER NOT NULL DEFAULT 0,"
             "file_name TEXT,PRIMARY KEY(root_path,mp3_rel_path))")));
-        QVERIFY(query.exec(QStringLiteral(
-            "INSERT INTO metadata_overrides VALUES('/music','SGB39/3902.mp3','Frank Sinatra','My Way',1,2,"
-            "'','Disc SGB39 - Track 02','SGB39',2,'3902.mp3')")));
+        // Stored rows hold the root as Catalogue::canonicalPath writes it
+        // (on Windows with its drive letter).
+        query.prepare(QStringLiteral(
+            "INSERT INTO metadata_overrides VALUES(?,'SGB39/3902.mp3','Frank Sinatra','My Way',1,2,"
+            "'','Disc SGB39 - Track 02','SGB39',2,'3902.mp3')"));
+        query.addBindValue(music);
+        QVERIFY(query.exec());
         QVERIFY(query.exec(QStringLiteral("PRAGMA user_version=1")));
         database.close();
     }
@@ -960,12 +965,12 @@ void TestMetadataFoundation::overrideStoreMigratesFromVersionOne()
     MetadataOverride value = all.first();
     value.originalKey = 21;
     QVERIFY2(store.setOverride(value, &error), qPrintable(error));
-    QCOMPARE(*store.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->originalKey, 21);
+    QCOMPARE(*store.overrideFor(music, QStringLiteral("SGB39/3902.mp3"))->originalKey, 21);
     value.originalKey = 24;
     QVERIFY(!store.setOverride(value, &error));
     // A key alone is a value worth keeping.
     MetadataOverride keyOnly;
-    keyOnly.rootPath = QStringLiteral("/music");
+    keyOnly.rootPath = music;
     keyOnly.mp3RelPath = QStringLiteral("SGB39/3903.mp3");
     keyOnly.originalKey = 0;
     QVERIFY(keyOnly.hasValues());
@@ -991,8 +996,8 @@ void TestMetadataFoundation::overrideStoreMigratesFromVersionOne()
     MetadataOverrideStore fromTwo(path);
     QVERIFY2(fromTwo.open(&error), qPrintable(error));
     QCOMPARE(fromTwo.all(&error).size(), 2);
-    QVERIFY(!fromTwo.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->originalKey);
-    QCOMPARE(*fromTwo.overrideFor(QStringLiteral("/music"), QStringLiteral("SGB39/3902.mp3"))->title,
+    QVERIFY(!fromTwo.overrideFor(music, QStringLiteral("SGB39/3902.mp3"))->originalKey);
+    QCOMPARE(*fromTwo.overrideFor(music, QStringLiteral("SGB39/3902.mp3"))->title,
              QStringLiteral("My Way"));
 }
 

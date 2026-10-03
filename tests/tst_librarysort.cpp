@@ -1,3 +1,4 @@
+#include "BackgroundWork.h"
 #include "BusTestPlayer.h"
 #include "LibraryController.h"
 #include "LibraryView.h"
@@ -112,6 +113,9 @@ QString userState(const QTemporaryDir& temporary)
 // Deletes the rebuildable catalogue entirely, as a recovery or reinstall would.
 void deleteCatalogue(const QString& path)
 {
+    // A count started by the last controller may still be reading the file,
+    // and Windows does not delete a file that is open.
+    QVERIFY(background::waitForAll(5000));
     for (const QString& suffix : {QString(), QStringLiteral("-wal"), QStringLiteral("-shm")})
         QFile::remove(path + suffix);
     QVERIFY(!QFileInfo::exists(path));
