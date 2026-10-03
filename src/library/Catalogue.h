@@ -4,6 +4,7 @@
 #include "library/MetadataOverrideStore.h"
 #include "library/UserStateStore.h"
 
+#include <QHash>
 #include <QList>
 #include <QSqlDatabase>
 #include <QString>
@@ -247,6 +248,9 @@ public:
     // The key of the MP3 the song would play (its preferred source first),
     // if one has been worked out.
     std::optional<SongKeyInfo> songKey(qint64 songId, QString* error = nullptr) const;
+    // songKey() for many songs at once (a few queries, not one per song);
+    // songs with nothing known are left out.
+    QHash<qint64, SongKeyInfo> songKeys(const QList<qint64>& songIds, QString* error = nullptr) const;
     // Key-analysis progress of a catalogue file, on a read-only connection
     // of its own: safe to call on a worker thread.
     static std::optional<SongKeySummary> readSongKeySummary(const QString& databasePath,

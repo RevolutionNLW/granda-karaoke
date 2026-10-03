@@ -15,6 +15,9 @@
 #include "library/Catalogue.h"
 #include "library/MetadataOverrideStore.h"
 #include "library/SongKeys.h"
+#include "PlaylistView.h"
+#include "playlist/PlaylistPlayback.h"
+#include "playlist/PlaylistStore.h"
 #include "music/KeyDetector.h"
 #include "music/MusicalKey.h"
 #include "ui/Theme.h"
@@ -29,6 +32,7 @@
 #include <QPointer>
 #include <QHeaderView>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMutexLocker>
 #include <QTreeView>
 #include <QPushButton>
@@ -40,6 +44,7 @@
 #include <QTest>
 #include <QUuid>
 
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -122,6 +127,34 @@ public:
     }
 };
 
+// Answers at once with a confident C major, without reading the file: for
+// the scheduling of many songs.
+class QuickEngine final : public SongKeyEngine {
+public:
+    std::atomic_int calls = 0;
+    Outcome analyse(const QString&, const std::function<bool()>&, KeyAnalysis* result,
+                    QString*) override
+    {
+        ++calls;
+        result->status = KeyAnalysis::Status::Confident;
+        result->key = MusicalKey{0, false};
+        result->confidence = 0.9;
+        return Outcome::Analysed;
+    }
+};
+
+// A drive that lists its songs but cannot read them.
+class UnreadableEngine final : public SongKeyEngine {
+public:
+    std::atomic_int calls = 0;
+    Outcome analyse(const QString&, const std::function<bool()>&, KeyAnalysis*, QString* detail) override
+    {
+        ++calls;
+        *detail = QStringLiteral("device not ready");
+        return Outcome::Unreadable;
+    }
+};
+
 // An installation whose audio decoder does not work.
 class BrokenEngine final : public SongKeyEngine {
 public:
@@ -178,6 +211,23 @@ QString shownKey(const LibraryController& controller, qint64 songId)
 {
     const std::optional<SongKeyInfo> key = controller.songKey(songId);
     return key ? songKeyName(key->shownKeyIndex()) : QString();
+}
+
+// A music folder of `count` songs whose MP3s differ (they are not real audio:
+// for engines that do not read them). Returns the folder.
+QString writeManySongs(const QString& root, int count)
+{
+    if (!QDir().mkpath(root))
+        return {};
+    for (int i = 0; i < count; ++i) {
+        const QString base = QStringLiteral("%1/KT300-%2 - Synth Band - Song %2")
+                                 .arg(root).arg(i, 3, 10, QLatin1Char('0'));
+        if (!testmedia::writeFile(base + QStringLiteral(".mp3"),
+                                  QByteArray("not really audio ").repeated(64) + QByteArray::number(i))
+            || !testmedia::writeCdg(base + QStringLiteral(".cdg"), testmedia::markerCdg(1000, 500)))
+            return {};
+    }
+    return root;
 }
 
 // A music folder with a G major song and a song with no clear key, as used by
@@ -271,6 +321,13 @@ private slots:
     void setSongKeyPopupChoosesAndClears();
     void keyCellClickIsLikeTheRestOfTheRow();
     void setSongKeyFitsTheLibraryFooter();
+    void editsWinOverASlowScanAndKeyAnalysis();
+    void analysisFollowsTheStartUpScanAndSaysWhatItIsDoing();
+    void analysisResumesAfterARestartAndWhenTurnedOnAgain();
+    void songsThatCannotBeReadAreRetriedCalmly();
+    void aMissingDecoderSaysSoInsteadOfResting();
+    void aKeyErrorGoesOnceItIsOutOfDate();
+    void playlistsShowTheSameKeyAsTheLibrary();
 
 private:
     QTemporaryDir m_dir;
@@ -1970,6 +2027,502 @@ void TestSongKeys::setSongKeyFitsTheLibraryFooter()
         QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
     }
     theme::setScalePercent(100);
+}
+
+void TestSongKeys::editsWinOverASlowScanAndKeyAnalysis()
+{
+    // The music drive on Frankie's laptop is slow, so a scan holds each batch
+    // of its catalogue writes for a long time. Saving a song's key, or any
+    // other correction, must neither fail with "database is locked" nor wait
+    // for the scan or for key analysis: the user's change goes first.
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    QVERIFY(QDir().mkpath(root));
+    const QString template_ = temporary.filePath(QStringLiteral("template.mp3"));
+    QVERIFY(testmedia::writeMp3(template_, 1000));
+    constexpr int kSongs = 160;
+    const auto mp3Name = [](int i) {
+        return QStringLiteral("KT200-%1 - Synth Band - Song %1.mp3").arg(i, 3, 10, QLatin1Char('0'));
+    };
+    for (int i = 0; i < kSongs; ++i) {
+        const QString mp3 = root + QLatin1Char('/') + mp3Name(i);
+        QVERIFY(QFile::copy(template_, mp3));
+        QVERIFY(testmedia::writeCdg(mp3.chopped(4) + QStringLiteral(".cdg"),
+                                    testmedia::markerCdg(1000, 500)));
+    }
+    const QMap<QString, QPair<qint64, qint64>> before = snapshot(root);
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    auto engine = std::make_shared<CountingEngine>();
+    LibraryController controller(appDir + QStringLiteral("/library.sqlite"), {}, overrides);
+    controller.setSongKeyEngineFactory([engine] { return engine; });
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+    QList<qint64> songs;
+    for (int i = 0; i < 4; ++i) {
+        songs.append(controller.findSongByMp3Path(root, mp3Name(i)));
+        QVERIFY(songs.last() > 0);
+    }
+
+    std::optional<int> expectedKey[4];
+    int edits = 0;
+    qint64 slowest = 0;
+    QString error;
+    // Sets, changes and clears keys on four songs, and corrects the first
+    // song's name and label now and then (its key must survive that).
+    const auto edit = [&] {
+        const int which = edits % 4;
+        const std::optional<int> key = edits % 5 == 4 ? std::nullopt
+                                                      : std::optional<int>((edits * 7) % 24);
+        QElapsedTimer timer;
+        timer.start();
+        if (!controller.setManualOriginalKey(songs.at(which), key, &error))
+            return false;
+        expectedKey[which] = key;
+        if (edits % 6 == 3) {
+            MetadataOverride value = controller.existingTrusted(songs.at(0));
+            value.artist = QStringLiteral("Corrected Band");
+            value.label = QStringLiteral("Test Label %1").arg(edits);
+            if (!controller.setTrustedMetadata(songs.at(0), value, &error))
+                return false;
+        }
+        slowest = std::max(slowest, timer.elapsed());
+        ++edits;
+        return true;
+    };
+
+    // A rescan of a slow drive: 320 files at 25 ms each, written in one batch.
+    QSignalSpy progress(&controller, &LibraryController::progressChanged);
+    controller.setScanReadDelayForTesting(25);
+    controller.requestRefreshScan();
+    QTRY_VERIFY_WITH_TIMEOUT(std::any_of(progress.cbegin(), progress.cend(), [](const QList<QVariant>& p) {
+        return p.at(0).toString() == QLatin1String("walk") && p.at(1).toLongLong() >= 20;
+    }), 10000);
+    while (controller.isScanning() && edits < 60) {
+        QVERIFY2(edit(), qPrintable(error));
+        QTest::qWait(100);
+    }
+    QVERIFY2(edits >= 10, qPrintable(QStringLiteral("only %1 edits overlapped the scan").arg(edits)));
+    QVERIFY2(slowest < 4000, qPrintable(QStringLiteral("an edit waited %1 ms for the scan").arg(slowest)));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 2, 60000);
+    QCOMPARE(finished.last().first().toMap().value(QStringLiteral("status")).toString(),
+             QStringLiteral("completed"));
+
+    // Key analysis working through the library meanwhile.
+    controller.setScanReadDelayForTesting(0);
+    const int scanEdits = edits;
+    slowest = 0;
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.isAnalysingSongKeys(), 10000);
+    while (!analysedAll(controller, kSongs) && edits < scanEdits + 60) {
+        QVERIFY2(edit(), qPrintable(error));
+        QTest::qWait(50);
+    }
+    QVERIFY2(slowest < 4000, qPrintable(QStringLiteral("an edit waited %1 ms for key analysis").arg(slowest)));
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, kSongs), 60000);
+
+    // Every value is where the user left it: in the library, and once in the store.
+    for (int i = 0; i < 4; ++i) {
+        const std::optional<SongKeyInfo> details = controller.songKeyDetails(songs.at(i));
+        QVERIFY(details);
+        QCOMPARE(details->manualKeyIndex, expectedKey[i] ? *expectedKey[i] : -1);
+    }
+    const QList<MetadataOverride> stored = storedOverrides(overrides);
+    QSet<QString> paths;
+    for (const MetadataOverride& row : stored) {
+        QVERIFY2(!paths.contains(row.mp3RelPath), qPrintable(row.mp3RelPath));
+        paths.insert(row.mp3RelPath);
+        if (row.mp3RelPath == mp3Name(0)) {
+            QCOMPARE(row.artist.value_or(QString()), QStringLiteral("Corrected Band"));
+            QVERIFY(row.label && row.label->startsWith(QStringLiteral("Test Label")));
+            QCOMPARE(row.originalKey, expectedKey[0]);
+        }
+    }
+    QVERIFY(paths.contains(mp3Name(0)));
+    const std::optional<SongRef> first = controller.songRef(songs.at(0));
+    QVERIFY(first);
+    QCOMPARE(first->artist, QStringLiteral("Corrected Band"));
+    QCOMPARE(snapshot(root), before);
+}
+
+void TestSongKeys::analysisFollowsTheStartUpScanAndSaysWhatItIsDoing()
+{
+    // As on Frankie's laptop: a library scanned before, analysis left on, so
+    // it is turned on before the start-up scan, which takes longer than the
+    // first wait. The first batch must follow the scan, then batch after
+    // batch, and Settings must say what is happening at each step.
+    using Activity = LibraryController::SongKeyActivity;
+    QTemporaryDir temporary;
+    constexpr int kSongs = 100;  // three batches
+    const QString root = writeManySongs(temporary.filePath(QStringLiteral("music")), kSongs);
+    QVERIFY(!root.isEmpty());
+    const QString catalogue = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    {
+        LibraryController first(catalogue);
+        QSignalSpy finished(&first, &LibraryController::scanFinished);
+        QVERIFY(first.chooseRoot(root));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+    }
+    auto quick = std::make_shared<QuickEngine>();
+    LibraryController controller(catalogue);
+    controller.setSongKeyEngineFactory([quick] { return quick; });
+    LibraryController::SongKeyTimings timings = quickTimings();
+    timings.startMs = 200;
+    controller.setSongKeyTimings(timings);
+    controller.setScanReadDelayForTesting(10);  // the start-up scan takes about two seconds
+    QSignalSpy keysChanged(&controller, &LibraryController::songKeysChanged);
+    controller.setSongKeyAnalysisEnabled(true);
+    QCOMPARE(controller.songKeyActivity(), Activity::Resting);
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    controller.startConfiguredScan();
+    QCOMPARE(controller.songKeyActivity(), Activity::WaitingForScan);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QTest::qWait(500);  // the first wait ends during the scan
+    QCOMPARE(quick->calls.load(), 0);
+    QCOMPARE(controller.songKeyActivity(), Activity::WaitingForScan);
+    QVERIFY2(controller.songKeyStatusText().contains(QStringLiteral("0 of 100 songs analysed")),
+             qPrintable(controller.songKeyStatusText()));
+    QVERIFY2(controller.songKeyStatusText().contains(QStringLiteral("Waiting for the library scan to finish")),
+             qPrintable(controller.songKeyStatusText()));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, kSongs), 30000);
+    QCOMPARE(quick->calls.load(), kSongs);
+    QVERIFY2(keysChanged.count() >= 3, qPrintable(QString::number(keysChanged.count())));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyActivity(), Activity::AllDone, 5000);
+    QVERIFY2(controller.songKeyStatusText().contains(QStringLiteral("100 of 100 songs analysed")),
+             qPrintable(controller.songKeyStatusText()));
+    QVERIFY(controller.songKeyStatusText().contains(QStringLiteral("All done")));
+    // A count asked for now agrees with what the batches counted.
+    controller.requestSongKeySummary();
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.songKeyStatusText().contains(QStringLiteral("Counting")), 5000);
+    QTest::qWait(300);
+    QCOMPARE(controller.songKeySummary()->analysed, kSongs);
+
+    // Everything analysed, then the library is scanned again: it says it is
+    // waiting for the scan (new songs may come), not "All done".
+    controller.requestRefreshScan();
+    QCOMPARE(controller.songKeyActivity(), Activity::WaitingForScan);
+    QVERIFY2(controller.songKeyStatusText().contains(QStringLiteral("Waiting for the library scan to finish")),
+             qPrintable(controller.songKeyStatusText()));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 2, 30000);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyActivity(), Activity::AllDone, 10000);
+}
+
+void TestSongKeys::analysisResumesAfterARestartAndWhenTurnedOnAgain()
+{
+    using Activity = LibraryController::SongKeyActivity;
+    QTemporaryDir temporary;
+    constexpr int kSongs = 100;
+    const QString root = writeManySongs(temporary.filePath(QStringLiteral("music")), kSongs);
+    QVERIFY(!root.isEmpty());
+    const QString catalogue = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    auto quick = std::make_shared<QuickEngine>();
+    LibraryController::SongKeyTimings timings = quickTimings();
+    timings.restMs = 300;
+    {
+        LibraryController first(catalogue);
+        first.setSongKeyEngineFactory([quick] { return quick; });
+        first.setSongKeyTimings(timings);
+        QSignalSpy finished(&first, &LibraryController::scanFinished);
+        QVERIFY(first.chooseRoot(root));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+        first.setSongKeyAnalysisEnabled(true);
+        QTRY_VERIFY_WITH_TIMEOUT(first.songKeySummary() && first.songKeySummary()->analysed >= 40, 30000);
+        // Closed part-way through.
+    }
+    const int before = quick->calls.load();
+    QVERIFY(before >= 40 && before < kSongs);
+
+    LibraryController controller(catalogue);
+    controller.setSongKeyEngineFactory([quick] { return quick; });
+    controller.setSongKeyTimings(timings);
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    controller.startConfiguredScan();
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+    // Where it left off: what was done is counted, nothing is done twice.
+    controller.requestSongKeySummary();
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QCOMPARE(controller.songKeySummary()->analysed, qint64(before));
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(quick->calls.load() > before, 10000);
+
+    // Turned off part-way: it says so and does nothing more.
+    controller.setSongKeyAnalysisEnabled(false);
+    QCOMPARE(controller.songKeyActivity(), Activity::Off);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.isAnalysingSongKeys(), 5000);
+    const int stopped = quick->calls.load();
+    QTest::qWait(800);
+    QCOMPARE(quick->calls.load(), stopped);
+    QVERIFY(!controller.songKeyStatusText().contains(QStringLiteral("Working")));
+
+    // On again: it carries on to the end.
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, kSongs), 30000);
+    QCOMPARE(quick->calls.load(), kSongs);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyActivity(), Activity::AllDone, 5000);
+}
+
+void TestSongKeys::songsThatCannotBeReadAreRetriedCalmly()
+{
+    // A drive whose songs cannot be read is not tried on song after song
+    // every few seconds, and Settings says why nothing is progressing.
+    using Activity = LibraryController::SongKeyActivity;
+    QTemporaryDir temporary;
+    constexpr int kSongs = 60;
+    const QString root = writeManySongs(temporary.filePath(QStringLiteral("music")), kSongs);
+    QVERIFY(!root.isEmpty());
+    auto unreadable = std::make_shared<UnreadableEngine>();
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    controller.setSongKeyEngineFactory([unreadable] { return unreadable; });
+    LibraryController::SongKeyTimings timings = quickTimings();
+    timings.retryMs = 60000;
+    controller.setSongKeyTimings(timings);
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyActivity(), Activity::Retrying, 10000);
+    const int calls = unreadable->calls.load();
+    QCOMPARE(calls, 40);  // one batch
+    QTest::qWait(1000);
+    QCOMPARE(unreadable->calls.load(), calls);
+    const QString status = controller.songKeyStatusText();
+    QVERIFY2(status.contains(QStringLiteral("0 of 60 songs analysed")), qPrintable(status));
+    QVERIFY2(status.contains(QStringLiteral("could not be read")), qPrintable(status));
+    QVERIFY2(status.contains(QStringLiteral("device not ready")), qPrintable(status));
+}
+
+void TestSongKeys::aMissingDecoderSaysSoInsteadOfResting()
+{
+    using Activity = LibraryController::SongKeyActivity;
+    QTemporaryDir temporary;
+    const QString root = writeManySongs(temporary.filePath(QStringLiteral("music")), 3);
+    QVERIFY(!root.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    controller.setSongKeyEngineFactory([] { return std::shared_ptr<SongKeyEngine>(); });
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 30000);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_COMPARE_WITH_TIMEOUT(controller.songKeyActivity(), Activity::Stopped, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary() && controller.songKeySummary()->total == 3, 5000);
+    const QString status = controller.songKeyStatusText();
+    QVERIFY2(status.contains(QStringLiteral("Stopped")) && status.contains(QStringLiteral("no audio decoder")),
+             qPrintable(status));
+    QVERIFY(!status.contains(QStringLiteral("Resting")));
+}
+
+void TestSongKeys::aKeyErrorGoesOnceItIsOutOfDate()
+{
+    // A key that could not be saved says so; the message goes as soon as it
+    // is out of date: the picker opened again, a later save that works, a
+    // key cleared, another song chosen.
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    const QString overrides = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {}, overrides);
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    const qint64 song = controller.findSongByMp3Path(root, known);
+
+    LibraryView view(&controller);
+    view.resize(1100, 600);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    view.searchBox()->setText(QStringLiteral("Synth Band"));
+    QTRY_COMPARE_WITH_TIMEOUT(view.songResultCount(), 2, 3000);
+    QTreeView* results = view.resultsList();
+    const auto select = [&](const QString& title) {
+        const int row = resultRow(&view, title);
+        QTest::mouseClick(results->viewport(), Qt::LeftButton, {},
+                          results->visualRect(results->model()->index(row, LibraryResultsModel::ArtistColumn)).center());
+    };
+    select(QStringLiteral("G Song"));
+    QCOMPARE(view.selectedSongId(), song);
+
+    // Another program holding the store makes the save fail (after SQLite's wait).
+    const QString name = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase blocker = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        blocker.setDatabaseName(overrides);
+        QVERIFY(blocker.open());
+        QSqlQuery hold(blocker);
+        const auto failToSave = [&](int keyIndex) {
+            QVERIFY(hold.exec(QStringLiteral("BEGIN IMMEDIATE")));
+            QPointer<SongKeyPicker> picker = view.openSongKeyPicker();
+            QVERIFY(picker);
+            QTest::mouseClick(picker->keyButton(keyIndex), Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(!picker, 10000);
+            QVERIFY2(view.messageLabel()->text().contains(QStringLiteral("could not be saved")),
+                     qPrintable(view.messageLabel()->text()));
+            QVERIFY(hold.exec(QStringLiteral("ROLLBACK")));
+        };
+
+        // Opened again: the old message goes; the save then works.
+        failToSave(0);
+        QVERIFY(!controller.songKeyDetails(song));  // nothing saved
+        QPointer<SongKeyPicker> picker = view.openSongKeyPicker();
+        QVERIFY(picker);
+        QVERIFY(view.messageLabel()->text().isEmpty());
+        QTest::mouseClick(picker->keyButton(2), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+        QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 2);
+        QVERIFY(view.messageLabel()->text().isEmpty());
+
+        // Another song chosen: the message was about the first one.
+        failToSave(4);
+        QCOMPARE(controller.songKeyDetails(song)->manualKeyIndex, 2);
+        select(QStringLiteral("Unknown Key"));
+        QVERIFY(view.selectedSongId() != song);
+        QVERIFY(view.messageLabel()->text().isEmpty());
+
+        // A key cleared after a failure: no message left behind.
+        select(QStringLiteral("G Song"));
+        failToSave(5);
+        picker = view.openSongKeyPicker();
+        QVERIFY(picker);
+        QVERIFY(picker->clearButton()->isEnabled());
+        QTest::mouseClick(picker->clearButton(), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+        QVERIFY(!controller.songKeyDetails(song) || !controller.songKeyDetails(song)->isManual());
+        QVERIFY(view.messageLabel()->text().isEmpty());
+
+        // Another message (not the key's) is left alone by a key saved later.
+        view.showMessage(QStringLiteral("Something else"));
+        picker = view.openSongKeyPicker();
+        QVERIFY(picker);
+        QTest::mouseClick(picker->keyButton(7), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+        QCOMPARE(view.messageLabel()->text(), QStringLiteral("Something else"));
+        blocker.close();
+    }
+    QSqlDatabase::removeDatabase(name);
+}
+
+void TestSongKeys::playlistsShowTheSameKeyAsTheLibrary()
+{
+    // Playlist rows show the key the library shows (the one set by hand,
+    // else a confident detected one, else nothing), and follow every change
+    // at once. The rows behave as before; the play mark stays separate.
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite")));
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    const qint64 gSong = controller.findSongByMp3Path(root, known);
+    const qint64 other = controller.findSongByMp3Path(root, unknown);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 playlistId = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Keys"), &playlistId));
+    for (const qint64 song : {gSong, other}) {
+        const std::optional<SongRef> ref = controller.songRef(song);
+        QVERIFY(ref);
+        QVERIFY(playlists.addItem(playlistId, *ref));
+    }
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.setShowErrorDialogs(false);
+    window.resize(1366, 768);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    PlaylistView* view = window.playlistView();
+    QListWidget* list = view->itemList();
+    QCOMPARE(list->count(), 2);
+    const auto rowOf = [&](qint64 songId) {
+        const QString title = controller.songRef(songId)->title;
+        for (int row = 0; row < list->count(); ++row) {
+            if (list->item(row)->text().contains(title))
+                return row;
+        }
+        return -1;
+    };
+    // Nothing to show yet: no Key column, as in the library.
+    QTRY_VERIFY_WITH_TIMEOUT(controller.songKeySummary().has_value(), 5000);
+    QVERIFY(!view->keyColumnShown());
+    // The first key set by hand brings the column at once; clearing the last takes it away.
+    QString error;
+    QVERIFY2(controller.setManualOriginalKey(other, 9, &error), qPrintable(error));
+    QVERIFY(view->keyColumnShown());
+    QCOMPARE(view->rowKeyText(rowOf(other)), QStringLiteral("A"));
+    QVERIFY(!window.libraryView()->resultsList()->isColumnHidden(LibraryResultsModel::KeyColumn));
+    QVERIFY2(controller.setManualOriginalKey(other, std::nullopt, &error), qPrintable(error));
+    QVERIFY(!view->keyColumnShown());
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.songKeySummary() || controller.songKeySummary()->manual == 0, 5000);
+    QVERIFY(!view->keyColumnShown());
+
+    controller.setSongKeyAnalysisEnabled(true);
+    QVERIFY(view->keyColumnShown());
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+    QTRY_COMPARE_WITH_TIMEOUT(view->rowKeyText(rowOf(gSong)), QStringLiteral("G"), 5000);
+    QCOMPARE(view->rowKeyText(rowOf(other)), QString());  // no clear key
+
+    // Set by hand in the library: the playlist shows it at once.
+    LibraryView* library = window.libraryView();
+    library->searchBox()->setText(QStringLiteral("Synth Band"));
+    QTRY_COMPARE_WITH_TIMEOUT(library->songResultCount(), 2, 3000);
+    QTreeView* results = library->resultsList();
+    const auto libraryKey = [&](const QString& title) {
+        return results->model()->index(resultRow(library, title), LibraryResultsModel::KeyColumn).data().toString();
+    };
+    const auto chooseKey = [&](const QString& title, std::optional<int> keyIndex) {
+        results->setCurrentIndex(results->model()->index(resultRow(library, title), 0));
+        QPointer<SongKeyPicker> picker = library->openSongKeyPicker();
+        QVERIFY(picker);
+        QTest::mouseClick(keyIndex ? picker->keyButton(*keyIndex) : picker->clearButton(), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!picker, 2000);
+    };
+    const int selectedRow = list->currentRow();
+    chooseKey(QStringLiteral("G Song"), 2);
+    QCOMPARE(libraryKey(QStringLiteral("G Song")), QStringLiteral("D"));
+    QCOMPARE(view->rowKeyText(rowOf(gSong)), QStringLiteral("D"));
+    QCOMPARE(list->currentRow(), selectedRow);  // the playlist kept its place
+    chooseKey(QStringLiteral("Unknown Key"), 21);
+    QCOMPARE(view->rowKeyText(rowOf(other)), QStringLiteral("Am"));
+    QCOMPARE(libraryKey(QStringLiteral("Unknown Key")), QStringLiteral("Am"));
+
+    // Cleared: back to the detected key, or to nothing.
+    chooseKey(QStringLiteral("G Song"), std::nullopt);
+    QCOMPARE(view->rowKeyText(rowOf(gSong)), QStringLiteral("G"));
+    QCOMPARE(libraryKey(QStringLiteral("G Song")), QStringLiteral("G"));
+    chooseKey(QStringLiteral("Unknown Key"), std::nullopt);
+    QCOMPARE(view->rowKeyText(rowOf(other)), QString());
+    QCOMPARE(libraryKey(QStringLiteral("Unknown Key")), QString());
+
+    // Moved down: the key goes with its song.
+    list->setCurrentRow(rowOf(gSong));
+    const int before = rowOf(gSong);
+    QTest::mouseClick(view->moveDownButton(), Qt::LeftButton);
+    QCOMPARE(rowOf(gSong), before + 1);
+    QCOMPARE(view->rowKeyText(rowOf(gSong)), QStringLiteral("G"));
+    QCOMPARE(view->rowKeyText(rowOf(other)), QString());
+
+    // Playing: the play mark is its own, the key stays in its column.
+    list->setCurrentRow(rowOf(gSong));
+    QTest::mouseClick(view->playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    QVERIFY(list->item(rowOf(gSong))->text().startsWith(QStringLiteral("▶ ")));
+    QCOMPARE(view->rowKeyText(rowOf(gSong)), QStringLiteral("G"));
+    player.stop();
+
+    // Analysis turned off with keys known: the column stays, as in the library.
+    controller.setSongKeyAnalysisEnabled(false);
+    QVERIFY(view->keyColumnShown());
 }
 
 QTEST_MAIN(TestSongKeys)

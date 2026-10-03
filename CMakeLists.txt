@@ -71,6 +71,8 @@ add_library(fks_library STATIC
     src/library/SongKeys.h
     src/library/TitleScreenText.cpp
     src/library/TitleScreenText.h
+    src/library/WritePriority.cpp
+    src/library/WritePriority.h
     src/library/ZipDirectory.cpp
     src/library/ZipDirectory.h
 )

@@ -82,6 +82,9 @@ private:
     void applyColumnWidths();
     void updateSelectionActions();
     void updateHint();
+    // A failed Set Song Key says so until the next try, or another song.
+    void showKeyError(qint64 songId, const QString& message);
+    void clearKeyError();
 
     LibraryController* m_controller;
     QLabel* m_statusLabel;
@@ -100,6 +103,8 @@ private:
     QTreeView* m_results;
     LibraryResultsModel* m_resultsModel;
     QLabel* m_messageLabel;
+    QString m_keyError;  // the message shown for a key that could not be saved
+    qint64 m_keyErrorSongId = 0;
     QPushButton* m_singButton;
     QPushButton* m_addToPlaylistButton;
     QPushButton* m_setKeyButton;

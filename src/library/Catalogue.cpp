@@ -23,6 +23,7 @@
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 
+#include <algorithm>
 #include <string>
 #endif
 
@@ -2386,33 +2387,75 @@ std::optional<ReviewSummary> Catalogue::readReviewSummary(const QString& databas
     return result;
 }
 
+namespace {
+
+// The copy of a song that would play (as activePlaybackPathsFor chooses it),
+// and only its own key: never another recording's. %1 picks the songs; the
+// first row of each song is its copy.
+const char* const kSongKeySql =
+    "SELECT so.id,k.status,k.key_index,k.confidence,so.manual_original_key FROM songs so "
+    "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+    "JOIN library_roots r ON r.id=s.root_id "
+    "JOIN files mf ON mf.id=s.mp3_file_id JOIN files gf ON gf.id=s.graphics_file_id "
+    "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
+    "WHERE %1 AND mf.present=1 AND gf.present=1 AND r.active=1 "
+    "AND (s.playable=1 OR s.unplayable_reason='root_offline') "
+    "ORDER BY so.id,CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,s.id";
+
+// The key of the row the query is on, if anything is known.
+std::optional<SongKeyInfo> songKeyOf(const QSqlQuery& query)
+{
+    if (query.value(1).isNull() && query.value(4).isNull())
+        return std::nullopt;
+    SongKeyInfo info;
+    info.status = query.value(1).toString();
+    info.keyIndex = query.value(2).isNull() ? -1 : query.value(2).toInt();
+    info.confidence = query.value(3).toDouble();
+    info.manualKeyIndex = query.value(4).isNull() ? -1 : query.value(4).toInt();
+    return info;
+}
+
+} // namespace
+
+QHash<qint64, SongKeyInfo> Catalogue::songKeys(const QList<qint64>& songIds, QString* error) const
+{
+    QHash<qint64, SongKeyInfo> keys;
+    for (qsizetype first = 0; first < songIds.size(); first += 500) {
+        QStringList ids;
+        for (qsizetype i = first; i < std::min(songIds.size(), first + 500); ++i)
+            ids.append(QString::number(songIds.at(i)));
+        QSqlQuery query(m_database);
+        if (!query.exec(QString::fromLatin1(kSongKeySql)
+                            .arg(QStringLiteral("so.id IN (%1)").arg(ids.join(QLatin1Char(',')))))) {
+            setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
+            return {};
+        }
+        qint64 previous = 0;
+        while (query.next()) {
+            const qint64 songId = query.value(0).toLongLong();
+            if (songId == previous)
+                continue;  // not the copy that would play
+            previous = songId;
+            if (const std::optional<SongKeyInfo> key = songKeyOf(query))
+                keys.insert(songId, *key);
+        }
+    }
+    return keys;
+}
+
 std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) const
 {
     QSqlQuery query(m_database);
-    query.prepare(QStringLiteral(
-        // The copy that would play (as activePlaybackPathsFor chooses it), and
-        // only its own key: never another recording's.
-        "SELECT k.status,k.key_index,k.confidence,so.manual_original_key FROM songs so "
-        "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
-        "JOIN library_roots r ON r.id=s.root_id "
-        "JOIN files mf ON mf.id=s.mp3_file_id JOIN files gf ON gf.id=s.graphics_file_id "
-        "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
-        "WHERE so.id=? AND mf.present=1 AND gf.present=1 AND r.active=1 "
-        "AND (s.playable=1 OR s.unplayable_reason='root_offline') "
-        "ORDER BY CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,s.id LIMIT 1"));
+    query.prepare(QString::fromLatin1(kSongKeySql).arg(QStringLiteral("so.id=?"))
+                  + QStringLiteral(" LIMIT 1"));
     query.addBindValue(songId);
     if (!query.exec()) {
         setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
         return std::nullopt;
     }
-    if (!query.next() || (query.value(0).isNull() && query.value(3).isNull()))
+    if (!query.next())
         return std::nullopt;
-    SongKeyInfo info;
-    info.status = query.value(0).toString();
-    info.keyIndex = query.value(1).isNull() ? -1 : query.value(1).toInt();
-    info.confidence = query.value(2).toDouble();
-    info.manualKeyIndex = query.value(3).isNull() ? -1 : query.value(3).toInt();
-    return info;
+    return songKeyOf(query);
 }
 
 namespace {
@@ -2482,13 +2525,22 @@ std::optional<SongKeySummary> Catalogue::readSongKeySummary(const QString& datab
             QSqlQuery attach(database);
             attach.prepare(QStringLiteral("ATTACH DATABASE ? AS enrich"));
             attach.addBindValue(cachePath);
-            if (QFileInfo::exists(cachePath) && attach.exec()) {
+            bool countOnly = !QFileInfo::exists(cachePath);
+            if (!countOnly && !attach.exec()) {
+                // Never counted as "nothing analysed": the caller keeps the
+                // progress it last knew.
+                if (error) {
+                    *error = QStringLiteral("could not read the key cache %1: %2")
+                                 .arg(cachePath, attach.lastError().text());
+                }
+            } else if (!countOnly) {
                 result = songKeySummaryOn(database, error);
                 if (!result && error && error->contains(QLatin1String("no such table"))) {
                     error->clear();
-                    result = SongKeySummary{};
+                    countOnly = true;  // a cache with no keys in it yet
                 }
-            } else {
+            }
+            if (countOnly) {
                 QSqlQuery count(database);
                 count.prepare(QStringLiteral(
                     "SELECT count(DISTINCT m.id) FROM sources s "

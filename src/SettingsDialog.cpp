@@ -1375,13 +1375,18 @@ QWidget* SettingsDialog::buildMetadata()
     });
 
     if (controller) {
+        // Key analysis waiting for a scan says how far the scan has got.
         connect(controller, &LibraryController::progressChanged, this, [this] {
-            if (currentPage() == QLatin1String("Metadata"))
+            if (currentPage() == QLatin1String("Metadata")) {
                 refreshMetadataStatus();
+                refreshSongKeyStatus();
+            }
         });
         connect(controller, &LibraryController::stateChanged, this, [this] {
-            if (currentPage() == QLatin1String("Metadata"))
+            if (currentPage() == QLatin1String("Metadata")) {
                 refreshMetadataStatus();
+                refreshSongKeyStatus();
+            }
         });
         // Counted on a worker thread; the page never waits for it.
         connect(controller, &LibraryController::reviewSummaryReady, this,

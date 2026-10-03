@@ -52,6 +52,9 @@ public:
     void setPaused(bool paused) { m_paused.store(paused); }
     bool isPaused() const { return m_paused.load(); }
     quint64 sourceFileReads() const { return m_sourceFileReads; }
+    // Tests only: every file the scan looks at or reads on the music drive
+    // takes this much longer, like a slow USB drive. Safe from any thread.
+    void setReadDelayForTesting(int milliseconds) { m_readDelayMs.store(milliseconds); }
     // Asks a running key-analysis batch to end after (or during) the current
     // song, so other work queued on this thread can start. Safe from any
     // thread. The controller clears it before queueing the next batch.
@@ -117,6 +120,7 @@ private:
     std::atomic_bool m_paused = false;
     std::atomic_bool m_titleScreensRequested = false;
     std::atomic_bool m_keyYield = false;
+    std::atomic_int m_readDelayMs = 0;
     // MP3 files that could not be read this session (not recorded, so a
     // later session tries again); key batches pass over them.
     QSet<qint64> m_keySkip;

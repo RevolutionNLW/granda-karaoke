@@ -1903,7 +1903,7 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
             return Status::Failed;
         }
         ++resolved;
-        if ((resolved % 500) == 0) {
+        if ((resolved % 500) == 0 || (options.yieldRequested && options.yieldRequested())) {
             if (!database.commit()) {
                 if (error)
                     *error = QStringLiteral("Could not commit metadata-resolution batch: %1")

@@ -2,6 +2,7 @@
 
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
+#include "library/SongKeys.h"
 #include "playlist/PlaylistPlayback.h"
 #include "playlist/PlaylistStore.h"
 #include "ui/Controls.h"
@@ -41,19 +42,22 @@ constexpr int TitleRole = Qt::UserRole + 3;
 constexpr int ArtistRole = Qt::UserRole + 4;
 constexpr int DiscRole = Qt::UserRole + 5;
 constexpr int PlayingRole = Qt::UserRole + 6;
+constexpr int SongIdRole = Qt::UserRole + 7;
+constexpr int KeyRole = Qt::UserRole + 8;  // the song's original key, as the library shows it
 constexpr auto PlaylistItemMimeType = "application/x-fks-playlist-item-id";
 
 // Where the playlist's columns sit in a row (shared by the rows and the
 // column captions above them): number, song, artist and, when there is room,
-// the disc.
+// the key and the disc.
 struct PlaylistColumns {
     QRect number;
     QRect song;
     QRect artist;
+    QRect key;
     QRect disc;
 };
 
-PlaylistColumns playlistColumns(const QRect& row)
+PlaylistColumns playlistColumns(const QRect& row, bool withKey)
 {
     PlaylistColumns columns;
     const int gap = theme::px(12);
@@ -62,10 +66,16 @@ PlaylistColumns playlistColumns(const QRect& row)
     const int left = columns.number.right() + theme::px(10);
     const int available = inner.right() - left;
     const int disc = available >= theme::px(440) ? theme::px(104) : 0;
-    const int songWidth = (available - disc) * 54 / 100;
+    // The key is short ("C", "F#m", "Bbm"), so its column is narrow; it is
+    // left out rather than squeeze the song and artist in a narrow pane.
+    const int key = withKey && available - disc >= theme::px(260) ? theme::px(38) : 0;
+    const int names = available - disc - (key ? key + gap : 0);
+    const int songWidth = names * 54 / 100;
     columns.song = QRect(left, row.top(), songWidth - gap, row.height());
     columns.artist = QRect(left + songWidth, row.top(),
-                           available - disc - songWidth - (disc ? gap : 0), row.height());
+                           names - songWidth - (disc ? gap : 0), row.height());
+    if (key)
+        columns.key = QRect(inner.right() - disc - (disc ? gap : 0) - key, row.top(), key, row.height());
     if (disc)
         columns.disc = QRect(inner.right() - disc, row.top(), disc, row.height());
     return columns;
@@ -76,9 +86,10 @@ PlaylistColumns playlistColumns(const QRect& row)
 // which is gold only in the pane being used.
 class PlaylistRowDelegate final : public QStyledItemDelegate {
 public:
-    PlaylistRowDelegate(QObject* parent, std::function<bool()> active)
+    PlaylistRowDelegate(QObject* parent, std::function<bool()> active, std::function<bool()> keys)
         : QStyledItemDelegate(parent)
         , m_active(std::move(active))
+        , m_keys(std::move(keys))
     {
         m_mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     }
@@ -101,7 +112,7 @@ public:
         if (strong)
             painter->fillRect(QRect(option.rect.left(), option.rect.top(), theme::px(3),
                                     option.rect.height()), theme::color::accent);
-        const PlaylistColumns columns = playlistColumns(option.rect);
+        const PlaylistColumns columns = playlistColumns(option.rect, m_keys());
         const QColor main = strong ? theme::color::selectionText : theme::color::text;
         const QColor secondary = strong ? theme::color::selectionText
                                         : theme::color::secondaryText;
@@ -130,6 +141,7 @@ public:
         songFont.setBold(playing);
         draw(columns.song, index.data(TitleRole).toString(), songFont, main);
         draw(columns.artist, index.data(ArtistRole).toString(), option.font, main);
+        draw(columns.key, index.data(KeyRole).toString(), option.font, secondary);
         QFont mono = m_mono;
         mono.setPixelSize(theme::px(13));
         draw(columns.disc, index.data(DiscRole).toString(), mono, secondary);
@@ -138,6 +150,7 @@ public:
 
 private:
     std::function<bool()> m_active;
+    std::function<bool()> m_keys;
     QFont m_mono;
 };
 
@@ -166,9 +179,10 @@ protected:
 // Column captions above the playlist rows, lined up with them.
 class PlaylistHeader final : public QWidget {
 public:
-    PlaylistHeader(QListWidget* list, QWidget* parent)
+    PlaylistHeader(QListWidget* list, std::function<bool()> keys, QWidget* parent)
         : QWidget(parent)
         , m_list(list)
+        , m_keys(std::move(keys))
     {
         setObjectName(QStringLiteral("listHeader"));
         theme::setFixedHeight(this, 34);
@@ -187,7 +201,7 @@ protected:
         painter.setFont(font);
         painter.setPen(theme::color::textMuted);
         const PlaylistColumns columns = playlistColumns(
-            QRect(0, 0, m_list->viewport()->width(), height() - 1));
+            QRect(0, 0, m_list->viewport()->width(), height() - 1), m_keys());
         const auto caption = [&painter](const QRect& rect, const QString& text) {
             if (rect.width() > 0)
                 painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter, text);
@@ -195,11 +209,13 @@ protected:
         caption(columns.number, QStringLiteral("#"));
         caption(columns.song, QStringLiteral("SONG"));
         caption(columns.artist, QStringLiteral("ARTIST"));
+        caption(columns.key, QStringLiteral("KEY"));
         caption(columns.disc, QStringLiteral("DISC ID"));
     }
 
 private:
     QListWidget* m_list;
+    std::function<bool()> m_keys;
 };
 
 class PlaylistListWidget final : public QListWidget {
@@ -425,7 +441,8 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     m_items->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_items->setTextElideMode(Qt::ElideRight);
     m_items->setUniformItemSizes(true);
-    m_items->setItemDelegate(new PlaylistRowDelegate(m_items, [this] { return m_active; }));
+    m_items->setItemDelegate(new PlaylistRowDelegate(m_items, [this] { return m_active; },
+                                                     [this] { return m_showKeys; }));
     m_items->setFocusPolicy(Qt::StrongFocus);
     m_items->setDragEnabled(true);
     m_items->setAcceptDrops(true);
@@ -435,7 +452,7 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
     m_items->setDropIndicatorShown(true);
     m_items->installEventFilter(this);
     m_items->viewport()->installEventFilter(this);
-    auto* columnHeader = new PlaylistHeader(m_items, pane);
+    auto* columnHeader = new PlaylistHeader(m_items, [this] { return m_showKeys; }, pane);
     m_columnHeader = columnHeader;
     connect(theme::notifier(), &theme::Notifier::changed, this, [this] {
         m_items->doItemsLayout();
@@ -537,8 +554,49 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
         // followed by catalogueChanged.
         connect(m_libraryController, &LibraryController::catalogueChanged,
                 this, [this] { refreshItems(); });
+        // A key set or cleared by hand, or found by analysis: shown at once,
+        // the rows themselves (selection, scroll) left as they are.
+        connect(m_libraryController, &LibraryController::songKeysChanged,
+                this, &PlaylistView::refreshKeys);
     }
     refresh();
+}
+
+QString PlaylistView::rowKeyText(int row) const
+{
+    const QListWidgetItem* item = m_items->item(row);
+    return item ? item->data(KeyRole).toString() : QString();
+}
+
+void PlaylistView::setKeyColumnShown(bool shown)
+{
+    if (shown == m_showKeys)
+        return;
+    m_showKeys = shown;
+    refreshKeys();
+    m_items->viewport()->update();
+    m_columnHeader->update();
+}
+
+void PlaylistView::refreshKeys()
+{
+    // Looked up only while the column is shown, all rows in one go.
+    if (!m_showKeys || !m_libraryController || m_items->count() == 0)
+        return;
+    QList<qint64> songIds;
+    for (int row = 0; row < m_items->count(); ++row) {
+        if (const qint64 songId = m_items->item(row)->data(SongIdRole).toLongLong(); songId > 0)
+            songIds.append(songId);
+    }
+    // The library's own rule: the key set by hand, else a confident detected one.
+    const QHash<qint64, SongKeyInfo> keys = m_libraryController->songKeys(songIds);
+    for (int row = 0; row < m_items->count(); ++row) {
+        QListWidgetItem* item = m_items->item(row);
+        const auto key = keys.constFind(item->data(SongIdRole).toLongLong());
+        const QString text = key != keys.constEnd() ? songKeyName(key->shownKeyIndex()) : QString();
+        if (item->data(KeyRole).toString() != text)
+            item->setData(KeyRole, text);
+    }
 }
 
 void PlaylistView::showAdjacentPlaylist(int step)
@@ -678,9 +736,11 @@ void PlaylistView::refreshItems(qint64 selectItemId, bool ensureVisible)
     QListWidgetItem* selected = nullptr;
     for (const PlaylistEntry& entry : m_store->items(playlistId)) {
         PlaylistEntry displayEntry = entry;
+        qint64 songId = 0;
         if (m_libraryController) {
             const PlaylistSongResolution resolution =
                 m_libraryController->resolvePlaylistSong(entry);
+            songId = resolution.songId;
             if (resolution.updateStoredSongId)
                 m_store->updateSongId(entry.itemId, resolution.songId);
             const auto current = resolution
@@ -703,9 +763,11 @@ void PlaylistView::refreshItems(qint64 selectItemId, bool ensureVisible)
         if (!disc.isEmpty() && displayEntry.track > 0)
             disc += QStringLiteral("-%1").arg(displayEntry.track, 2, 10, QLatin1Char('0'));
         row->setData(DiscRole, disc);
+        row->setData(SongIdRole, songId);
         if (entry.itemId == selectItemId)
             selected = row;
     }
+    refreshKeys();
     m_countLabel->setText(QStringLiteral("(%1)").arg(m_items->count()));
     static_cast<PlaylistListWidget*>(m_items)->setHint(m_items->count() > 0
         ? QStringLiteral("Drag songs here from the library, or double-click a song to play it.")

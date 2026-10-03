@@ -326,7 +326,11 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         m_searchBox->setFocus(Qt::OtherFocusReason);
     });
     connect(m_results->selectionModel(), &QItemSelectionModel::currentChanged,
-            this, [this] { updateSelectionActions(); });
+            this, [this] {
+                updateSelectionActions();
+                if (selectedSongId() != m_keyErrorSongId)
+                    clearKeyError();  // it was about another song
+            });
     connect(m_results, &QAbstractItemView::doubleClicked, this,
             [this](const QModelIndex&) { singSelected(); });
     connect(m_chooseFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
@@ -442,6 +446,22 @@ void LibraryView::showMessage(const QString& message)
 {
     m_messageLabel->setText(message);
     m_searchBox->setFocus(Qt::OtherFocusReason);
+}
+
+void LibraryView::showKeyError(qint64 songId, const QString& message)
+{
+    m_keyError = message;
+    m_keyErrorSongId = songId;
+    showMessage(message);
+}
+
+void LibraryView::clearKeyError()
+{
+    // Only the key's own message: another one shown since stays.
+    if (!m_keyError.isEmpty() && m_messageLabel->text() == m_keyError)
+        m_messageLabel->clear();
+    m_keyError.clear();
+    m_keyErrorSongId = 0;
 }
 
 int LibraryView::songResultCount() const
@@ -632,12 +652,15 @@ SongKeyPicker* LibraryView::openSongKeyPicker()
     const QString title = row.data(Qt::DisplayRole).toString().trimmed();
     const QString song = artist.isEmpty() ? title : artist + QStringLiteral(" \u2013 ") + title;
     const std::optional<SongKeyInfo> key = m_controller->songKeyDetails(songId);
+    clearKeyError();  // trying again
     auto* picker = new SongKeyPicker(song, key ? key->manualKeyIndex : -1,
                                      key ? key->detectedKeyIndex() : -1, this);
     const auto save = [this, songId](std::optional<int> keyIndex) {
         QString error;
-        if (!m_controller->setManualOriginalKey(songId, keyIndex, &error))
-            showMessage(QStringLiteral("The song key could not be saved. %1").arg(error));
+        if (m_controller->setManualOriginalKey(songId, keyIndex, &error))
+            clearKeyError();
+        else
+            showKeyError(songId, QStringLiteral("The song key could not be saved. %1").arg(error));
     };
     connect(picker, &SongKeyPicker::keyChosen, this, [save](int keyIndex) { save(keyIndex); });
     connect(picker, &SongKeyPicker::clearRequested, this, [save] { save(std::nullopt); });

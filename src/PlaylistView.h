@@ -69,6 +69,12 @@ public:
     // selection, shown quietly.
     void setActive(bool active);
     bool isActive() const { return m_active; }
+    // The Key column, shown like the library's (when the setting is on and
+    // there are keys to show). Display only: rows behave as before.
+    void setKeyColumnShown(bool shown);
+    bool keyColumnShown() const { return m_showKeys; }
+    // The key shown in a row ("" for none), for tests.
+    QString rowKeyText(int row) const;
 
 public slots:
     void refresh();
@@ -89,6 +95,7 @@ private:
     void refreshItems(qint64 selectItemId = 0, bool ensureVisible = false);
     void updateButtons();
     void updatePlaybackMarkers();
+    void refreshKeys();
     void createPlaylist();
     void renamePlaylist();
     void deletePlaylist();
@@ -111,6 +118,7 @@ private:
     QWidget* m_columnHeader;
     bool m_active = false;
     bool m_confirmRemove = true;
+    bool m_showKeys = false;
     QLabel* m_message;
     QListWidget* m_items;
     QPushButton* m_newButton;

@@ -23,6 +23,10 @@ public:
         // it says stop, resolve() returns Cancelled promptly, having written
         // no partial batch and leaving the reprocess pending.
         std::function<bool()> cancelled;
+        // Consulted for every row written; must return at once. When true
+        // the batch is committed early and shouldStop() is consulted, so a
+        // change the user is waiting to write goes first.
+        std::function<bool()> yieldRequested;
         // Told each stage's name as it begins ("candidates", "sidecars",
         // "names", "evidence", "base", "duplicates", "title_screens", "write").
         std::function<void(const QString& stage)> stageStarted;

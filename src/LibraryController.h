@@ -5,6 +5,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QThread>
 
 #include <functional>
@@ -168,11 +169,34 @@ public:
     // A song is being opened: key analysis gets off the drive now and waits
     // a while (Play usually follows; playback then keeps it stopped).
     void holdSongKeysForSong();
+    // What key analysis is doing now. Every state but Off, AllDone and
+    // Stopped has something pending that brings the next batch (a timer, the
+    // end of a scan or of a song); Stalled never lasts (a check restarts it).
+    enum class SongKeyActivity {
+        Off,              // turned off
+        Working,          // a batch is analysing songs now
+        WaitingForScan,   // a library scan (or reprocess) comes first
+        PausedForSong,    // a song is playing or paused
+        WaitingAfterSong, // a while after a song (Autoplay may start another)
+        Resting,          // between batches
+        Retrying,         // the last songs tried could not be read; tries again soon
+        WaitingForDrive,  // the music folder is not there
+        DoneForNow,       // the rest could not be read this session
+        AllDone,          // every song analysed
+        Stopped,          // cannot work here (see songKeyProblem()); tries after the next scan
+        Stalled,          // nothing pending (never expected)
+    };
+    SongKeyActivity songKeyActivity() const;
+    static QString songKeyActivityName(SongKeyActivity activity);
+    // Why analysis stopped or the last songs failed (empty if neither).
+    QString songKeyProblem() const { return m_keyProblem; }
     // One line for Settings: how far analysis has got, and what it is doing.
     QString songKeyStatusText() const;
     // The song's key if it is known well enough to show (the user's original
     // key first, else a confident detected one).
     std::optional<SongKeyInfo> songKey(qint64 songId) const;
+    // songKey() for many songs at once (for a playlist); unknown ones are left out.
+    QHash<qint64, SongKeyInfo> songKeys(const QList<qint64>& songIds) const;
     // Everything known about the song's key, shown or not (for Set Song Key).
     std::optional<SongKeyInfo> songKeyDetails(qint64 songId) const;
     // The original key of the backing track, chosen by the user (0-23, see
@@ -188,8 +212,11 @@ public:
         int restMs = 2000;           // between batches
         int afterPlaybackMs = 45000; // after a song stops (Autoplay may start the next)
         int retryMs = 60000;         // after a batch was interrupted for another reason
+        int checkMs = 30000;         // how often a stalled chain is looked for
     };
     void setSongKeyTimings(const SongKeyTimings& timings) { m_keyTimings = timings; }
+    // Tests only: the scan reads the music drive this much more slowly per file.
+    void setScanReadDelayForTesting(int milliseconds);
 
 signals:
     // Keys of some songs became known: shown keys should be looked up again.
@@ -227,15 +254,27 @@ private:
     // another folder's path, which could otherwise follow the song again.
     bool storeOverrideLocked(qint64 songId, const MetadataOverride& identity,
                              const MetadataOverride* value, QString* error);
+    // The user's change is saved in the store but the library's copy could
+    // not be written yet (the catalogue stayed busy): written very soon.
+    void mirrorLater(qint64 songId);
+    void retryMirrors();
+    QSet<qint64> m_mirrorRetry;
+    QTimer* m_mirrorTimer = nullptr;
     void invalidateBrowseCache();
     void startReviewSummary();
     void finishReviewSummary(const std::optional<ReviewSummary>& summary, quint64 generation);
     void startScan(const QString& rootPath);
     void startPendingWork();
-    void scheduleKeyBatch(int delayMs);
+    // Why the key timer runs (the longest wait asked for wins).
+    enum class KeyWait { Start, Rest, AfterSong, Retry };
+    void scheduleKeyBatch(int delayMs, KeyWait why);
     void startKeyBatch();
     bool keyBatchAllowed() const;
     void onKeyBatchFinished(const QVariantMap& summary);
+    // Logs a change of songKeyActivity() and tells Settings.
+    void keyActivityChanged();
+    void checkKeyChain();
+    QString scanPhaseText() const;
 
     Catalogue m_catalogue;
     mutable QList<CatalogueSearchRow> m_browseRows;
@@ -279,6 +318,8 @@ private:
     bool m_keyBatchInFlight = false;
     bool m_keySummaryRunning = false;
     bool m_keySummaryAgain = false;
+    // Counted by a batch: a count started before it is out of date.
+    quint64 m_keySummaryGeneration = 0;
     bool m_playbackActive = false;
     QTimer* m_keyTimer = nullptr;
     std::shared_ptr<SongKeyEngine> m_keyEngine;
@@ -287,6 +328,13 @@ private:
     std::optional<SongKeySummary> m_keySummary;
     bool m_keyChainDone = false;  // the last batch found nothing left to try
     bool m_keyUnavailable = false;  // the last batch could not work at all
+    bool m_keyOffline = false;      // the last batch found no music folder
+    bool m_keyFailing = false;      // the last batch read no song at all
+    KeyWait m_keyWait = KeyWait::Start;
+    QString m_keyProblem;
+    QTimer* m_keyCheck = nullptr;
+    SongKeyActivity m_loggedKeyActivity = SongKeyActivity::Off;
+    qint64 m_keyBatchStartedMs = 0;
     qint64 m_keyMsTimed = 0;
     qint64 m_keySongsTimed = 0;
 };

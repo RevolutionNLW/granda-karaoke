@@ -8,22 +8,71 @@
 #include "library/LibraryScanner.h"
 #include "ocr/PlatformTitleScreenOcr.h"
 #include "library/MetadataResolver.h"
+#include "library/WritePriority.h"
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QMutexLocker>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QLoggingCategory>
 #include <QPointer>
 #include <QTimer>
 
+#include <algorithm>
 #include <utility>
 
 namespace {
 Q_LOGGING_CATEGORY(lcLibraryController, "fks.library.controller")
 
 const QString kSortKey = QStringLiteral("library_sort");
+
+// How long a user's change may wait for the catalogue (SQLite's usual wait).
+constexpr int kUserWriteMs = 5000;
+
+bool isBusyError(const QString& error)
+{
+    return error.contains(QLatin1String("locked"), Qt::CaseInsensitive)
+        || error.contains(QLatin1String("busy"), Qt::CaseInsensitive);
+}
+
+enum class UserChange { Written, Busy, Failed };
+
+// Writes a user's change to the catalogue (with writepriority::UserWrite
+// held, so background work steps aside at its next row). SQLite waits for
+// the write lock; a write it refuses at once as busy is tried again, all
+// within the one usual wait. Busy: the catalogue was still not free.
+template <typename Write>
+UserChange writeUserChange(Catalogue& catalogue, Write write, QString* error)
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (int attempt = 1;; ++attempt) {
+        QString attemptError;
+        catalogue.setBusyTimeout(int(std::max<qint64>(0, kUserWriteMs - elapsed.elapsed())));
+        const bool written = write(&attemptError);
+        catalogue.setBusyTimeout(kUserWriteMs);
+        if (written) {
+            if (attempt > 1 || elapsed.elapsed() >= 1000) {
+                qCInfo(lcLibraryController).noquote()
+                    << "A change waited" << elapsed.elapsed() << "ms for the library (attempt"
+                    << attempt << ")";
+            }
+            return UserChange::Written;
+        }
+        const bool busy = isBusyError(attemptError);
+        if (!busy || elapsed.elapsed() >= kUserWriteMs) {
+            qCWarning(lcLibraryController).noquote()
+                << "A change could not be written to the library after" << elapsed.elapsed()
+                << "ms (attempt" << attempt << "):" << attemptError;
+            if (error)
+                *error = attemptError;
+            return busy ? UserChange::Busy : UserChange::Failed;
+        }
+        QThread::msleep(20);
+    }
+}
 
 // Stored names of the library sorts; unknown values fall back to Artist A-Z.
 const std::pair<LibrarySort, const char*> kSortNames[] = {
@@ -143,6 +192,10 @@ LibraryController::LibraryController(const QString& databasePath,
     m_keyTimer = new QTimer(this);
     m_keyTimer->setSingleShot(true);
     connect(m_keyTimer, &QTimer::timeout, this, &LibraryController::startKeyBatch);
+    // A safety net, and a report: analysis that is on must always have
+    // something pending (see SongKeyActivity).
+    m_keyCheck = new QTimer(this);
+    connect(m_keyCheck, &QTimer::timeout, this, &LibraryController::checkKeyChain);
 
     // A catalogue written by older resolver rules, or an interrupted reprocess,
     // is brought up to date in the background. It only reads the database, so
@@ -226,6 +279,8 @@ bool LibraryController::stopScanner(int timeoutMs)
 {
     if (m_keyTimer)
         m_keyTimer->stop();
+    if (m_keyCheck)
+        m_keyCheck->stop();
     if (m_scanner) {
         // Asked while its thread still runs its event loop, so the scanner
         // cannot have been deleted yet. It is deleted on its own thread as
@@ -242,6 +297,12 @@ void LibraryController::runOnScannerThreadForTesting(std::function<void()> work)
 {
     if (m_scanner)
         QMetaObject::invokeMethod(m_scanner, std::move(work), Qt::QueuedConnection);
+}
+
+void LibraryController::setScanReadDelayForTesting(int milliseconds)
+{
+    if (m_scanner)
+        m_scanner->setReadDelayForTesting(milliseconds);
 }
 
 bool LibraryController::hasActiveRoot() const
@@ -814,7 +875,9 @@ void LibraryController::requestMetadataReprocess()
     m_done = 0;
     m_total = -1;
     m_scanner->prepareScan();
+    qCInfo(lcLibraryController) << "Library metadata reprocess started";
     emit stateChanged();
+    keyActivityChanged();
     emit metadataReprocessRequested();
 }
 
@@ -868,6 +931,57 @@ QVariantMap LibraryController::reviewDetail(qint64 songId, QString* error) const
     return m_catalogue.reviewDetail(songId, error);
 }
 
+void LibraryController::mirrorLater(qint64 songId)
+{
+    qCWarning(lcLibraryController) << "Song" << songId
+                                   << "correction saved; the library will show it shortly";
+    m_mirrorRetry.insert(songId);
+    if (!m_mirrorTimer) {
+        m_mirrorTimer = new QTimer(this);
+        m_mirrorTimer->setSingleShot(true);
+        connect(m_mirrorTimer, &QTimer::timeout, this, &LibraryController::retryMirrors);
+    }
+    if (!m_mirrorTimer->isActive())
+        m_mirrorTimer->start(1000);
+}
+
+void LibraryController::retryMirrors()
+{
+    if (m_mirrorRetry.isEmpty() || !isAvailable())
+        return;
+    bool written = false;
+    {
+        const writepriority::UserWrite priority;
+        QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+        if (!m_overrideStore || !m_overrideStore->isOpen())
+            return;  // the next start applies the store
+        const QSet<qint64> songs = std::exchange(m_mirrorRetry, {});
+        for (const qint64 songId : songs) {
+            // Whatever the store holds now (a later edit wins too).
+            const MetadataOverride stored = existingTrusted(songId);
+            QString error;
+            const UserChange outcome = writeUserChange(m_catalogue, [&](QString* writeError) {
+                return stored.hasValues()
+                    ? m_catalogue.setTrustedMetadata(songId, stored, stored.updatedAt, writeError)
+                    : m_catalogue.clearManualOverride(songId, writeError);
+            }, &error);
+            if (outcome == UserChange::Written)
+                written = true;
+            else if (outcome == UserChange::Busy)
+                m_mirrorRetry.insert(songId);
+            // Failed: left for the next scan or start, which apply the store.
+        }
+    }
+    if (written) {
+        invalidateBrowseCache();
+        emit catalogueChanged();
+        emit songKeysChanged();
+        requestSongKeySummary();
+    }
+    if (!m_mirrorRetry.isEmpty())
+        m_mirrorTimer->start(2000);
+}
+
 bool LibraryController::setManualOverride(qint64 songId,
                                           const std::optional<QString>& artist,
                                           const std::optional<QString>& title,
@@ -875,6 +989,7 @@ bool LibraryController::setManualOverride(qint64 songId,
 {
     // A name edit changes only the name: trusted label, series, disc, track
     // and the origin of an import stay exactly as they are.
+    const writepriority::UserWrite priority;
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     MetadataOverride values = existingTrusted(songId);
     values.artist = artist;
@@ -910,6 +1025,7 @@ MetadataOverride LibraryController::existingTrusted(qint64 songId) const
 bool LibraryController::setTrustedMetadata(qint64 songId, const MetadataOverride& values,
                                            QString* error)
 {
+    const writepriority::UserWrite priority;
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     return setTrustedMetadataLocked(songId, values, error);
 }
@@ -937,8 +1053,17 @@ bool LibraryController::setTrustedMetadataLocked(qint64 songId, const MetadataOv
     value->updatedAt = QDateTime::currentMSecsSinceEpoch();
     if (!storeOverrideLocked(songId, *value, &*value, error))
         return false;
-    if (!m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, error))
+    switch (writeUserChange(m_catalogue, [&](QString* writeError) {
+        return m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, writeError);
+    }, error)) {
+    case UserChange::Written:
+        break;
+    case UserChange::Busy:
+        mirrorLater(songId);  // saved: the library shows it in a moment
+        break;
+    case UserChange::Failed:
         return false;
+    }
     invalidateBrowseCache();
     emit catalogueChanged();
     return true;
@@ -946,6 +1071,7 @@ bool LibraryController::setTrustedMetadataLocked(qint64 songId, const MetadataOv
 
 bool LibraryController::clearManualOverride(qint64 songId, QString* error)
 {
+    const writepriority::UserWrite priority;
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     if (!m_overrideStore || !m_overrideStore->isOpen()) {
         if (error)
@@ -964,8 +1090,17 @@ bool LibraryController::clearManualOverride(qint64 songId, QString* error)
         return setTrustedMetadataLocked(songId, remaining, error);
     if (!storeOverrideLocked(songId, *value, nullptr, error))
         return false;
-    if (!m_catalogue.clearManualOverride(songId, error))
+    switch (writeUserChange(m_catalogue, [&](QString* writeError) {
+        return m_catalogue.clearManualOverride(songId, writeError);
+    }, error)) {
+    case UserChange::Written:
+        break;
+    case UserChange::Busy:
+        mirrorLater(songId);
+        break;
+    case UserChange::Failed:
         return false;
+    }
     invalidateBrowseCache();
     emit catalogueChanged();
     return true;
@@ -1004,9 +1139,9 @@ void LibraryController::setPlaybackActive(bool active)
         if (m_keyTimer)
             m_keyTimer->stop();
     } else {
-        scheduleKeyBatch(m_keyTimings.afterPlaybackMs);
+        scheduleKeyBatch(m_keyTimings.afterPlaybackMs, KeyWait::AfterSong);
     }
-    emit songKeySummaryChanged();
+    keyActivityChanged();
 }
 
 void LibraryController::startScan(const QString& rootPath)
@@ -1029,7 +1164,9 @@ void LibraryController::startScan(const QString& rootPath)
     m_done = 0;
     m_total = -1;
     m_scanner->prepareScan();
+    qCInfo(lcLibraryController).noquote() << "Library scan started:" << rootPath;
     emit stateChanged();
+    keyActivityChanged();
     emit scanRequested(rootPath);
 }
 
@@ -1046,6 +1183,26 @@ void LibraryController::onProgress(const QString& phase, qint64 done, qint64 tot
 
 void LibraryController::onFinished(const QVariantMap& summary)
 {
+    {
+        // One line per scan, so a log shows how long the library work takes
+        // on this computer and drive (key analysis waits for it).
+        const QVariantMap counts = summary.value(QStringLiteral("counts")).toMap();
+        const QVariantMap timings = summary.value(QStringLiteral("timingsMs")).toMap();
+        QStringList phases;
+        for (auto it = timings.cbegin(); it != timings.cend(); ++it) {
+            if (it.value().toLongLong() >= 1000)
+                phases.append(QStringLiteral("%1 %2 s").arg(it.key()).arg(it.value().toLongLong() / 1000));
+        }
+        qCInfo(lcLibraryController).noquote()
+            << (m_reprocessing ? "Library metadata reprocess" : "Library scan")
+            << summary.value(QStringLiteral("status")).toString() << "in"
+            << summary.value(QStringLiteral("elapsedMs")).toLongLong() / 1000 << "s;"
+            << "files" << counts.value(QStringLiteral("walked")).toLongLong()
+            << "changed" << counts.value(QStringLiteral("changed")).toLongLong()
+            << "tags read" << counts.value(QStringLiteral("tagsRead")).toLongLong()
+            << "file reads" << counts.value(QStringLiteral("sourceFileReads")).toLongLong()
+            << (phases.isEmpty() ? QString() : QStringLiteral("(%1)").arg(phases.join(QStringLiteral(", "))));
+    }
     invalidateBrowseCache();
     m_scanning = false;
     m_reprocessing = false;
@@ -1094,7 +1251,8 @@ void LibraryController::startPendingWork()
         return;
     }
     // Songs a scan added (or a drive that came back) may need keys.
-    scheduleKeyBatch(m_keyTimings.startMs);
+    scheduleKeyBatch(m_keyTimings.startMs, KeyWait::Start);
+    keyActivityChanged();
 }
 
 void LibraryController::setSongKeyAnalysisEnabled(bool enabled)
@@ -1104,15 +1262,23 @@ void LibraryController::setSongKeyAnalysisEnabled(bool enabled)
     m_keysEnabled = enabled;
     qCInfo(lcLibraryController) << "Song key analysis" << (enabled ? "turned on" : "turned off");
     if (enabled) {
-        scheduleKeyBatch(m_keyTimings.startMs);
+        m_keyUnavailable = false;
+        m_keyOffline = false;
+        m_keyFailing = false;
+        m_keyProblem.clear();
+        scheduleKeyBatch(m_keyTimings.startMs, KeyWait::Start);
         requestSongKeySummary();
+        if (m_keyCheck)
+            m_keyCheck->start(m_keyTimings.checkMs);
     } else {
         if (m_keyTimer)
             m_keyTimer->stop();
+        if (m_keyCheck)
+            m_keyCheck->stop();
         if (m_scanner && m_keyBatchInFlight)
             m_scanner->setKeyYield(true);
     }
-    emit songKeySummaryChanged();
+    keyActivityChanged();
 }
 
 bool LibraryController::keyBatchAllowed() const
@@ -1129,18 +1295,22 @@ void LibraryController::holdSongKeysForSong()
         return;
     if (m_keyBatchInFlight)
         m_scanner->setKeyYield(true);
-    scheduleKeyBatch(m_keyTimings.afterPlaybackMs);
+    scheduleKeyBatch(m_keyTimings.afterPlaybackMs, KeyWait::AfterSong);
+    keyActivityChanged();
 }
 
-void LibraryController::scheduleKeyBatch(int delayMs)
+void LibraryController::scheduleKeyBatch(int delayMs, KeyWait why)
 {
     if (!m_keysEnabled || !m_keyTimer || !m_scanner)
         return;
     // More work may have come (a scan, turned on again): "done" is stale.
     m_keyChainDone = false;
     // Never sooner than a wait already asked for (e.g. after playback).
-    if (m_keyTimer->isActive())
-        delayMs = std::max(delayMs, m_keyTimer->remainingTime());
+    if (m_keyTimer->isActive() && m_keyTimer->remainingTime() > delayMs) {
+        delayMs = m_keyTimer->remainingTime();
+        why = m_keyWait;
+    }
+    m_keyWait = why;
     m_keyTimer->start(delayMs);
 }
 
@@ -1151,18 +1321,24 @@ void LibraryController::startKeyBatch()
     if (!m_keyEngine)
         m_keyEngine = m_keyEngineFactory ? m_keyEngineFactory() : createSongKeyEngine();
     if (!m_keyEngine) {
+        // Tried again after the next scan, like any other "unavailable".
         qCWarning(lcLibraryController) << "Song keys cannot be worked out here: no audio decoder";
+        m_keyUnavailable = true;
+        m_keyProblem = QStringLiteral("no audio decoder");
+        keyActivityChanged();
         return;
     }
     m_keyBatchInFlight = true;
+    m_keyBatchStartedMs = QDateTime::currentMSecsSinceEpoch();
     m_keyChainDone = false;
     m_keyUnavailable = false;
+    m_keyOffline = false;
     m_scanner->setKeyYield(false);
     LibraryScanner* scanner = m_scanner;
     std::shared_ptr<SongKeyEngine> engine = m_keyEngine;
     QMetaObject::invokeMethod(m_scanner, [scanner, engine] { scanner->analyseSongKeys(engine); },
                               Qt::QueuedConnection);
-    emit songKeySummaryChanged();
+    keyActivityChanged();
 }
 
 void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
@@ -1182,30 +1358,173 @@ void LibraryController::onKeyBatchFinished(const QVariantMap& summary)
         counts.confident = summary.value(QStringLiteral("confident")).toLongLong();
         counts.manual = summary.value(QStringLiteral("manual")).toLongLong();
         m_keySummary = counts;
+        ++m_keySummaryGeneration;
     }
+    const qint64 skipped = summary.value(QStringLiteral("skipped")).toLongLong();
+    const QString detail = summary.value(QStringLiteral("detail")).toString();
+    if (decoded + reused > 0)
+        ++m_keySummaryGeneration;  // a count started before these results is out of date
     m_keyMsTimed += decodeMs;
     m_keySongsTimed += decoded;
-    if (decoded + reused + failed > 0) {
-        qCInfo(lcLibraryController).noquote()
-            << "Song keys:" << decoded << "analysed," << reused << "already known," << failed
-            << "unreadable;" << (decoded > 0 ? decodeMs / decoded : 0) << "ms per song;"
-            << (m_keySummary ? QStringLiteral("%1 of %2 done").arg(m_keySummary->analysed).arg(m_keySummary->total)
-                             : QString())
-            << "(" << reason << ")";
+    // Every batch that did no work is logged too: it is how a run that shows
+    // no progress tells what is happening.
+    const bool noProgress = decoded + reused == 0 && reason != QLatin1String("stopped");
+    if (decoded + reused + failed + skipped > 0 || noProgress) {
+        QString line = QStringLiteral("Song keys: %1 analysed, %2 already known, %3 unreadable, "
+                                      "%4 skipped; %5 ms per song; ")
+                           .arg(decoded).arg(reused).arg(failed).arg(skipped)
+                           .arg(decoded > 0 ? decodeMs / decoded : 0);
+        if (m_keySummary)
+            line += QStringLiteral("%1 of %2 done ").arg(m_keySummary->analysed).arg(m_keySummary->total);
+        line += QStringLiteral("( %1 )").arg(reason);
+        if (!detail.isEmpty())
+            line += QStringLiteral(" - ") + detail;
+        if (noProgress && reason != QLatin1String("done"))
+            qCWarning(lcLibraryController).noquote() << line;
+        else
+            qCInfo(lcLibraryController).noquote() << line;
     }
     if (decoded + reused > 0)
         emit songKeysChanged();
-    emit songKeySummaryChanged();
     m_keyChainDone = reason == QLatin1String("done");
     m_keyUnavailable = reason == QLatin1String("unavailable");
+    m_keyOffline = reason == QLatin1String("offline");
+    // A batch that read no song at all (every one unreadable, or none could
+    // be recorded) is not repeated at once: a drive or installation problem
+    // would otherwise be tried on song after song, every few seconds.
+    m_keyFailing = reason == QLatin1String("more") && decoded + reused == 0;
+    if (m_keyUnavailable || m_keyFailing)
+        m_keyProblem = detail;
+    else if (decoded + reused > 0)
+        m_keyProblem.clear();
     if (reason == QLatin1String("more"))
-        scheduleKeyBatch(m_keyTimings.restMs);
-    else if (reason == QLatin1String("stopped"))
-        scheduleKeyBatch(m_keyTimings.retryMs);
-    // "done", "offline" and "unavailable" (no decoder, or no lasting cache)
-    // wait for the next scan to finish; the decoder is then made afresh.
+        scheduleKeyBatch(m_keyFailing ? m_keyTimings.retryMs : m_keyTimings.restMs,
+                         m_keyFailing ? KeyWait::Retry : KeyWait::Rest);
+    else if (reason == QLatin1String("stopped") || reason == QLatin1String("offline"))
+        scheduleKeyBatch(m_keyTimings.retryMs, KeyWait::Retry);
+    // "done" and "unavailable" (no decoder, or no lasting cache) wait for the
+    // next scan to finish; the decoder is then made afresh.
     if (reason == QLatin1String("unavailable"))
         m_keyEngine.reset();
+    keyActivityChanged();
+}
+
+LibraryController::SongKeyActivity LibraryController::songKeyActivity() const
+{
+    if (!m_keysEnabled)
+        return SongKeyActivity::Off;
+    if (m_keyBatchInFlight)
+        return SongKeyActivity::Working;
+    if (m_playbackActive)
+        return SongKeyActivity::PausedForSong;
+    if (m_scanning || !m_pendingRoot.isEmpty() || m_pendingReprocess)
+        return SongKeyActivity::WaitingForScan;
+    if (m_keyUnavailable)
+        return SongKeyActivity::Stopped;
+    const bool pending = m_keyTimer && m_keyTimer->isActive();
+    if (m_keyChainDone && !pending) {
+        return m_keySummary && m_keySummary->remaining() == 0 ? SongKeyActivity::AllDone
+                                                               : SongKeyActivity::DoneForNow;
+    }
+    if (!pending)
+        return SongKeyActivity::Stalled;
+    if (m_keyOffline)
+        return SongKeyActivity::WaitingForDrive;
+    switch (m_keyWait) {
+    case KeyWait::AfterSong:
+        return SongKeyActivity::WaitingAfterSong;
+    case KeyWait::Retry:
+        return m_keyFailing ? SongKeyActivity::Retrying : SongKeyActivity::Resting;
+    case KeyWait::Start:
+    case KeyWait::Rest:
+        break;
+    }
+    return SongKeyActivity::Resting;
+}
+
+QString LibraryController::songKeyActivityName(SongKeyActivity activity)
+{
+    switch (activity) {
+    case SongKeyActivity::Off: return QStringLiteral("off");
+    case SongKeyActivity::Working: return QStringLiteral("working");
+    case SongKeyActivity::WaitingForScan: return QStringLiteral("waiting for the library scan");
+    case SongKeyActivity::PausedForSong: return QStringLiteral("paused while a song plays");
+    case SongKeyActivity::WaitingAfterSong: return QStringLiteral("waiting after a song");
+    case SongKeyActivity::Resting: return QStringLiteral("resting");
+    case SongKeyActivity::Retrying: return QStringLiteral("retrying after songs could not be read");
+    case SongKeyActivity::WaitingForDrive: return QStringLiteral("waiting for the music drive");
+    case SongKeyActivity::DoneForNow: return QStringLiteral("done for now");
+    case SongKeyActivity::AllDone: return QStringLiteral("all done");
+    case SongKeyActivity::Stopped: return QStringLiteral("stopped");
+    case SongKeyActivity::Stalled: return QStringLiteral("stalled");
+    }
+    return {};
+}
+
+void LibraryController::keyActivityChanged()
+{
+    const SongKeyActivity activity = songKeyActivity();
+    // Working and resting alternate every few seconds; the batch lines say
+    // that. Every other change is logged.
+    const auto quiet = [](SongKeyActivity a) {
+        return a == SongKeyActivity::Working || a == SongKeyActivity::Resting;
+    };
+    if (activity != m_loggedKeyActivity && !(quiet(activity) && quiet(m_loggedKeyActivity))) {
+        QString line = QStringLiteral("Song keys: ") + songKeyActivityName(activity);
+        if (m_keySummary)
+            line += QStringLiteral(" (%1 of %2 analysed)").arg(m_keySummary->analysed).arg(m_keySummary->total);
+        if (activity == SongKeyActivity::WaitingForScan)
+            line += QStringLiteral(" - ") + scanPhaseText();
+        if ((activity == SongKeyActivity::Stopped || activity == SongKeyActivity::Retrying)
+            && !m_keyProblem.isEmpty())
+            line += QStringLiteral(" - ") + m_keyProblem;
+        qCInfo(lcLibraryController).noquote() << line;
+    }
+    m_loggedKeyActivity = activity;
+    emit songKeySummaryChanged();
+}
+
+void LibraryController::checkKeyChain()
+{
+    switch (songKeyActivity()) {
+    case SongKeyActivity::Stalled:
+        // Never expected: something forgot to start the next batch.
+        qCWarning(lcLibraryController) << "Song keys: nothing was pending; starting again";
+        scheduleKeyBatch(m_keyTimings.restMs, KeyWait::Rest);
+        keyActivityChanged();
+        break;
+    case SongKeyActivity::Working:
+        // A batch ends between songs after a few seconds; one song may take
+        // up to a few minutes on a drive that hardly answers.
+        if (const qint64 working = QDateTime::currentMSecsSinceEpoch() - m_keyBatchStartedMs;
+            working >= 4 * 60 * 1000) {
+            qCWarning(lcLibraryController) << "Song keys: one batch has been working for"
+                                           << working / 60000 << "minutes (a slow song file?)";
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+QString LibraryController::scanPhaseText() const
+{
+    if (m_reprocessing)
+        return QStringLiteral("updating song names");
+    QString what;
+    if (m_phase == QLatin1String("walk"))
+        what = QStringLiteral("checking files");
+    else if (m_phase == QLatin1String("tags"))
+        what = QStringLiteral("reading song details");
+    else if (m_phase == QLatin1String("content_matching"))
+        what = QStringLiteral("comparing songs");
+    else
+        what = QStringLiteral("updating the library");
+    if (m_done > 0 && m_total > 0)
+        return QStringLiteral("%1, %L2 of %L3").arg(what).arg(m_done).arg(m_total);
+    if (m_done > 0)
+        return QStringLiteral("%1, %L2 so far").arg(what).arg(m_done);
+    return what;
 }
 
 void LibraryController::requestSongKeySummary()
@@ -1219,17 +1538,19 @@ void LibraryController::requestSongKeySummary()
     m_keySummaryRunning = true;
     const QString path = m_catalogue.databasePath();
     const QPointer<LibraryController> self(this);
-    background::run(QStringLiteral("SongKeySummary"), [self, path] {
+    const quint64 generation = m_keySummaryGeneration;
+    background::run(QStringLiteral("SongKeySummary"), [self, path, generation] {
         QString error;
         const std::optional<SongKeySummary> summary = Catalogue::readSongKeySummary(path, &error);
         if (!summary)
             qCWarning(lcLibraryController).noquote() << "Could not count song keys:" << error;
         if (QCoreApplication* app = QCoreApplication::instance()) {
-            QMetaObject::invokeMethod(app, [self, summary] {
+            QMetaObject::invokeMethod(app, [self, summary, generation] {
                 if (!self)
                     return;
                 self->m_keySummaryRunning = false;
-                if (summary)
+                // A batch counted afterwards knows better.
+                if (summary && (generation == self->m_keySummaryGeneration || !self->m_keySummary))
                     self->m_keySummary = summary;
                 emit self->songKeySummaryChanged();
                 if (std::exchange(self->m_keySummaryAgain, false))
@@ -1248,6 +1569,23 @@ std::optional<SongKeyInfo> LibraryController::songKey(qint64 songId) const
     if (!error.isEmpty())
         qCWarning(lcLibraryController).noquote() << error;
     return key && key->shown() ? key : std::nullopt;
+}
+
+QHash<qint64, SongKeyInfo> LibraryController::songKeys(const QList<qint64>& songIds) const
+{
+    if (!isAvailable() || songIds.isEmpty())
+        return {};
+    QString error;
+    QHash<qint64, SongKeyInfo> keys = m_catalogue.songKeys(songIds, &error);
+    if (!error.isEmpty())
+        qCWarning(lcLibraryController).noquote() << error;
+    for (auto it = keys.begin(); it != keys.end();) {
+        if (it->shown())
+            ++it;
+        else
+            it = keys.erase(it);
+    }
+    return keys;
 }
 
 std::optional<SongKeyInfo> LibraryController::songKeyDetails(qint64 songId) const
@@ -1269,7 +1607,10 @@ bool LibraryController::setManualOriginalKey(qint64 songId, std::optional<int> k
             *error = QStringLiteral("Not a song key: %1").arg(*keyIndex);
         return false;
     }
+    const std::optional<SongKeyInfo> before = songKeyDetails(songId);
+    const bool hadManual = before && before->isManual();
     {
+        const writepriority::UserWrite priority;
         QMutexLocker lock(&MetadataOverrideStore::synchronisation());
         if (!m_overrideStore || !m_overrideStore->isOpen()) {
             if (error)
@@ -1291,12 +1632,20 @@ bool LibraryController::setManualOriginalKey(qint64 songId, std::optional<int> k
         value->createdAt = existing.createdAt;
         value->originalKey = keyIndex;
         value->updatedAt = QDateTime::currentMSecsSinceEpoch();
-        if (value->hasValues()) {
-            if (!storeOverrideLocked(songId, *value, &*value, error)
-                || !m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, error))
-                return false;
-        } else if (!storeOverrideLocked(songId, *value, nullptr, error)
-                   || !m_catalogue.clearManualOverride(songId, error)) {
+        const bool set = value->hasValues();
+        if (!storeOverrideLocked(songId, *value, set ? &*value : nullptr, error))
+            return false;
+        // The store is the truth: from here the key is saved.
+        switch (writeUserChange(m_catalogue, [&](QString* writeError) {
+            return set ? m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, writeError)
+                       : m_catalogue.clearManualOverride(songId, writeError);
+        }, error)) {
+        case UserChange::Written:
+            break;
+        case UserChange::Busy:
+            mirrorLater(songId);  // the library shows it in a moment
+            break;
+        case UserChange::Failed:
             return false;
         }
     }
@@ -1305,44 +1654,78 @@ bool LibraryController::setManualOriginalKey(qint64 songId, std::optional<int> k
         << (keyIndex ? songKeyName(*keyIndex) : QStringLiteral("none (detected key used)"));
     // The names are unchanged: the library keeps its place; keys are looked up again.
     emit songKeysChanged();
+    // The first key set by hand (or the last cleared) shows (or hides) the
+    // Key columns at once; the count that follows confirms it.
+    if (m_keySummary && keyIndex.has_value() != hadManual)
+        m_keySummary->manual = std::max<qint64>(0, m_keySummary->manual + (hadManual ? -1 : 1));
+    ++m_keySummaryGeneration;  // a count started before this change is out of date
+    keyActivityChanged();
     requestSongKeySummary();
     return true;
 }
 
 QString LibraryController::songKeyStatusText() const
 {
-    if (!m_keySummary)
+    // A scan first: whatever was counted before it may be about to change.
+    const SongKeyActivity activity = songKeyActivity();
+    const bool scanFirst = activity == SongKeyActivity::WaitingForScan;
+    const QString scanWait = QStringLiteral("Waiting for the library scan to finish (%1).")
+                                 .arg(scanPhaseText());
+    if (!m_keySummary) {
+        if (scanFirst)
+            return scanWait;
         return m_keySummaryRunning ? QStringLiteral("Counting songs...") : QString();
+    }
     const SongKeySummary& counts = *m_keySummary;
     if (counts.total == 0)
-        return QStringLiteral("No songs to analyse yet.");
+        return scanFirst ? scanWait : QStringLiteral("No songs to analyse yet.");
     QString found = QStringLiteral("%L1 of %L2 songs analysed; keys shown for %L3.")
                         .arg(counts.analysed).arg(counts.total).arg(counts.confident);
     if (counts.manual > 0)
         found += QStringLiteral(" %L1 set by hand.").arg(counts.manual);
     if (!m_keysEnabled)
         return found;
-    if (counts.remaining() == 0)
+    if (counts.remaining() == 0 && !scanFirst)
         return found + QStringLiteral(" All done.");
-    if (m_keyUnavailable && !m_keyBatchInFlight) {
-        return found + QStringLiteral(" Stopped: song keys cannot be worked out just now (see "
-                                      "the log). It tries again after the next library scan.");
-    }
-    if (m_keyChainDone && !m_keyBatchInFlight) {
+    const QString problem = m_keyProblem.isEmpty() ? QStringLiteral("see the log")
+                                                   : m_keyProblem;
+    QString doing;
+    switch (activity) {
+    case SongKeyActivity::Off:
+    case SongKeyActivity::AllDone:
+        return found + QStringLiteral(" All done.");
+    case SongKeyActivity::Stopped:
+        return found + QStringLiteral(" Stopped: song keys cannot be worked out just now (%1). "
+                                      "It tries again after the next library scan.").arg(problem);
+    case SongKeyActivity::DoneForNow:
         return found + QStringLiteral(" Done for now: %L1 could not be read and will be tried again "
                                       "next time.").arg(counts.remaining());
-    }
-    QString doing;
-    if (m_playbackActive)
+    case SongKeyActivity::Working:
+        doing = QStringLiteral("Working now.");
+        break;
+    case SongKeyActivity::WaitingForScan:
+        doing = scanWait;
+        break;
+    case SongKeyActivity::PausedForSong:
         doing = QStringLiteral("Paused while a song plays.");
-    else if (m_scanning)
-        doing = QStringLiteral("Waiting for the library scan.");
-    else if (!isRootConnected())
+        break;
+    case SongKeyActivity::WaitingAfterSong:
+        doing = QStringLiteral("Waiting a little after the song, then carrying on.");
+        break;
+    case SongKeyActivity::Resting:
+        doing = QStringLiteral("Resting between batches.");
+        break;
+    case SongKeyActivity::Retrying:
+        doing = QStringLiteral("The last songs tried could not be read (%1); trying again in a "
+                               "minute.").arg(problem);
+        break;
+    case SongKeyActivity::WaitingForDrive:
         doing = QStringLiteral("Waiting for the music drive.");
-    else if (m_keyBatchInFlight)
-        doing = QStringLiteral("Working.");
-    else
-        doing = QStringLiteral("Resting.");
+        break;
+    case SongKeyActivity::Stalled:
+        doing = QStringLiteral("Starting again shortly.");
+        break;
+    }
     QString left;
     if (const qint64 perSong = songKeyMsPerSong(); perSong > 0) {
         const qint64 minutes = std::max<qint64>(1, counts.remaining() * perSong / 60000);

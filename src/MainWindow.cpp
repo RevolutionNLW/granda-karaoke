@@ -552,6 +552,7 @@ void MainWindow::applyPreference(const QString& key)
     } else if (key == pref::ShowKeyColumn && m_library) {
         m_library->setColumnVisible(LibraryResultsModel::KeyColumn,
                                     m_preferences->flag(key, true));
+        updateKeyColumn();
     } else if (key == pref::AnalyseSongKeys && m_libraryController) {
         m_libraryController->setSongKeyAnalysisEnabled(m_preferences->flag(key, false));
         updateKeyColumn();
@@ -578,8 +579,12 @@ void MainWindow::updateKeyColumn()
     if (!m_library || !m_libraryController)
         return;
     const auto summary = m_libraryController->songKeySummary();
-    m_library->setKeyColumnAvailable(m_libraryController->songKeyAnalysisEnabled()
-                                     || (summary && (summary->confident > 0 || summary->manual > 0)));
+    const bool available = m_libraryController->songKeyAnalysisEnabled()
+        || (summary && (summary->confident > 0 || summary->manual > 0));
+    m_library->setKeyColumnAvailable(available);
+    // The playlists show keys exactly when the library can.
+    if (m_playlistView)
+        m_playlistView->setKeyColumnShown(available && m_preferences->flag(pref::ShowKeyColumn, true));
 }
 
 void MainWindow::applyDisplaySleep()
