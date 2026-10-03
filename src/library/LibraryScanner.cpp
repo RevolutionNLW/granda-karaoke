@@ -231,8 +231,25 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
                              << syncError;
         return true;
     }
-    if (!catalogue.applyManualOverrides(overrides, error))
+    // A correction saved for a song that is now in another (the active)
+    // folder follows it there: its store row is copied to the song's own
+    // identity first, and the old row is removed only once the catalogue
+    // shows the value. A row that cannot be copied stays where it was.
+    const auto copyToSong = [&store](const MovedMetadataOverride& move) {
+        QString copyError;
+        if (store.copyOverride(move, &copyError))
+            return true;
+        qWarning().noquote() << "A manual metadata correction was not moved to"
+                             << move.rootPath << move.mp3RelPath << ":" << copyError;
         return false;
+    };
+    QList<MetadataOverride> replaced;
+    if (!catalogue.applyManualOverrides(overrides, error, copyToSong, &replaced))
+        return false;
+    QString removeError;
+    if (!replaced.isEmpty() && !store.removeOverrides(replaced, &removeError))
+        qWarning().noquote() << "Moved manual metadata corrections were not tidied up:"
+                             << removeError;
     return true;
 }
 

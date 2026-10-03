@@ -9,6 +9,7 @@
 #include <QString>
 #include <QVariantMap>
 
+#include <functional>
 #include <optional>
 
 struct CatalogueRoot {
@@ -194,8 +195,24 @@ public:
     QVariantMap compareMetadata(const QString& baselinePath, int exampleLimit = 10,
                                 QString* error = nullptr) const;
 
+    // Mirrors the trusted values into the catalogue. A value stored for a
+    // song in another folder than the active one goes to the same song in the
+    // active folder when it is found there safely: `copyToSong` first copies
+    // its store row to that song's identity (if it returns false the value
+    // stays with the song at its old path). One value per song: the song's
+    // own wins, else the newest moved one. After a successful sync,
+    // `replaced` lists the store rows that have been copied or superseded,
+    // for removal.
+    using CopyOverride = std::function<bool(const MovedMetadataOverride&)>;
     bool applyManualOverrides(const QList<MetadataOverride>& overrides,
-                              QString* error = nullptr);
+                              QString* error = nullptr,
+                              const CopyOverride& copyToSong = {},
+                              QList<MetadataOverride>* replaced = nullptr);
+    // Stored values saved at another folder's path that would follow this
+    // song (in the active folder) on the next sync: older copies of its
+    // correction, to be removed with it when it is cleared.
+    QList<MetadataOverride> movedCopiesOf(qint64 songId, const QList<MetadataOverride>& stored,
+                                          QString* error = nullptr) const;
     bool setManualOverride(qint64 songId, const std::optional<QString>& artist,
                            const std::optional<QString>& title,
                            qint64 updatedAt = 0, QString* error = nullptr);
@@ -260,6 +277,9 @@ private:
     friend class MetadataResolver;
 
     static QString playlistSongLookupSql();
+    // The one song in the active folder at this value's path, if its
+    // automatic disc/track (or title) shows it is the same song; else 0.
+    qint64 movedActiveSongFor(const MetadataOverride& value, QString* error) const;
     // The MP3s key analysis covers (see SongKeySummary), counted on any
     // connection that has the enrichment cache attached as "enrich".
     static std::optional<SongKeySummary> songKeySummaryOn(const QSqlDatabase& database,

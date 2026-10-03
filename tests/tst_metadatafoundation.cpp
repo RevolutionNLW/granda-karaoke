@@ -151,6 +151,8 @@ private slots:
     void pausedScanDoesNotBlockCorrections();
     void emptyOverrideStoreNeverErasesCorrections();
     void overrideStoreMigratesFromVersionOne();
+    void overridesFollowAMovedMusicFolder();
+    void movesNeedTheSameSongAndClearsAreAllOrNothing();
 };
 
 void TestMetadataFoundation::migrationCreatesBackupAndPreservesRows()
@@ -552,6 +554,268 @@ void TestMetadataFoundation::emptyOverrideStoreNeverErasesCorrections()
     Catalogue catalogue(path);
     QVERIFY2(catalogue.open(&error), qPrintable(error));
     QCOMPARE(catalogue.search(QStringLiteral("frank sinatra my way"), 5, true, &error).size(), 1);
+}
+
+void TestMetadataFoundation::overridesFollowAMovedMusicFolder()
+{
+    // The same collection at three folders, all still listed as present in
+    // the catalogue (old drive letters are never rescanned); B is in use.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const QString rootC = temporary.filePath(QStringLiteral("music-c"));
+    const QString path = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    const QString overridesPath = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    const QString named = QStringLiteral("SGB39/SGB39-02 - Sinatra, Frank - My Way.mp3");
+    const QString other = QStringLiteral("SGB39/SGB39-03 - Sinatra, Frank - New York.mp3");
+    for (const QString& root : {rootA, rootB, rootC}) {
+        for (const QString& mp3 : {named, other}) {
+            writeFile(root + QLatin1Char('/') + mp3, QByteArray("audio"));
+            writeFile(root + QLatin1Char('/') + mp3.chopped(4) + QStringLiteral(".cdg"),
+                      QByteArray("lyrics"));
+        }
+        QCOMPARE(runScan(path, root).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+    }
+    Catalogue catalogue(path);
+    QString error;
+    QVERIFY2(catalogue.open(&error), qPrintable(error));
+    const QString canonicalA = Catalogue::canonicalPath(rootA);
+    const QString canonicalB = Catalogue::canonicalPath(rootB);
+    auto activate = [&](const QString& root) {
+        for (const CatalogueRoot& known : catalogue.roots(&error)) {
+            if (known.path == Catalogue::canonicalPath(root))
+                return catalogue.setActiveRoot(known.id, &error);
+        }
+        return false;
+    };
+    QVERIFY2(activate(rootB), qPrintable(error));
+    const qint64 songA = catalogue.findSongByMp3Path(rootA, named);
+    const qint64 songB = catalogue.findSongByMp3Path(rootB, named);
+    const qint64 otherA = catalogue.findSongByMp3Path(rootA, other);
+    const qint64 otherB = catalogue.findSongByMp3Path(rootB, other);
+    QVERIFY(songA > 0 && songB > 0 && songA != songB && otherA > 0 && otherB > 0);
+    const QString automaticTitle = catalogue.songRef(songB)->title;
+    const QString automaticOther = catalogue.songRef(otherB)->title;
+    auto titleOf = [&](qint64 song) { return catalogue.songRef(song)->title; };
+
+    MetadataOverrideStore store(overridesPath);
+    QVERIFY2(store.open(&error, {rootA, rootB, rootC}), qPrintable(error));
+    auto storedTitle = [&](const QString& root, const QString& relPath) {
+        const auto value = store.overrideFor(root, relPath, &error);
+        return value && value->title ? *value->title : QString();
+    };
+    int copies = 0;
+    const Catalogue::CopyOverride copy = [&](const MovedMetadataOverride& move) {
+        ++copies;
+        return store.copyOverride(move, &error);
+    };
+    QList<MetadataOverride> replaced;
+    auto sync = [&] {
+        copies = 0;
+        return catalogue.applyManualOverrides(store.all(&error), &error, copy, &replaced)
+            && store.removeOverrides(replaced, &error);
+    };
+
+    auto value = catalogue.metadataOverrideSnapshot(songA, &error);
+    QVERIFY(value);
+    QCOMPARE(value->discId, QStringLiteral("SGB39"));
+    value->artist = QStringLiteral("Francis Albert Sinatra");
+    value->title = QStringLiteral("From A");
+    value->label = QStringLiteral("Sunfly");
+    value->series = QStringLiteral("Gold");
+    value->trustedDiscId = QStringLiteral("SF001");
+    value->trustedTrack = 7;
+    value->originalKey = 3;
+    value->origin = QStringLiteral("import");
+    value->createdAt = 50;
+    value->updatedAt = 100;
+    QVERIFY2(store.setOverride(*value, &error), qPrintable(error));
+    // A file at the same path whose automatic disc/track do not match what
+    // the correction was made for is not the same song.
+    auto unsafe = catalogue.metadataOverrideSnapshot(otherA, &error);
+    QVERIFY(unsafe);
+    unsafe->discId = QStringLiteral("NOPE01");
+    unsafe->title = QStringLiteral("Unsafe");
+    unsafe->updatedAt = 100;
+    QVERIFY2(store.setOverride(*unsafe, &error), qPrintable(error));
+
+    // A copy that cannot be made leaves every value where it was.
+    QVERIFY2(catalogue.applyManualOverrides(store.all(&error), &error,
+                                            [](const MovedMetadataOverride&) { return false; },
+                                            &replaced), qPrintable(error));
+    QVERIFY(replaced.isEmpty());
+    QCOMPARE(titleOf(songB), automaticTitle);
+    QCOMPARE(titleOf(songA), QStringLiteral("From A"));
+
+    // Moved: copied to B with every value and timestamp, then removed at A.
+    QVERIFY2(sync(), qPrintable(error));
+    QCOMPARE(copies, 1);
+    QCOMPARE(replaced.size(), 1);
+    QCOMPARE(titleOf(songB), QStringLiteral("From A"));
+    QCOMPARE(titleOf(otherB), automaticOther);
+    QCOMPARE(titleOf(otherA), QStringLiteral("Unsafe"));
+    QVERIFY(!store.overrideFor(rootA, named, &error));
+    QVERIFY(store.overrideFor(rootA, other, &error));
+    const auto atB = store.overrideFor(rootB, named, &error);
+    QVERIFY(atB);
+    QCOMPARE(atB->rootPath, canonicalB);
+    QCOMPARE(atB->artist, value->artist);
+    QCOMPARE(atB->title, value->title);
+    QCOMPARE(atB->label, value->label);
+    QCOMPARE(atB->series, value->series);
+    QCOMPARE(atB->trustedDiscId, value->trustedDiscId);
+    QCOMPARE(atB->trustedTrack, value->trustedTrack);
+    QCOMPARE(atB->originalKey, value->originalKey);
+    QCOMPARE(atB->origin, value->origin);
+    QCOMPARE(atB->createdAt, 50LL);
+    QCOMPARE(atB->updatedAt, 100LL);
+    QCOMPARE(atB->discId, value->discId);
+    QCOMPARE(atB->track, value->track);
+    QCOMPARE(atB->autoTitle, value->autoTitle);
+    QCOMPARE(atB->fileName, value->fileName);
+    QVERIFY2(sync(), qPrintable(error));  // settled: nothing more moves
+    QCOMPARE(copies, 0);
+    QVERIFY(replaced.isEmpty());
+    QCOMPARE(store.all(&error).size(), 2);
+
+    // A copy never replaces a row already at the new identity, nor copies a
+    // row that changed since it was read; a removal skips a changed row.
+    MetadataOverride stale = *value;
+    stale.title = QStringLiteral("Old A");
+    stale.updatedAt = 200;
+    QVERIFY2(store.setOverride(stale, &error), qPrintable(error));
+    QVERIFY(!store.copyOverride({stale, canonicalB, named}, &error));
+    QVERIFY(!store.copyOverride({*value, canonicalB, named}, &error));
+    QVERIFY2(store.removeOverrides({*value}, &error), qPrintable(error));
+    QCOMPARE(storedTitle(rootA, named), QStringLiteral("Old A"));
+    QCOMPARE(storedTitle(rootB, named), QStringLiteral("From A"));
+
+    // A song's own value wins over one that would move onto it (even a newer
+    // one, e.g. re-entered before this fix), and the superseded row goes, so
+    // clearing the song's own value cannot bring it back.
+    QVERIFY2(sync(), qPrintable(error));
+    QCOMPARE(copies, 0);
+    QCOMPARE(titleOf(songB), QStringLiteral("From A"));
+    QVERIFY(!store.overrideFor(rootA, named, &error));
+    QVERIFY(store.clearOverride(rootB, named, &error));
+    QVERIFY2(sync(), qPrintable(error));
+    QCOMPARE(titleOf(songB), automaticTitle);
+
+    // Two old folders: the newer value moves, the older one goes.
+    MetadataOverride fromA = *value;
+    fromA.title = QStringLiteral("Older at A");
+    fromA.updatedAt = 300;
+    QVERIFY2(store.setOverride(fromA, &error), qPrintable(error));
+    MetadataOverride fromC = *catalogue.metadataOverrideSnapshot(
+        catalogue.findSongByMp3Path(rootC, named), &error);
+    fromC.title = QStringLiteral("Newer at C");
+    fromC.updatedAt = 400;
+    QVERIFY2(store.setOverride(fromC, &error), qPrintable(error));
+    QVERIFY2(sync(), qPrintable(error));
+    QCOMPARE(copies, 1);
+    QCOMPARE(titleOf(songB), QStringLiteral("Newer at C"));
+    QCOMPARE(storedTitle(rootB, named), QStringLiteral("Newer at C"));
+    QVERIFY(!store.overrideFor(rootA, named, &error));
+    QVERIFY(!store.overrideFor(rootC, named, &error));
+
+    // A is in use again: the value follows the song back.
+    QVERIFY2(activate(rootA), qPrintable(error));
+    QVERIFY2(sync(), qPrintable(error));
+    QCOMPARE(titleOf(songA), QStringLiteral("Newer at C"));
+    QCOMPARE(titleOf(songB), automaticTitle);
+    QCOMPARE(titleOf(otherA), QStringLiteral("Unsafe"));
+    QCOMPARE(storedTitle(canonicalA, named), QStringLiteral("Newer at C"));
+    QVERIFY(!store.overrideFor(rootB, named, &error));
+    QCOMPARE(store.all(&error).size(), 2);
+}
+
+void TestMetadataFoundation::movesNeedTheSameSongAndClearsAreAllOrNothing()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const QString path = temporary.filePath(QStringLiteral("app/library.sqlite"));
+    const QString overridesPath = temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite"));
+    const QString named = QStringLiteral("SGB39/SGB39-02 - Sinatra, Frank - My Way.mp3");
+    for (const QString& root : {rootA, rootB}) {
+        writeFile(root + QLatin1Char('/') + named, QByteArray("audio"));
+        writeFile(root + QLatin1Char('/') + named.chopped(4) + QStringLiteral(".cdg"), QByteArray("lyrics"));
+        QCOMPARE(runScan(path, root).value(QStringLiteral("status")).toString(),
+                 QStringLiteral("completed"));
+    }
+    Catalogue catalogue(path);
+    QString error;
+    QVERIFY2(catalogue.open(&error), qPrintable(error));
+    for (const CatalogueRoot& root : catalogue.roots(&error)) {
+        if (root.path == Catalogue::canonicalPath(rootB))
+            QVERIFY2(catalogue.setActiveRoot(root.id, &error), qPrintable(error));
+    }
+    const qint64 songA = catalogue.findSongByMp3Path(rootA, named);
+    const qint64 songB = catalogue.findSongByMp3Path(rootB, named);
+    QVERIFY(songA > 0 && songB > 0);
+    const QString automaticTitle = catalogue.songRef(songB)->title;
+    MetadataOverrideStore store(overridesPath);
+    QVERIFY2(store.open(&error, {rootA, rootB}), qPrintable(error));
+    const Catalogue::CopyOverride copy = [&](const MovedMetadataOverride& move) {
+        return store.copyOverride(move, &error);
+    };
+    QList<MetadataOverride> replaced;
+
+    // Without a disc number, the same title by another artist is another song.
+    auto value = catalogue.metadataOverrideSnapshot(songA, &error);
+    QVERIFY(value && !value->autoTitle.isEmpty());
+    value->discId.clear();
+    value->track = 0;
+    value->autoArtist = QStringLiteral("Someone Else");
+    value->title = QStringLiteral("Corrected");
+    value->updatedAt = 100;
+    QVERIFY2(store.setOverride(*value, &error), qPrintable(error));
+    QVERIFY2(catalogue.applyManualOverrides(store.all(&error), &error, copy, &replaced), qPrintable(error));
+    QVERIFY(replaced.isEmpty());
+    QCOMPARE(catalogue.songRef(songB)->title, automaticTitle);
+    QCOMPARE(catalogue.songRef(songA)->title, QStringLiteral("Corrected"));
+    QVERIFY(!store.overrideFor(rootB, named, &error));
+    QVERIFY(catalogue.movedCopiesOf(songB, store.all(&error), &error).isEmpty());
+    // The same title and artist (in any case) is the same song.
+    value->autoArtist = catalogue.metadataOverrideSnapshot(songA, &error)->autoArtist.toUpper();
+    value->updatedAt = 200;
+    QVERIFY2(store.setOverride(*value, &error), qPrintable(error));
+    QCOMPARE(catalogue.movedCopiesOf(songB, store.all(&error), &error).size(), 1);
+    QVERIFY2(catalogue.applyManualOverrides(store.all(&error), &error, copy, &replaced), qPrintable(error));
+    QCOMPARE(replaced.size(), 1);
+    QCOMPARE(catalogue.songRef(songB)->title, QStringLiteral("Corrected"));
+
+    // The copy at A is left behind (its tidy-up has not run). Clearing B
+    // removes it too, but only all together and only if it is unchanged.
+    QVERIFY(store.overrideFor(rootA, named, &error));
+    const QList<MetadataOverride> copies = catalogue.movedCopiesOf(songB, store.all(&error), &error);
+    QCOMPARE(copies.size(), 1);
+    MetadataOverride changed = copies.first();
+    changed.updatedAt = 1;
+    QVERIFY(!store.clearOverrideAndCopies(rootB, named, {changed}, &error));
+    QVERIFY(store.overrideFor(rootA, named, &error));
+    QVERIFY(store.overrideFor(rootB, named, &error));
+    const QString connection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        QSqlDatabase raw = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+        raw.setDatabaseName(overridesPath);
+        QVERIFY(raw.open());
+        QSqlQuery trigger(raw);
+        QVERIFY(trigger.exec(QStringLiteral(
+            "CREATE TRIGGER test_keep_own BEFORE DELETE ON metadata_overrides WHEN old.root_path='%1' "
+            "BEGIN SELECT RAISE(ABORT,'forced failure'); END").arg(Catalogue::canonicalPath(rootB))));
+        QVERIFY(!store.clearOverrideAndCopies(rootB, named, copies, &error));
+        QVERIFY(store.overrideFor(rootA, named, &error));  // rolled back
+        QVERIFY(store.overrideFor(rootB, named, &error));
+        QVERIFY(trigger.exec(QStringLiteral("DROP TRIGGER test_keep_own")));
+        raw.close();
+    }
+    QSqlDatabase::removeDatabase(connection);
+    QVERIFY2(store.clearOverrideAndCopies(rootB, named, copies, &error), qPrintable(error));
+    QVERIFY(store.all(&error).isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TestMetadataFoundation)

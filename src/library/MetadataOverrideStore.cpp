@@ -72,10 +72,12 @@ MetadataOverride overrideFromQuery(const QSqlQuery& query)
     return value;
 }
 
-const QString overrideColumns = QStringLiteral(
-    "root_path,mp3_rel_path,artist,title,created_at,updated_at,"
+// Everything stored for a song file except its identity (root and path).
+const QString valueColumns = QStringLiteral(
+    "artist,title,created_at,updated_at,"
     "auto_artist,auto_title,disc_id,track,file_name,label,series,set_disc_id,set_track,origin,"
     "original_key");
+const QString overrideColumns = QStringLiteral("root_path,mp3_rel_path,") + valueColumns;
 
 } // namespace
 
@@ -348,6 +350,144 @@ bool MetadataOverrideStore::clearOverride(const QString& rootPath,
     if (query.exec())
         return true;
     setError(queryError(query, QStringLiteral("Could not clear metadata override")), error);
+    return false;
+}
+
+bool MetadataOverrideStore::copyOverride(const MovedMetadataOverride& move, QString* error)
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    // A plain INSERT: an existing row at the new identity makes this fail.
+    QSqlQuery insert(m_database);
+    insert.prepare(QStringLiteral("INSERT INTO metadata_overrides(root_path,mp3_rel_path,%1) "
+                                  "SELECT ?,?,%1 FROM metadata_overrides "
+                                  "WHERE root_path=? AND mp3_rel_path=? AND updated_at=?")
+                       .arg(valueColumns));
+    insert.addBindValue(Catalogue::canonicalPath(move.rootPath));
+    insert.addBindValue(Catalogue::normalizedPlaylistRelativePath(move.mp3RelPath));
+    insert.addBindValue(Catalogue::canonicalPath(move.stored.rootPath));
+    insert.addBindValue(Catalogue::normalizedPlaylistRelativePath(move.stored.mp3RelPath));
+    insert.addBindValue(move.stored.updatedAt);
+    if (!insert.exec()) {
+        setError(queryError(insert, QStringLiteral("Could not copy metadata override")), error);
+        return false;
+    }
+    if (insert.numRowsAffected() == 1)
+        return true;
+    setError(QStringLiteral("Could not copy metadata override: it changed or was removed"), error);
+    return false;
+}
+
+bool MetadataOverrideStore::removeOverrides(const QList<MetadataOverride>& rows, QString* error)
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("Could not begin removing metadata overrides: %1")
+                     .arg(m_database.lastError().text()), error);
+        return false;
+    }
+    QSqlQuery remove(m_database);
+    remove.prepare(QStringLiteral(
+        "DELETE FROM metadata_overrides WHERE root_path=? AND mp3_rel_path=? AND updated_at=?"));
+    for (const MetadataOverride& row : rows) {
+        remove.bindValue(0, Catalogue::canonicalPath(row.rootPath));
+        remove.bindValue(1, Catalogue::normalizedPlaylistRelativePath(row.mp3RelPath));
+        remove.bindValue(2, row.updatedAt);
+        if (!remove.exec()) {
+            const QString message = queryError(remove, QStringLiteral("Could not remove metadata override"));
+            m_database.rollback();
+            setError(message, error);
+            return false;
+        }
+    }
+    if (m_database.commit())
+        return true;
+    const QString message = QStringLiteral("Could not commit removing metadata overrides: %1")
+                                .arg(m_database.lastError().text());
+    m_database.rollback();
+    setError(message, error);
+    return false;
+}
+
+bool MetadataOverrideStore::removeCopiesExactly(const QList<MetadataOverride>& copies,
+                                                QString* error)
+{
+    QSqlQuery remove(m_database);
+    remove.prepare(QStringLiteral(
+        "DELETE FROM metadata_overrides WHERE root_path=? AND mp3_rel_path=? AND updated_at=?"));
+    for (const MetadataOverride& copy : copies) {
+        remove.bindValue(0, Catalogue::canonicalPath(copy.rootPath));
+        remove.bindValue(1, Catalogue::normalizedPlaylistRelativePath(copy.mp3RelPath));
+        remove.bindValue(2, copy.updatedAt);
+        if (!remove.exec()) {
+            setError(queryError(remove, QStringLiteral("Could not remove an older copy")), error);
+            return false;
+        }
+        if (remove.numRowsAffected() != 1) {
+            setError(QStringLiteral("Could not remove an older copy: it changed or was removed"), error);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MetadataOverrideStore::setOverrideAndRemoveCopies(const MetadataOverride& value,
+                                                       const QList<MetadataOverride>& copies,
+                                                       QString* error)
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    if (copies.isEmpty())
+        return setOverride(value, error);
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("Could not begin saving metadata override: %1")
+                     .arg(m_database.lastError().text()), error);
+        return false;
+    }
+    if (!removeCopiesExactly(copies, error) || !setOverride(value, error)) {
+        m_database.rollback();
+        return false;
+    }
+    if (m_database.commit())
+        return true;
+    const QString message = QStringLiteral("Could not commit metadata override: %1")
+                                .arg(m_database.lastError().text());
+    m_database.rollback();
+    setError(message, error);
+    return false;
+}
+
+bool MetadataOverrideStore::clearOverrideAndCopies(const QString& rootPath,
+                                                   const QString& mp3RelPath,
+                                                   const QList<MetadataOverride>& copies,
+                                                   QString* error)
+{
+    if (!isOpen()) {
+        setError(QStringLiteral("Metadata override store is not open"), error);
+        return false;
+    }
+    if (!m_database.transaction()) {
+        setError(QStringLiteral("Could not begin clearing metadata override: %1")
+                     .arg(m_database.lastError().text()), error);
+        return false;
+    }
+    if (!removeCopiesExactly(copies, error) || !clearOverride(rootPath, mp3RelPath, error)) {
+        m_database.rollback();
+        return false;
+    }
+    if (m_database.commit())
+        return true;
+    const QString message = QStringLiteral("Could not commit clearing metadata override: %1")
+                                .arg(m_database.lastError().text());
+    m_database.rollback();
+    setError(message, error);
     return false;
 }
 

@@ -9,6 +9,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLoggingCategory>
@@ -1848,76 +1849,188 @@ bool Catalogue::clearManualOverride(qint64 songId, QString* error)
     return false;
 }
 
-bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
-                                     QString* error)
+qint64 Catalogue::movedActiveSongFor(const MetadataOverride& value, QString* error) const
 {
+    // The music folder moved: accept a unique relative-path match in the
+    // active folder only when its automatic disc/track (or, without a disc,
+    // title and artist) match the snapshot.
+    QString lookupError;
+    const qint64 candidate = findUniqueActiveSongByMp3Path(value.mp3RelPath, &lookupError);
+    if (!lookupError.isEmpty()) {
+        setError(lookupError, error);
+        return 0;
+    }
+    if (candidate == 0)
+        return 0;
+    QSqlQuery automatic(m_database);
+    automatic.prepare(QStringLiteral(
+        "SELECT COALESCE(auto_disc_id,''),COALESCE(auto_track,0),COALESCE(auto_title,''),"
+        "COALESCE(auto_artist,'') FROM songs WHERE id=?"));
+    automatic.addBindValue(candidate);
+    if (!automatic.exec()) {
+        setError(sqlError(automatic, QStringLiteral("Could not check a moved song")), error);
+        return 0;
+    }
+    if (!automatic.next())
+        return 0;
+    const bool matches = (!value.discId.trimmed().isEmpty() && value.track > 0
+                          && automatic.value(0).toString().compare(
+                                 value.discId, Qt::CaseInsensitive) == 0
+                          && automatic.value(1).toInt() == value.track)
+        || (value.discId.trimmed().isEmpty() && !value.autoTitle.trimmed().isEmpty()
+            && automatic.value(2).toString().compare(value.autoTitle,
+                                                     Qt::CaseInsensitive) == 0
+            && automatic.value(3).toString().compare(value.autoArtist,
+                                                     Qt::CaseInsensitive) == 0);
+    return matches ? candidate : 0;
+}
+
+QList<MetadataOverride> Catalogue::movedCopiesOf(qint64 songId,
+                                                 const QList<MetadataOverride>& stored,
+                                                 QString* error) const
+{
+    QList<MetadataOverride> copies;
+    QString lookupError;
+    const QString activePath = activeRoot(&lookupError).path;
+    if (!lookupError.isEmpty()) {
+        setError(lookupError, error);
+        return {};
+    }
+    if (activePath.isEmpty() || songId <= 0)
+        return copies;
+    const QString activeRootPath = canonicalPath(activePath);
+    for (const MetadataOverride& value : stored) {
+        if (!value.hasValues() || canonicalPath(value.rootPath) == activeRootPath)
+            continue;
+        const qint64 song = movedActiveSongFor(value, &lookupError);
+        if (!lookupError.isEmpty()) {
+            setError(lookupError, error);
+            return {};
+        }
+        if (song == songId)
+            copies.append(value);
+    }
+    return copies;
+}
+
+bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
+                                     QString* error,
+                                     const CopyOverride& copyToSong,
+                                     QList<MetadataOverride>* replaced)
+{
+    if (replaced)
+        replaced->clear();
     if (!m_database.transaction()) {
         setError(QStringLiteral("Could not begin metadata override sync: %1")
                      .arg(m_database.lastError().text()), error);
         return false;
     }
-    QSqlQuery manualSongs(m_database);
-    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ") + hasAnyTrustedSql())) {
+    auto fail = [&](const QString& message) {
         m_database.rollback();
-        setError(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")), error);
+        setError(message, error);
         return false;
-    }
+    };
+    QSqlQuery manualSongs(m_database);
+    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ") + hasAnyTrustedSql()))
+        return fail(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")));
     QList<qint64> changed;
     while (manualSongs.next())
         changed.append(manualSongs.value(0).toLongLong());
     QSqlQuery clear(m_database);
     if (!clear.exec(QStringLiteral("UPDATE songs SET ") + kClearTrusted + QStringLiteral(" WHERE ")
-                    + hasAnyTrustedSql())) {
-        m_database.rollback();
-        setError(sqlError(clear, QStringLiteral("Could not reset manual metadata")), error);
-        return false;
-    }
+                    + hasAnyTrustedSql()))
+        return fail(sqlError(clear, QStringLiteral("Could not reset manual metadata")));
 
+    QString lookupError;
+    const QString activePath = activeRoot(&lookupError).path;
+    if (!lookupError.isEmpty())
+        return fail(lookupError);
+    const QString activeRootPath = activePath.isEmpty() ? QString() : canonicalPath(activePath);
+
+    // Where each value belongs: the song at its own path, and (for a value
+    // saved in another folder than the active one) the same song in the
+    // active folder, where Frankie sees it.
+    struct Entry {
+        const MetadataOverride* value = nullptr;
+        qint64 ownSong = 0;
+        qint64 movedSong = 0;
+        MovedMetadataOverride move;
+    };
+    QList<Entry> entries;
+    QList<qint64> songOrder;
+    QHash<qint64, QList<qsizetype>> bySong;
     for (const MetadataOverride& value : overrides) {
         if (!value.hasValues())
             continue;
-        qint64 songId = findSongByMp3Path(value.rootPath, value.mp3RelPath, error);
-        if (error && !error->isEmpty()) {
-            m_database.rollback();
-            return false;
-        }
-        if (songId == 0) {
-            // The music folder moved: accept a unique relative-path match only
-            // when its automatic disc/track (or title) matches the snapshot.
-            const qint64 moved = findUniqueActiveSongByMp3Path(value.mp3RelPath, error);
-            if (error && !error->isEmpty()) {
-                m_database.rollback();
-                return false;
-            }
-            if (moved != 0) {
-                QSqlQuery automatic(m_database);
-                automatic.prepare(QStringLiteral(
-                    "SELECT COALESCE(auto_disc_id,''),COALESCE(auto_track,0),COALESCE(auto_title,'') "
-                    "FROM songs WHERE id=?"));
-                automatic.addBindValue(moved);
-                if (automatic.exec() && automatic.next()) {
-                    const bool matches = (!value.discId.trimmed().isEmpty() && value.track > 0
-                                          && automatic.value(0).toString().compare(
-                                                 value.discId, Qt::CaseInsensitive) == 0
-                                          && automatic.value(1).toInt() == value.track)
-                        || (value.discId.trimmed().isEmpty() && !value.autoTitle.trimmed().isEmpty()
-                            && automatic.value(2).toString().compare(value.autoTitle,
-                                                                     Qt::CaseInsensitive) == 0);
-                    if (matches)
-                        songId = moved;
+        Entry entry;
+        entry.value = &value;
+        entry.ownSong = findSongByMp3Path(value.rootPath, value.mp3RelPath, &lookupError);
+        if (lookupError.isEmpty() && !activeRootPath.isEmpty()
+            && canonicalPath(value.rootPath) != activeRootPath) {
+            const qint64 song = movedActiveSongFor(value, &lookupError);
+            if (song != 0 && song != entry.ownSong && lookupError.isEmpty()) {
+                const auto target = metadataOverrideSnapshot(song, &lookupError);
+                if (target) {
+                    entry.movedSong = song;
+                    entry.move = {value, target->rootPath, target->mp3RelPath};
                 }
             }
         }
-        if (songId == 0)
+        if (!lookupError.isEmpty())
+            return fail(lookupError);
+        const qint64 song = entry.movedSong != 0 ? entry.movedSong : entry.ownSong;
+        if (song == 0)
             continue;
+        if (!bySong.contains(song))
+            songOrder.append(song);
+        bySong[song].append(entries.size());
+        entries.append(entry);
+    }
+
+    QList<QPair<qint64, const MetadataOverride*>> applied;
+    QList<MetadataOverride> removable;
+    for (qint64 song : std::as_const(songOrder)) {
+        const QList<qsizetype>& group = bySong.value(song);
+        // One value per song: the last one saved at the song's own path, else
+        // the newest that moved here. The others are superseded.
+        qsizetype winner = -1;
+        for (qsizetype index : group) {
+            if (entries.at(index).movedSong == 0)
+                winner = index;
+        }
+        bool copied = winner >= 0;
+        if (winner < 0) {
+            for (qsizetype index : group) {
+                if (winner < 0 || entries.at(index).value->updatedAt
+                                      >= entries.at(winner).value->updatedAt)
+                    winner = index;
+            }
+            copied = !copyToSong || copyToSong(entries.at(winner).move);
+            if (copied)
+                removable.append(*entries.at(winner).value);
+        }
+        if (!copied) {
+            // The store row could not follow: every value stays with the
+            // song at its own path, as stored.
+            for (qsizetype index : group) {
+                if (entries.at(index).ownSong != 0)
+                    applied.append({entries.at(index).ownSong, entries.at(index).value});
+            }
+            continue;
+        }
+        applied.append({song, entries.at(winner).value});
+        for (qsizetype index : group) {
+            if (index != winner && entries.at(index).movedSong != 0)
+                removable.append(*entries.at(index).value);
+        }
+    }
+
+    for (const auto& [songId, value] : std::as_const(applied)) {
         QSqlQuery set(m_database);
         set.prepare(kSetTrusted);
-        bindTrusted(set, value, value.updatedAt, songId);
-        if (!set.exec()) {
-            m_database.rollback();
-            setError(sqlError(set, QStringLiteral("Could not apply metadata override")), error);
-            return false;
-        }
+        bindTrusted(set, *value, value->updatedAt, songId);
+        if (!set.exec())
+            return fail(sqlError(set, QStringLiteral("Could not apply metadata override")));
         if (!changed.contains(songId))
             changed.append(songId);
     }
@@ -1927,8 +2040,11 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
             return false;
         }
     }
-    if (m_database.commit())
+    if (m_database.commit()) {
+        if (replaced)
+            *replaced = std::move(removable);
         return true;
+    }
     setError(QStringLiteral("Could not commit metadata override sync: %1")
                  .arg(m_database.lastError().text()), error);
     return false;

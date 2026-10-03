@@ -40,6 +40,15 @@ struct MetadataOverride {
     }
 };
 
+// A stored value for a song that is now in the active music folder at
+// another path (the folder moved, e.g. a new drive letter): its store row
+// belongs at that song's identity from now on.
+struct MovedMetadataOverride {
+    MetadataOverride stored;
+    QString rootPath;
+    QString mp3RelPath;
+};
+
 class QMutex;
 
 class MetadataOverrideStore {
@@ -70,12 +79,31 @@ public:
     bool setOverride(const MetadataOverride& value, QString* error = nullptr);
     bool clearOverride(const QString& rootPath, const QString& mp3RelPath,
                        QString* error = nullptr);
+    // Copies a stored row to the song file it now belongs to, keeping every
+    // value and timestamp. Fails, changing nothing, if the row changed since
+    // it was read or a row is already stored for the new song file.
+    bool copyOverride(const MovedMetadataOverride& move, QString* error = nullptr);
+    // Removes rows (moved or replaced ones) in one transaction, each only if
+    // it is still exactly as it was read (same last change).
+    bool removeOverrides(const QList<MetadataOverride>& rows, QString* error = nullptr);
+    // Saves, or clears, a song's row and removes the older copies of it saved
+    // at another folder's path, in one transaction, so the song's row is the
+    // only one left. Every copy must still be exactly as it was read;
+    // otherwise, or on any error, nothing changes.
+    bool setOverrideAndRemoveCopies(const MetadataOverride& value,
+                                    const QList<MetadataOverride>& copies,
+                                    QString* error = nullptr);
+    bool clearOverrideAndCopies(const QString& rootPath, const QString& mp3RelPath,
+                                const QList<MetadataOverride>& copies,
+                                QString* error = nullptr);
     std::optional<MetadataOverride> overrideFor(
         const QString& rootPath, const QString& mp3RelPath,
         QString* error = nullptr) const;
     QList<MetadataOverride> all(QString* error = nullptr) const;
 
 private:
+    // Inside an open transaction: removes each copy, which must match exactly one row.
+    bool removeCopiesExactly(const QList<MetadataOverride>& copies, QString* error);
     bool ensureSchema(QString* error);
     bool execute(const QString& sql, QString* error = nullptr) const;
     bool recoverCorruptDatabase(const QString& detail, QString* error);

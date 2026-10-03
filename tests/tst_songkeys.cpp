@@ -12,6 +12,8 @@
 #include "MainWindow.h"
 #include "SongKeyAnalyser.h"
 #include "SongKeyPicker.h"
+#include "library/Catalogue.h"
+#include "library/MetadataOverrideStore.h"
 #include "library/SongKeys.h"
 #include "music/KeyDetector.h"
 #include "music/MusicalKey.h"
@@ -27,6 +29,7 @@
 #include <QPointer>
 #include <QHeaderView>
 #include <QLineEdit>
+#include <QMutexLocker>
 #include <QTreeView>
 #include <QPushButton>
 #include <QSet>
@@ -213,6 +216,16 @@ QList<SongKeyPicker*> openPickers()
     return pickers;
 }
 
+// Every row of a metadata override store, read on a connection of its own.
+QList<MetadataOverride> storedOverrides(const QString& path)
+{
+    MetadataOverrideStore store(path);
+    QString error;
+    if (!store.open(&error))
+        return {};
+    return store.all(&error);
+}
+
 LibraryController::SongKeyTimings quickTimings()
 {
     LibraryController::SongKeyTimings timings;
@@ -251,6 +264,10 @@ private slots:
     void manualOriginalKeyWinsAndSurvives();
     void manualOriginalKeyIsSeparateFromTranspose();
     void manualKeyAloneShowsTheKeyColumn();
+    void correctionsFollowAMovedMusicFolder();
+    void anOldFolderCopyNeverUndoesAClear();
+    void aCopyLeftByAFailedTidyUpNeverUndoesAClear();
+    void anEditBeforeTheSyncKeepsTheOtherValues();
     void setSongKeyPopupChoosesAndClears();
     void keyCellClickIsLikeTheRestOfTheRow();
     void setSongKeyFitsTheLibraryFooter();
@@ -1267,6 +1284,474 @@ void TestSongKeys::manualKeyAloneShowsTheKeyColumn()
     QTRY_VERIFY_WITH_TIMEOUT(results->isColumnHidden(LibraryResultsModel::KeyColumn), 5000);
     QCOMPARE(controller.songKeySummary()->manual, 0);
     QCOMPARE(results->model()->index(0, LibraryResultsModel::KeyColumn).data().toString(), QString());
+}
+
+void TestSongKeys::correctionsFollowAMovedMusicFolder()
+{
+    // The music folder moves (on Windows the USB drive gets another letter)
+    // and is chosen again in Settings > Library > Change...; the catalogue is
+    // kept, and the old folder's songs are still listed as present in it.
+    // Corrections made before the move show on the songs at the new folder,
+    // and editing or clearing them there sticks through rescans and restarts.
+    QTemporaryDir temporary;
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, rootA);
+    QVERIFY(!known.isEmpty());
+    QVERIFY(!writeManualKeyLibrary(m_fixtures, rootB).first.isEmpty());
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString catalogue = appDir + QStringLiteral("/library.sqlite");
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    const QString canonicalA = Catalogue::canonicalPath(rootA);
+    const QString canonicalB = Catalogue::canonicalPath(rootB);
+    const QMap<QString, QPair<qint64, qint64>> beforeA = snapshot(rootA);
+    const QMap<QString, QPair<qint64, qint64>> beforeB = snapshot(rootB);
+    auto storedAt = [&](const QString& root) {
+        QStringList where;
+        for (const MetadataOverride& value : storedOverrides(overrides)) {
+            if (value.rootPath == root)
+                where.append(value.mp3RelPath);
+        }
+        return where;
+    };
+    QString error;
+    QString automaticTitle;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songA = controller.findSongByMp3Path(rootA, known);
+        const qint64 otherA = controller.findSongByMp3Path(rootA, unknown);
+        QVERIFY(songA > 0 && otherA > 0);
+        automaticTitle = controller.songRef(songA)->title;
+        QVERIFY(!automaticTitle.isEmpty());
+
+        // Under folder A: an imported label, a name correction and a key on
+        // one song; just a key on the other.
+        MetadataOverride imported = controller.existingTrusted(songA);
+        imported.label = QStringLiteral("Sunfly");
+        imported.origin = QStringLiteral("import");
+        QVERIFY2(controller.setTrustedMetadata(songA, imported, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOverride(songA, QStringLiteral("Someone"), QStringLiteral("Something"), &error),
+                 qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songA, 0, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(otherA, 5, &error), qPrintable(error));
+        QCOMPARE(controller.songRef(songA)->title, QStringLiteral("Something"));
+        QCOMPARE(shownKey(controller, songA), QStringLiteral("C"));
+        QCOMPARE(storedAt(canonicalA), QStringList({known, unknown}));
+        const MetadataOverride beforeMove = storedOverrides(overrides).first();
+
+        // The same collection is chosen at folder B.
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        const qint64 otherB = controller.findSongByMp3Path(rootB, unknown);
+        QVERIFY(songB > 0 && otherB > 0 && songB != songA && otherB != otherA);
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(controller.songRef(songB)->artist, QStringLiteral("Someone"));
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, otherB), QStringLiteral("F"));
+        // The store rows moved to the songs' new identities, every value kept.
+        QCOMPARE(storedAt(canonicalA), QStringList());
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+        const MetadataOverride afterMove = storedOverrides(overrides).first();
+        QCOMPARE(afterMove.mp3RelPath, beforeMove.mp3RelPath);
+        QCOMPARE(afterMove.artist, beforeMove.artist);
+        QCOMPARE(afterMove.title, beforeMove.title);
+        QCOMPARE(afterMove.label, std::optional<QString>(QStringLiteral("Sunfly")));
+        QCOMPARE(afterMove.series, beforeMove.series);
+        QCOMPARE(afterMove.trustedDiscId, beforeMove.trustedDiscId);
+        QCOMPARE(afterMove.trustedTrack, beforeMove.trustedTrack);
+        QCOMPARE(afterMove.originalKey, std::optional<int>(0));
+        QCOMPARE(afterMove.origin, QStringLiteral("import"));
+        QCOMPARE(afterMove.createdAt, beforeMove.createdAt);
+        QCOMPARE(afterMove.updatedAt, beforeMove.updatedAt);
+        QCOMPARE(afterMove.autoTitle, beforeMove.autoTitle);
+        QCOMPARE(afterMove.discId, beforeMove.discId);
+        QCOMPARE(afterMove.track, beforeMove.track);
+        QCOMPARE(controller.existingTrusted(songB).title, std::optional<QString>(QStringLiteral("Something")));
+
+        // Edited at B: the key changes, everything else stays.
+        QVERIFY2(controller.setManualOriginalKey(songB, 21, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("Am"));
+        QCOMPARE(storedOverrides(overrides).size(), 2);
+        QCOMPARE(storedOverrides(overrides).first().originalKey, std::optional<int>(21));
+        QCOMPARE(storedOverrides(overrides).first().title, std::optional<QString>(QStringLiteral("Something")));
+        QCOMPARE(storedOverrides(overrides).first().createdAt, beforeMove.createdAt);
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("Am"));
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+
+        // Back to A and to B again: the corrections follow the folder in use.
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(shownKey(controller, songA), QStringLiteral("Am"));
+        QCOMPARE(controller.songRef(songA)->title, QStringLiteral("Something"));
+        QCOMPARE(storedAt(canonicalA), QStringList({known, unknown}));
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+
+        // Cleared at B: the name and both keys go back to automatic.
+        QVERIFY2(controller.clearManualOverride(songB, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songB, std::nullopt, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(otherB, std::nullopt, &error), qPrintable(error));
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+        // Only the imported label is left in the store.
+        QCOMPARE(storedAt(canonicalB), QStringList({known}));
+        QVERIFY(!storedOverrides(overrides).first().title);
+        QVERIFY(!storedOverrides(overrides).first().originalKey);
+        QCOMPARE(storedOverrides(overrides).first().label, std::optional<QString>(QStringLiteral("Sunfly")));
+
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+    }
+    // After restarting (with the start-up library check), nothing comes back.
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        controller.startConfiguredScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        const qint64 otherB = controller.findSongByMp3Path(rootB, unknown);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+        QCOMPARE(storedAt(canonicalB), QStringList({known}));
+        QCOMPARE(storedAt(canonicalA), QStringList());
+        QCOMPARE(rowCount(catalogue, QStringLiteral("SELECT count(*) FROM songs WHERE manual_title IS NOT NULL "
+                                                    "OR manual_artist IS NOT NULL OR manual_original_key IS NOT NULL")),
+                 0LL);
+    }
+    QCOMPARE(snapshot(rootA), beforeA);  // nothing written to either folder
+    QCOMPARE(snapshot(rootB), beforeB);
+}
+
+void TestSongKeys::anOldFolderCopyNeverUndoesAClear()
+{
+    // Before corrections followed a moved folder, a correction made at the
+    // old folder (A) stayed there, and the user may have entered it again at
+    // the new one (B). The song's own correction wins, the old copy is
+    // dropped, and clearing at B stays cleared.
+    QTemporaryDir temporary;
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, rootA);
+    QVERIFY(!known.isEmpty());
+    QVERIFY(!writeManualKeyLibrary(m_fixtures, rootB).first.isEmpty());
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString catalogue = appDir + QStringLiteral("/library.sqlite");
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    QString error;
+    QString automaticTitle;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songA = controller.findSongByMp3Path(rootA, known);
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        QVERIFY(songA > 0 && songB > 0 && songA != songB);
+        automaticTitle = controller.songRef(songB)->title;
+
+        // As builds before this fix left them: the old folder's row (saved
+        // later than B's, to show that age does not matter) and the song's
+        // own row at B, entered without the old one's values.
+        {
+            QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+            MetadataOverrideStore store(overrides);
+            QVERIFY2(store.open(&error), qPrintable(error));
+            const SongRef automatic = *controller.songRef(songA);
+            MetadataOverride old;
+            old.rootPath = rootA;
+            old.mp3RelPath = known;
+            old.discId = automatic.discId;
+            old.track = automatic.track;
+            old.autoTitle = automatic.title;
+            old.autoArtist = automatic.artist;
+            old.title = QStringLiteral("Old Name");
+            old.originalKey = 0;
+            old.updatedAt = QDateTime::currentMSecsSinceEpoch() + 60000;
+            QVERIFY2(store.setOverride(old, &error), qPrintable(error));
+            MetadataOverride own = old;
+            own.rootPath = rootB;
+            own.artist = QStringLiteral("Someone");
+            own.title = QStringLiteral("New Name");
+            own.originalKey.reset();
+            own.updatedAt = QDateTime::currentMSecsSinceEpoch();
+            QVERIFY2(store.setOverride(own, &error), qPrintable(error));
+        }
+        QCOMPARE(storedOverrides(overrides).size(), 2);
+
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("New Name"));
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(storedOverrides(overrides).size(), 1);
+        QCOMPARE(storedOverrides(overrides).first().rootPath, Catalogue::canonicalPath(rootB));
+
+        QVERIFY2(controller.clearManualOverride(songB, &error), qPrintable(error));
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QVERIFY(storedOverrides(overrides).isEmpty());
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+    }
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        controller.startConfiguredScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QVERIFY(storedOverrides(overrides).isEmpty());
+    }
+}
+
+void TestSongKeys::aCopyLeftByAFailedTidyUpNeverUndoesAClear()
+{
+    // The correction is copied to the new folder's song, but removing the
+    // old folder's row fails (forced here with a trigger in the test's own
+    // store). No change or clear at the new folder may be undone by that
+    // copy: not by a rescan, a restart, or choosing the old folder again.
+    QTemporaryDir temporary;
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, rootA);
+    QVERIFY(!known.isEmpty());
+    QVERIFY(!writeManualKeyLibrary(m_fixtures, rootB).first.isEmpty());
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString catalogue = appDir + QStringLiteral("/library.sqlite");
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    const QString canonicalA = Catalogue::canonicalPath(rootA);
+    const QString canonicalB = Catalogue::canonicalPath(rootB);
+    const QMap<QString, QPair<qint64, qint64>> beforeA = snapshot(rootA);
+    const QMap<QString, QPair<qint64, qint64>> beforeB = snapshot(rootB);
+    auto storedAt = [&](const QString& root) {
+        QStringList where;
+        for (const MetadataOverride& value : storedOverrides(overrides)) {
+            if (value.rootPath == root)
+                where.append(value.mp3RelPath);
+        }
+        return where;
+    };
+    auto onStore = [&](const QString& sql) {
+        const QString name = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        bool ok = false;
+        {
+            QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+            database.setDatabaseName(overrides);
+            if (database.open()) {
+                QSqlQuery query(database);
+                ok = query.exec(sql);
+            }
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(name);
+        return ok;
+    };
+    QString error;
+    QString automaticTitle;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songA = controller.findSongByMp3Path(rootA, known);
+        const qint64 otherA = controller.findSongByMp3Path(rootA, unknown);
+        automaticTitle = controller.songRef(songA)->title;
+        QVERIFY2(controller.setManualOverride(songA, QStringLiteral("Someone"), QStringLiteral("Something"), &error),
+                 qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songA, 0, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(otherA, 5, &error), qPrintable(error));
+
+        // Rows at folder A can no longer be removed.
+        QVERIFY(onStore(QStringLiteral(
+            "CREATE TRIGGER test_keep_old BEFORE DELETE ON metadata_overrides "
+            "WHEN old.root_path='%1' BEGIN SELECT RAISE(ABORT,'forced failure'); END")
+                            .arg(canonicalA)));
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        const qint64 otherB = controller.findSongByMp3Path(rootB, unknown);
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, otherB), QStringLiteral("F"));
+        // Copied to B, but the old rows are still there.
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+        QCOMPARE(storedAt(canonicalA), QStringList({known, unknown}));
+
+        // While the old copies cannot be removed, every change at B is
+        // refused and changes nothing (the old copies would otherwise come
+        // back, or win when A is chosen again).
+        QVERIFY(!controller.clearManualOverride(songB, &error));
+        QVERIFY(!controller.setManualOriginalKey(songB, std::nullopt, &error));
+        QVERIFY(!controller.setManualOriginalKey(songB, 7, &error));
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("C"));
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("C"));
+        // Choosing A again, the old rows are the same values: nothing is lost.
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songA)->title, QStringLiteral("Something"));
+        QCOMPARE(shownKey(controller, songA), QStringLiteral("C"));
+        QCOMPARE(storedAt(canonicalA), QStringList({known, unknown}));
+        QCOMPARE(storedAt(canonicalB), QStringList());
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(storedAt(canonicalA), QStringList({known, unknown}));
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+
+        // The failure passes, with the old copies still stored. A partial
+        // clear at B takes the song's old copy with it, so choosing A again
+        // keeps B's newer values: the name stays automatic, the key stays.
+        QVERIFY(onStore(QStringLiteral("DROP TRIGGER test_keep_old")));
+        QVERIFY2(controller.clearManualOverride(songB, &error), qPrintable(error));
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("C"));
+        QCOMPARE(storedAt(canonicalA), QStringList({unknown}));
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootA));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songA)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songA), QStringLiteral("C"));
+        QCOMPARE(shownKey(controller, otherA), QStringLiteral("F"));
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(storedAt(canonicalA), QStringList());
+        QCOMPARE(storedAt(canonicalB), QStringList({known, unknown}));
+
+        // Cleared at B for good.
+        QVERIFY2(controller.setManualOriginalKey(songB, std::nullopt, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(otherB, std::nullopt, &error), qPrintable(error));
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+        QVERIFY(storedOverrides(overrides).isEmpty());
+
+        finished.clear();
+        controller.requestRefreshScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+    }
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        controller.startConfiguredScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        const qint64 otherB = controller.findSongByMp3Path(rootB, unknown);
+        QCOMPARE(controller.songRef(songB)->title, automaticTitle);
+        QCOMPARE(shownKey(controller, songB), QString());
+        QCOMPARE(shownKey(controller, otherB), QString());
+        QVERIFY(storedOverrides(overrides).isEmpty());
+        QCOMPARE(rowCount(catalogue, QStringLiteral("SELECT count(*) FROM songs WHERE manual_title IS NOT NULL "
+                                                    "OR manual_artist IS NOT NULL OR manual_original_key IS NOT NULL")),
+                 0LL);
+    }
+    QCOMPARE(snapshot(rootA), beforeA);
+    QCOMPARE(snapshot(rootB), beforeB);
+}
+
+void TestSongKeys::anEditBeforeTheSyncKeepsTheOtherValues()
+{
+    // A folder already in the catalogue is chosen again: its songs show at
+    // once, before the library check moves their corrections over. A key set
+    // in that moment keeps the name and label saved at the other folder.
+    QTemporaryDir temporary;
+    const QString rootA = temporary.filePath(QStringLiteral("music-a"));
+    const QString rootB = temporary.filePath(QStringLiteral("music-b"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, rootA);
+    QVERIFY(!known.isEmpty());
+    QVERIFY(!writeManualKeyLibrary(m_fixtures, rootB).first.isEmpty());
+    const QString appDir = temporary.filePath(QStringLiteral("app"));
+    const QString catalogue = appDir + QStringLiteral("/library.sqlite");
+    const QString overrides = appDir + QStringLiteral("/metadata-overrides.sqlite");
+    QString error;
+    qint64 createdAt = 0;
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        for (const QString& root : {rootA, rootB, rootA}) {
+            finished.clear();
+            QVERIFY(controller.chooseRoot(root));
+            QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        }
+        const qint64 songA = controller.findSongByMp3Path(rootA, known);
+        MetadataOverride imported = controller.existingTrusted(songA);
+        imported.label = QStringLiteral("Sunfly");
+        imported.origin = QStringLiteral("import");
+        QVERIFY2(controller.setTrustedMetadata(songA, imported, &error), qPrintable(error));
+        QVERIFY2(controller.setManualOverride(songA, QStringLiteral("Someone"), QStringLiteral("Something"), &error),
+                 qPrintable(error));
+        QVERIFY2(controller.setManualOriginalKey(songA, 0, &error), qPrintable(error));
+        createdAt = storedOverrides(overrides).first().createdAt;
+
+        // Playback holds the library check before it reaches the sync.
+        controller.setPlaybackActive(true);
+        finished.clear();
+        QVERIFY(controller.chooseRoot(rootB));
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        QVERIFY(songB > 0);
+        QCOMPARE(storedOverrides(overrides).first().rootPath, Catalogue::canonicalPath(rootA));
+        QCOMPARE(controller.existingTrusted(songB).title, std::optional<QString>(QStringLiteral("Something")));
+        QVERIFY2(controller.setManualOriginalKey(songB, 21, &error), qPrintable(error));
+        QCOMPARE(finished.count(), 0);
+        controller.setPlaybackActive(false);
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("Am"));
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        const QList<MetadataOverride> stored = storedOverrides(overrides);
+        QCOMPARE(stored.size(), 1);
+        QCOMPARE(stored.first().rootPath, Catalogue::canonicalPath(rootB));
+        QCOMPARE(stored.first().title, std::optional<QString>(QStringLiteral("Something")));
+        QCOMPARE(stored.first().artist, std::optional<QString>(QStringLiteral("Someone")));
+        QCOMPARE(stored.first().label, std::optional<QString>(QStringLiteral("Sunfly")));
+        QCOMPARE(stored.first().origin, QStringLiteral("import"));
+        QCOMPARE(stored.first().originalKey, std::optional<int>(21));
+        QCOMPARE(stored.first().createdAt, createdAt);
+    }
+    {
+        LibraryController controller(catalogue, {}, overrides);
+        QSignalSpy finished(&controller, &LibraryController::scanFinished);
+        controller.startConfiguredScan();
+        QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+        const qint64 songB = controller.findSongByMp3Path(rootB, known);
+        QCOMPARE(shownKey(controller, songB), QStringLiteral("Am"));
+        QCOMPARE(controller.songRef(songB)->title, QStringLiteral("Something"));
+        QCOMPARE(storedOverrides(overrides).size(), 1);
+        QCOMPARE(storedOverrides(overrides).first().label, std::optional<QString>(QStringLiteral("Sunfly")));
+    }
 }
 
 void TestSongKeys::setSongKeyPopupChoosesAndClears()

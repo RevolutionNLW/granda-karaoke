@@ -144,7 +144,8 @@ public:
     // store first, so it survives catalogue rebuilds and every reprocess.
     bool setTrustedMetadata(qint64 songId, const MetadataOverride& values,
                             QString* error = nullptr);
-    // The song's current trusted values from the user-owned store (empty if none).
+    // The song's current trusted values from the user-owned store (empty if
+    // none): its own, or else those that will follow it from another folder.
     MetadataOverride existingTrusted(qint64 songId) const;
 
     // Background key analysis (see library/SongKeys.h). Off unless the user
@@ -214,6 +215,15 @@ private slots:
     void onFailed(const QString& message);
 
 private:
+    // setTrustedMetadata with MetadataOverrideStore::synchronisation() held,
+    // so a read of the existing values and the write are one step.
+    bool setTrustedMetadataLocked(qint64 songId, const MetadataOverride& values,
+                                  QString* error);
+    // Saves (value set) or removes the song's stored values, with the same
+    // lock held, and removes in the same step any older copies saved at
+    // another folder's path, which could otherwise follow the song again.
+    bool storeOverrideLocked(qint64 songId, const MetadataOverride& identity,
+                             const MetadataOverride* value, QString* error);
     void invalidateBrowseCache();
     void startReviewSummary();
     void finishReviewSummary(const std::optional<ReviewSummary>& summary, quint64 generation);

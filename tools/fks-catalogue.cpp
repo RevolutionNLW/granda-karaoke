@@ -186,8 +186,25 @@ int main(int argc, char* argv[])
             for (const CatalogueRoot& root : catalogue.roots(&error))
                 roots.append(root.path);
             MetadataOverrideStore store(overridesPath);
-            if (!error.isEmpty() || !store.open(&error, roots)
-                || !catalogue.applyManualOverrides(store.all(&error), &error)) {
+            const auto copyToSong = [&store](const MovedMetadataOverride& move) {
+                QString copyError;
+                if (store.copyOverride(move, &copyError))
+                    return true;
+                QTextStream(stderr) << copyError << '\n';
+                return false;
+            };
+            QList<MetadataOverride> overrides;
+            if (error.isEmpty() && store.open(&error, roots))
+                overrides = store.all(&error);
+            // As in a library scan: an empty store never erases the
+            // corrections the catalogue still holds.
+            if (error.isEmpty() && overrides.isEmpty() && catalogue.hasTrustedMirror(&error))
+                error = QStringLiteral("the override store is empty but the catalogue holds "
+                                       "corrections; keeping them");
+            QList<MetadataOverride> replaced;
+            if (!error.isEmpty()
+                || !catalogue.applyManualOverrides(overrides, &error, copyToSong, &replaced)
+                || !store.removeOverrides(replaced, &error)) {
                 QTextStream(stderr) << error << '\n';
                 return 1;
             }

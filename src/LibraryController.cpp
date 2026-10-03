@@ -841,10 +841,11 @@ bool LibraryController::setManualOverride(qint64 songId,
 {
     // A name edit changes only the name: trusted label, series, disc, track
     // and the origin of an import stay exactly as they are.
+    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     MetadataOverride values = existingTrusted(songId);
     values.artist = artist;
     values.title = title;
-    return setTrustedMetadata(songId, values, error);
+    return setTrustedMetadataLocked(songId, values, error);
 }
 
 MetadataOverride LibraryController::existingTrusted(qint64 songId) const
@@ -856,13 +857,32 @@ MetadataOverride LibraryController::existingTrusted(qint64 songId) const
     if (!key)
         return values;
     const auto stored = m_overrideStore->overrideFor(key->rootPath, key->mp3RelPath);
-    return stored ? *stored : values;
+    if (stored)
+        return *stored;
+    // The song's folder was chosen again and the next sync has not moved its
+    // values here yet: they are the newest copy that would follow it.
+    QString error;
+    const QList<MetadataOverride> copies =
+        m_catalogue.movedCopiesOf(songId, m_overrideStore->all(&error), &error);
+    if (!error.isEmpty())
+        return values;
+    for (const MetadataOverride& copy : copies) {
+        if (copy.updatedAt >= values.updatedAt)
+            values = copy;
+    }
+    return values;
 }
 
 bool LibraryController::setTrustedMetadata(qint64 songId, const MetadataOverride& values,
                                            QString* error)
 {
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+    return setTrustedMetadataLocked(songId, values, error);
+}
+
+bool LibraryController::setTrustedMetadataLocked(qint64 songId, const MetadataOverride& values,
+                                                 QString* error)
+{
     if (!m_overrideStore || !m_overrideStore->isOpen()) {
         if (error)
             *error = QStringLiteral("Metadata override store is unavailable");
@@ -879,8 +899,9 @@ bool LibraryController::setTrustedMetadata(qint64 songId, const MetadataOverride
     value->trustedTrack = values.trustedTrack;
     value->originalKey = values.originalKey;
     value->origin = values.origin;
+    value->createdAt = values.createdAt;  // kept by a row already stored
     value->updatedAt = QDateTime::currentMSecsSinceEpoch();
-    if (!m_overrideStore->setOverride(*value, error))
+    if (!storeOverrideLocked(songId, *value, &*value, error))
         return false;
     if (!m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, error))
         return false;
@@ -891,6 +912,7 @@ bool LibraryController::setTrustedMetadata(qint64 songId, const MetadataOverride
 
 bool LibraryController::clearManualOverride(qint64 songId, QString* error)
 {
+    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     if (!m_overrideStore || !m_overrideStore->isOpen()) {
         if (error)
             *error = QStringLiteral("Metadata override store is unavailable");
@@ -905,15 +927,34 @@ bool LibraryController::clearManualOverride(qint64 songId, QString* error)
     remaining.artist.reset();
     remaining.title.reset();
     if (remaining.hasValues())
-        return setTrustedMetadata(songId, remaining, error);
-    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
-    if (!m_overrideStore->clearOverride(value->rootPath, value->mp3RelPath, error))
+        return setTrustedMetadataLocked(songId, remaining, error);
+    if (!storeOverrideLocked(songId, *value, nullptr, error))
         return false;
     if (!m_catalogue.clearManualOverride(songId, error))
         return false;
     invalidateBrowseCache();
     emit catalogueChanged();
     return true;
+}
+
+bool LibraryController::storeOverrideLocked(qint64 songId, const MetadataOverride& identity,
+                                            const MetadataOverride* value, QString* error)
+{
+    // A copy left behind when a moved correction could not be tidied up
+    // would otherwise move onto the song again, or win over its newer
+    // values when its old folder is chosen again.
+    QString readError;
+    const QList<MetadataOverride> stored = m_overrideStore->all(&readError);
+    const QList<MetadataOverride> copies = readError.isEmpty()
+        ? m_catalogue.movedCopiesOf(songId, stored, &readError) : QList<MetadataOverride>();
+    if (!readError.isEmpty()) {
+        if (error)
+            *error = readError;
+        return false;
+    }
+    return value ? m_overrideStore->setOverrideAndRemoveCopies(*value, copies, error)
+                 : m_overrideStore->clearOverrideAndCopies(identity.rootPath, identity.mp3RelPath,
+                                                           copies, error);
 }
 
 void LibraryController::setPlaybackActive(bool active)
@@ -1217,10 +1258,10 @@ bool LibraryController::setManualOriginalKey(qint64 songId, std::optional<int> k
         value->originalKey = keyIndex;
         value->updatedAt = QDateTime::currentMSecsSinceEpoch();
         if (value->hasValues()) {
-            if (!m_overrideStore->setOverride(*value, error)
+            if (!storeOverrideLocked(songId, *value, &*value, error)
                 || !m_catalogue.setTrustedMetadata(songId, *value, value->updatedAt, error))
                 return false;
-        } else if (!m_overrideStore->clearOverride(value->rootPath, value->mp3RelPath, error)
+        } else if (!storeOverrideLocked(songId, *value, nullptr, error)
                    || !m_catalogue.clearManualOverride(songId, error)) {
             return false;
         }
