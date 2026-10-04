@@ -20,6 +20,7 @@
 #include <QLineEdit>
 #include <QPainter>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QStackedWidget>
 #include <QStyledItemDelegate>
 #include <QTimer>
@@ -522,6 +523,11 @@ void LibraryView::refreshSearch()
 {
     const qint64 keepSongId = selectedSongId();
     const QString text = m_searchBox->text().trimmed();
+    // A search typed or changed shows its best matches from the top; the
+    // same search refreshed (a scan, a correction) stays where it was.
+    const bool newSearch = !text.isEmpty() && text != m_shownQuery;
+    const bool sameSearch = text == m_shownQuery;
+    const int keptScroll = m_results->verticalScrollBar()->value();
     m_shownQuery = text;
     m_results->show();
     m_hintWanted = text.isEmpty();
@@ -551,6 +557,13 @@ void LibraryView::refreshSearch()
     const int keepRow = m_resultsModel->rowForSongId(keepSongId);
     m_results->setCurrentIndex(keepRow >= 0 ? m_resultsModel->index(keepRow, 0)
                                             : QModelIndex());
+    // After the selection, which scrolls to the kept song.
+    if (newSearch) {
+        m_results->scrollToTop();
+    } else if (sameSearch) {
+        m_results->doItemsLayout();  // the new rows' scroll range
+        m_results->verticalScrollBar()->setValue(keptScroll);
+    }
     updateSelectionActions();
 }
 

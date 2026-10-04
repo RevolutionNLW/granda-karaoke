@@ -20,6 +20,7 @@
 #include <QMimeData>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSignalSpy>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -93,6 +94,7 @@ private slots:
     void missingRootMessageAndStayOnLibrary();
     void protectedStorageInsideChosenRootIsRefused();
     void playbackPausesScannerAndShutdownCancels();
+    void searchShowsTheBestMatchesFromTheTop();
 };
 
 void TestLibraryView::initTestCase()
@@ -665,6 +667,108 @@ void TestLibraryView::playbackPausesScannerAndShutdownCancels()
     controller.reset();
     QVERIFY2(timer.elapsed() < 5000,
              qPrintable(QStringLiteral("Shutdown took %1 ms").arg(timer.elapsed())));
+}
+
+void TestLibraryView::searchShowsTheBestMatchesFromTheTop()
+{
+    // Scrolled far down the library, the user starts typing: the results
+    // show from the top (the best matches) after every change of the search,
+    // nothing is chosen or played for them, and clearing works as before.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    constexpr int kSongs = 300;
+    for (int i = 1; i <= kSongs; ++i)
+        writeSmallPair(root, i, QStringLiteral("Band"), QStringLiteral("Song Number %1").arg(i, 3, 10, QLatin1Char('0')));
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    LibraryView view(&controller);
+    view.resize(900, 500);
+    view.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    view.searchBox()->clear();
+    view.refreshSearch();
+    QCOMPARE(view.songResultCount(), kSongs);
+
+    QTreeView* results = view.resultsList();
+    QScrollBar* scroll = results->verticalScrollBar();
+    QSignalSpy sing(&view, &LibraryView::singRequested);
+    QSignalSpy activated(results, &QAbstractItemView::activated);
+    QSignalSpy doubleClicked(results, &QAbstractItemView::doubleClicked);
+    // Well down the library, a song chosen that the first search keeps
+    // (far down its results too).
+    const qint64 chosen = controller.search(QStringLiteral("S"), 200).value(150).songId;
+    QVERIFY(chosen != 0);
+    const auto rowOf = [&](qint64 songId) {
+        for (int row = 0; row < view.songResultCount(); ++row) {
+            if (results->model()->index(row, 0).data(LibraryResultsModel::SongIdRole).toLongLong() == songId)
+                return row;
+        }
+        return -1;
+    };
+    QVERIFY(rowOf(chosen) >= 0);
+    results->setCurrentIndex(results->model()->index(rowOf(chosen), 0));
+    results->scrollToBottom();
+    QCOMPARE(view.selectedSongId(), chosen);
+    QVERIFY(scroll->value() > 0);
+    const auto typed = [&](auto key, const char* what) {
+        scroll->setValue(scroll->maximum());  // wherever the view was
+        QVERIFY(scroll->value() > 0);
+        const QString before = view.searchBox()->text();
+        QTest::keyClick(view.searchBox(), key);
+        QVERIFY(view.searchBox()->text() != before);
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), 0, 3000);
+        QVERIFY2(view.songResultCount() > 0, what);
+        // The rows are the search's own, in its own order.
+        const QList<CatalogueSearchRow> expected = controller.search(view.searchBox()->text().trimmed(), 200);
+        QCOMPARE(results->model()->index(0, 0).data(Qt::DisplayRole).toString(), expected.first().displayTitle);
+        // Nothing is chosen for the user: the song chosen before, or none.
+        QVERIFY2(view.selectedSongId() == chosen || view.selectedSongId() == 0, what);
+    };
+    typed('S', "S");
+    QVERIFY(scroll->maximum() > 0);  // long enough to scroll
+    // The chosen song is kept (off screen), and a refresh of the same search
+    // (a scan, a correction) does not take the view back down to it.
+    QCOMPARE(view.selectedSongId(), chosen);
+    view.refreshSearch();
+    QCOMPARE(scroll->value(), 0);
+    QCOMPARE(view.selectedSongId(), chosen);
+    typed('o', "So");
+    typed('n', "Son");
+    typed('g', "Song");
+    typed(Qt::Key_Backspace, "Son (backspace)");
+    typed('g', "Song");
+    // A trailing space is not a new search (nothing is refreshed for it).
+    QTest::keyClick(view.searchBox(), Qt::Key_Space);
+    typed('N', "Song N");
+    typed('u', "Song Nu");
+    QTest::keyClick(view.searchBox(), 'm');
+    QTest::keyClick(view.searchBox(), 'b');
+    QTest::keyClick(view.searchBox(), 'e');
+    typed('r', "Song Number");
+    QTest::keyClick(view.searchBox(), Qt::Key_Space);
+    typed('2', "Song Number 2");
+    QCOMPARE(view.searchBox()->text(), QStringLiteral("Song Number 2"));
+
+    // The same search refreshed in the background keeps its place.
+    scroll->setValue(scroll->maximum() / 2);
+    const int place = scroll->value();
+    QVERIFY(place > 0);
+    view.refreshSearch();
+    QCOMPARE(scroll->value(), place);
+
+    // Nothing was played or opened.
+    QCOMPARE(sing.count(), 0);
+    QCOMPARE(activated.count(), 0);
+    QCOMPARE(doubleClicked.count(), 0);
+
+    // Cleared: the whole library again, as before.
+    QTest::keyClick(view.searchBox(), Qt::Key_Escape);
+    QVERIFY(view.searchBox()->text().isEmpty());
+    QCOMPARE(view.songResultCount(), kSongs);
+    QCOMPARE(sing.count(), 0);
 }
 
 QTEST_MAIN(TestLibraryView)
