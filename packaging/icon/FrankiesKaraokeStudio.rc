@@ -1,0 +1,3 @@
+// The application icon (Explorer, the taskbar, title bars and shortcuts).
+// Qt takes IDI_ICON1 as every window's icon. The .ico is made by make_icons.py.
+IDI_ICON1 ICON "FrankiesKaraokeStudio.ico"

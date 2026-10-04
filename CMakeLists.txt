@@ -183,13 +183,27 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
+# The application icon, made from the approved artwork by
+# packaging/icon/make_icons.py (Finder, the Dock; Explorer, the taskbar).
+if(APPLE)
+    set(FKS_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icon/FrankiesKaraokeStudio.icns")
+    target_sources(FrankiesKaraokeStudio PRIVATE "${FKS_APP_ICON}")
+    set_source_files_properties("${FKS_APP_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    set_target_properties(FrankiesKaraokeStudio PROPERTIES MACOSX_BUNDLE_ICON_FILE FrankiesKaraokeStudio.icns)
+elseif(WIN32)
+    enable_language(RC)
+    target_sources(FrankiesKaraokeStudio PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icon/FrankiesKaraokeStudio.rc")
+endif()
+
 # CI turns warnings into errors: the build must stay free of warnings.
 option(FKS_WARNINGS_AS_ERRORS "Treat compiler warnings in the program's own code as errors" OFF)
 foreach(_target fks_cdg fks_music fks_library fks_ocr fks_playlist fks-catalogue fks_core fks-song-keys FrankiesKaraokeStudio)
     if(MSVC)
-        target_compile_options(${_target} PRIVATE /W4 /utf-8 /permissive-)
+        # C++ only: the icon's resource script is compiled by rc.exe.
+        target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/utf-8;/permissive->")
         if(FKS_WARNINGS_AS_ERRORS)
-            target_compile_options(${_target} PRIVATE /WX)
+            target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/WX>")
         endif()
     else()
         target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
