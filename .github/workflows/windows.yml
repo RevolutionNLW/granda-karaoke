@@ -141,7 +141,8 @@ jobs:
           $missing = @()
           foreach ($e in 'playbin','decodebin','uridecodebin','filesrc','typefind','id3demux','mpegaudioparse',
                          'mpg123audiodec','audioconvert','audioresample','capsfilter','scaletempo','pitch',
-                         'volume','audiotestsrc','autoaudiosink','wasapi2sink','fakesink','lamemp3enc','filesink','id3v2mux') {
+                         'volume','audiotestsrc','autoaudiosink','wasapi2sink','fakesink','lamemp3enc','filesink','id3v2mux',
+                         'wavparse') {
             & "$env:GSTREAMER_ROOT\bin\gst-inspect-1.0.exe" --exists $e
             if ($LASTEXITCODE -ne 0) { $missing += $e }
           }

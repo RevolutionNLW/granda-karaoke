@@ -2,6 +2,8 @@
 
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
+#include "SongKeyPicker.h"
+#include "library/SongKeys.h"
 #include "ui/Controls.h"
 #include "ui/ElidedLabel.h"
 #include "ui/Theme.h"
@@ -18,6 +20,7 @@
 #include <QLineEdit>
 #include <QPainter>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QStackedWidget>
 #include <QStyledItemDelegate>
 #include <QTimer>
@@ -90,7 +93,7 @@ public:
         }
         const int column = index.column();
         const bool secondary = column == Model::LabelColumn || column == Model::DiscColumn
-            || column == Model::PlaysColumn;
+            || column == Model::PlaysColumn || column == Model::KeyColumn;
         painter->setPen(strong ? theme::color::selectionText
                                : secondary ? theme::color::secondaryText : theme::color::text);
         QFont font = option.font;
@@ -205,6 +208,10 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         m_resultsModel->setPlayCountProvider([controller](qint64 songId) {
             return controller->playStats(songId).playCount;
         });
+        m_resultsModel->setKeyProvider([controller](qint64 songId) {
+            const std::optional<SongKeyInfo> key = controller->songKey(songId);
+            return key ? songKeyName(key->shownKeyIndex()) : QString();
+        });
     }
     m_results->setModel(m_resultsModel);
     m_results->setObjectName(QStringLiteral("libraryResults"));
@@ -232,6 +239,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     columns->setSectionResizeMode(LibraryResultsModel::ArtistColumn, QHeaderView::Stretch);
     columns->setSectionResizeMode(LibraryResultsModel::SongColumn, QHeaderView::Stretch);
     columns->setSectionResizeMode(LibraryResultsModel::LabelColumn, QHeaderView::Fixed);
+    columns->setSectionResizeMode(LibraryResultsModel::KeyColumn, QHeaderView::Fixed);
     columns->setSectionResizeMode(LibraryResultsModel::DiscColumn, QHeaderView::Fixed);
     columns->setSectionResizeMode(LibraryResultsModel::PlaysColumn, QHeaderView::Fixed);
     // Artist first, as people look for songs by singer.
@@ -249,20 +257,30 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
     m_messageLabel = new QLabel(m_searchPage);
     m_messageLabel->setWordWrap(true);
     m_messageLabel->setStyleSheet(theme::dangerStyle());
+    // Takes the room left in the footer; never asks for any (the buttons do).
+    m_messageLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
     m_addToPlaylistButton = makeLibraryButton(QStringLiteral("Add to Playlist"), m_searchPage);
     m_addToPlaylistButton->setEnabled(false);
     m_singButton = makeLibraryButton(QStringLiteral("Sing This Song"), m_searchPage);
     m_singButton->setEnabled(false);
-    for (QPushButton* button : {m_addToPlaylistButton, m_singButton})
+    // The song's original key, chosen by hand. A button of its own: the Key
+    // cell is only ever shown, so every part of a row behaves the same.
+    m_setKeyButton = makeLibraryButton(QStringLiteral("Set Song Key"), m_searchPage);
+    m_setKeyButton->setEnabled(false);
+    m_setKeyButton->setToolTip(QStringLiteral("Choose the key the selected song's backing track is recorded in"));
+    for (QPushButton* button : {m_setKeyButton, m_addToPlaylistButton, m_singButton})
         button->setObjectName(QStringLiteral("ghostButton"));
     auto* footer = new QFrame(m_searchPage);
     footer->setObjectName(QStringLiteral("paneFooter"));
+    m_footer = footer;
+    footer->installEventFilter(this);
     auto* actions = new QHBoxLayout(footer);
     actions->setContentsMargins(16, 8, 12, 8);
     actions->setSpacing(8);
     actions->addWidget(m_hintLabel);
     actions->addWidget(m_messageLabel, 1);
+    actions->addWidget(m_setKeyButton);
     actions->addWidget(m_addToPlaylistButton);
     actions->addWidget(m_singButton);
 
@@ -309,12 +327,17 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         m_searchBox->setFocus(Qt::OtherFocusReason);
     });
     connect(m_results->selectionModel(), &QItemSelectionModel::currentChanged,
-            this, [this] { updateSelectionActions(); });
+            this, [this] {
+                updateSelectionActions();
+                if (selectedSongId() != m_keyErrorSongId)
+                    clearKeyError();  // it was about another song
+            });
     connect(m_results, &QAbstractItemView::doubleClicked, this,
             [this](const QModelIndex&) { singSelected(); });
     connect(m_chooseFolderButton, &QPushButton::clicked, this, &LibraryView::chooseFolder);
-    for (QPushButton* button : {m_singButton, m_addToPlaylistButton})
+    for (QPushButton* button : {m_singButton, m_addToPlaylistButton, m_setKeyButton})
         connect(button, &QPushButton::pressed, this, &LibraryView::interacted);
+    connect(m_setKeyButton, &QPushButton::clicked, this, [this] { openSongKeyPicker(); });
     connect(m_sortBox, &QComboBox::activated, this, &LibraryView::interacted);
     connect(m_singButton, &QPushButton::clicked, this, &LibraryView::singSelected);
     connect(m_addToPlaylistButton, &QPushButton::clicked, this, [this] {
@@ -327,6 +350,8 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                 this, &LibraryView::updateState);
         connect(m_controller, &LibraryController::playStatsChanged,
                 m_resultsModel, &LibraryResultsModel::forgetPlayCount);
+        connect(m_controller, &LibraryController::songKeysChanged,
+                m_resultsModel, &LibraryResultsModel::forgetKeys);
         connect(m_controller, &LibraryController::catalogueChanged,
                 this, &LibraryView::refreshSearch);
         connect(m_controller, &LibraryController::libraryReady,
@@ -350,11 +375,42 @@ void LibraryView::applyColumnWidths()
     columns->resizeSection(LibraryResultsModel::LabelColumn, share(18, 100, 180));
     columns->resizeSection(LibraryResultsModel::DiscColumn, share(15, 106, 140));
     columns->resizeSection(LibraryResultsModel::PlaysColumn, theme::px(64));
+    // Room for the widest key ("G#m", "Bbm") and the caption. The Key column
+    // gives way when Artist and Song would be left narrower than Label (a
+    // small screen at a large interface size); the player bar still shows
+    // the key of the song being sung.
+    const int keyWidth = theme::px(52);
+    columns->resizeSection(LibraryResultsModel::KeyColumn, keyWidth);
+    int fixed = keyWidth;
+    for (const int column : {int(LibraryResultsModel::LabelColumn), int(LibraryResultsModel::DiscColumn),
+                             int(LibraryResultsModel::PlaysColumn)}) {
+        if (!m_results->isColumnHidden(column))
+            fixed += columns->sectionSize(column);
+    }
+    const int label = m_results->isColumnHidden(LibraryResultsModel::LabelColumn)
+        ? 0 : columns->sectionSize(LibraryResultsModel::LabelColumn);
+    const bool room = (width - fixed) / 2 >= label;
+    m_results->setColumnHidden(LibraryResultsModel::KeyColumn,
+                               !(m_keyColumnWanted && m_keyColumnAvailable && room));
+}
+
+void LibraryView::setKeyColumnAvailable(bool available)
+{
+    if (available == m_keyColumnAvailable)
+        return;
+    m_keyColumnAvailable = available;
+    applyColumnWidths();
 }
 
 void LibraryView::setColumnVisible(int column, bool visible)
 {
+    if (column == LibraryResultsModel::KeyColumn) {
+        m_keyColumnWanted = visible;
+        applyColumnWidths();
+        return;
+    }
     m_results->setColumnHidden(column, !visible);
+    applyColumnWidths();
 }
 
 void LibraryView::setActive(bool active)
@@ -391,6 +447,22 @@ void LibraryView::showMessage(const QString& message)
 {
     m_messageLabel->setText(message);
     m_searchBox->setFocus(Qt::OtherFocusReason);
+}
+
+void LibraryView::showKeyError(qint64 songId, const QString& message)
+{
+    m_keyError = message;
+    m_keyErrorSongId = songId;
+    showMessage(message);
+}
+
+void LibraryView::clearKeyError()
+{
+    // Only the key's own message: another one shown since stays.
+    if (!m_keyError.isEmpty() && m_messageLabel->text() == m_keyError)
+        m_messageLabel->clear();
+    m_keyError.clear();
+    m_keyErrorSongId = 0;
 }
 
 int LibraryView::songResultCount() const
@@ -451,9 +523,15 @@ void LibraryView::refreshSearch()
 {
     const qint64 keepSongId = selectedSongId();
     const QString text = m_searchBox->text().trimmed();
+    // A search typed or changed shows its best matches from the top; the
+    // same search refreshed (a scan, a correction) stays where it was.
+    const bool newSearch = !text.isEmpty() && text != m_shownQuery;
+    const bool sameSearch = text == m_shownQuery;
+    const int keptScroll = m_results->verticalScrollBar()->value();
     m_shownQuery = text;
     m_results->show();
-    m_hintLabel->setVisible(text.isEmpty());
+    m_hintWanted = text.isEmpty();
+    updateHint();
     if (!m_controller || !m_controller->hasActiveRoot()) {
         m_resultsModel->setRows({});
         updateSelectionActions();
@@ -479,11 +557,42 @@ void LibraryView::refreshSearch()
     const int keepRow = m_resultsModel->rowForSongId(keepSongId);
     m_results->setCurrentIndex(keepRow >= 0 ? m_resultsModel->index(keepRow, 0)
                                             : QModelIndex());
+    // After the selection, which scrolls to the kept song.
+    if (newSearch) {
+        m_results->scrollToTop();
+    } else if (sameSearch) {
+        m_results->doItemsLayout();  // the new rows' scroll range
+        m_results->verticalScrollBar()->setValue(keptScroll);
+    }
     updateSelectionActions();
+}
+
+void LibraryView::updateHint()
+{
+    // The hint shortens itself as the footer narrows; when only a few letters
+    // would be left (a small window at a large interface size) it steps
+    // aside, so the buttons always have their full width.
+    if (!m_footer) {
+        m_hintLabel->setVisible(m_hintWanted);
+        return;
+    }
+    int room = m_footer->contentsRect().width();
+    if (const QLayout* layout = m_footer->layout()) {
+        const QMargins margins = layout->contentsMargins();
+        room -= margins.left() + margins.right();
+        for (QPushButton* button : {m_setKeyButton, m_addToPlaylistButton, m_singButton}) {
+            if (!button->isHidden())
+                room -= button->sizeHint().width() + layout->spacing();
+        }
+        room -= layout->spacing();  // between the hint and the message
+    }
+    m_hintLabel->setVisible(m_hintWanted && room >= theme::px(48));
 }
 
 bool LibraryView::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_footer && (event->type() == QEvent::Resize || event->type() == QEvent::LayoutRequest))
+        updateHint();
     if (watched == m_results->viewport() && event->type() == QEvent::Resize)
         applyColumnWidths();
     if (watched == m_results->viewport() && event->type() == QEvent::MouseButtonPress
@@ -543,4 +652,31 @@ void LibraryView::updateSelectionActions()
     const bool song = selectedSongId() != 0;
     m_singButton->setEnabled(song);
     m_addToPlaylistButton->setEnabled(song && m_playlistAvailable);
+    m_setKeyButton->setEnabled(song && m_controller);
+}
+
+SongKeyPicker* LibraryView::openSongKeyPicker()
+{
+    const qint64 songId = selectedSongId();
+    if (songId == 0 || !m_controller)
+        return nullptr;
+    const QModelIndex row = m_results->currentIndex().siblingAtColumn(0);
+    const QString artist = row.data(LibraryResultsModel::ArtistRole).toString().trimmed();
+    const QString title = row.data(Qt::DisplayRole).toString().trimmed();
+    const QString song = artist.isEmpty() ? title : artist + QStringLiteral(" \u2013 ") + title;
+    const std::optional<SongKeyInfo> key = m_controller->songKeyDetails(songId);
+    clearKeyError();  // trying again
+    auto* picker = new SongKeyPicker(song, key ? key->manualKeyIndex : -1,
+                                     key ? key->detectedKeyIndex() : -1, this);
+    const auto save = [this, songId](std::optional<int> keyIndex) {
+        QString error;
+        if (m_controller->setManualOriginalKey(songId, keyIndex, &error))
+            clearKeyError();
+        else
+            showKeyError(songId, QStringLiteral("The song key could not be saved. %1").arg(error));
+    };
+    connect(picker, &SongKeyPicker::keyChosen, this, [save](int keyIndex) { save(keyIndex); });
+    connect(picker, &SongKeyPicker::clearRequested, this, [save] { save(std::nullopt); });
+    picker->popUpAt(m_setKeyButton);
+    return picker;
 }

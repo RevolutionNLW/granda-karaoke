@@ -30,6 +30,16 @@ add_library(fks_cdg STATIC
 )
 target_include_directories(fks_cdg PUBLIC src)
 
+# Musical keys and key detection from decoded audio: plain C++ with no Qt or
+# GStreamer dependency, so it can be tested in isolation.
+add_library(fks_music STATIC
+    src/music/KeyDetector.cpp
+    src/music/KeyDetector.h
+    src/music/MusicalKey.cpp
+    src/music/MusicalKey.h
+)
+target_include_directories(fks_music PUBLIC src)
+
 # Read-only song-library parsing primitives.  This target deliberately has no
 # UI or media-playback dependency so the parsers remain independently testable.
 add_library(fks_library STATIC
@@ -57,13 +67,17 @@ add_library(fks_library STATIC
     src/library/MetadataOverrideStore.h
     src/library/SidecarParser.cpp
     src/library/SidecarParser.h
+    src/library/SongKeys.cpp
+    src/library/SongKeys.h
     src/library/TitleScreenText.cpp
     src/library/TitleScreenText.h
+    src/library/WritePriority.cpp
+    src/library/WritePriority.h
     src/library/ZipDirectory.cpp
     src/library/ZipDirectory.h
 )
 target_include_directories(fks_library PUBLIC src)
-target_link_libraries(fks_library PUBLIC fks_cdg Qt6::Core Qt6::Sql)
+target_link_libraries(fks_library PUBLIC fks_cdg fks_music Qt6::Core Qt6::Sql)
 
 # Local title-screen OCR (Apple Vision on macOS). Platform code is isolated
 # here; other platforms build a stub that reports no engine.
@@ -114,6 +128,10 @@ add_library(fks_core STATIC
     src/Logging.h
     src/SongPair.cpp
     src/SongPair.h
+    src/SongKeyAnalyser.cpp
+    src/SongKeyAnalyser.h
+    src/SongKeyPicker.cpp
+    src/SongKeyPicker.h
     src/SongSettings.cpp
     src/SongSettings.h
     src/KaraokePlayer.cpp
@@ -152,6 +170,10 @@ if(APPLE)
     target_link_libraries(fks_core PRIVATE "-framework IOKit" "-framework CoreFoundation")
 endif()
 
+# Checks the key detector on real songs, read in place (see README).
+add_executable(fks-song-keys tools/fks-song-keys.cpp)
+target_link_libraries(fks-song-keys PRIVATE fks_core)
+
 add_executable(FrankiesKaraokeStudio MACOSX_BUNDLE WIN32 src/main.cpp)
 target_link_libraries(FrankiesKaraokeStudio PRIVATE fks_core)
 target_compile_definitions(FrankiesKaraokeStudio PRIVATE FKS_VERSION="${PROJECT_VERSION}")
@@ -161,13 +183,27 @@ set_target_properties(FrankiesKaraokeStudio PROPERTIES
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 )
 
+# The application icon, made from the approved artwork by
+# packaging/icon/make_icons.py (Finder, the Dock; Explorer, the taskbar).
+if(APPLE)
+    set(FKS_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icon/FrankiesKaraokeStudio.icns")
+    target_sources(FrankiesKaraokeStudio PRIVATE "${FKS_APP_ICON}")
+    set_source_files_properties("${FKS_APP_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    set_target_properties(FrankiesKaraokeStudio PROPERTIES MACOSX_BUNDLE_ICON_FILE FrankiesKaraokeStudio.icns)
+elseif(WIN32)
+    enable_language(RC)
+    target_sources(FrankiesKaraokeStudio PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icon/FrankiesKaraokeStudio.rc")
+endif()
+
 # CI turns warnings into errors: the build must stay free of warnings.
 option(FKS_WARNINGS_AS_ERRORS "Treat compiler warnings in the program's own code as errors" OFF)
-foreach(_target fks_cdg fks_library fks_ocr fks_playlist fks-catalogue fks_core FrankiesKaraokeStudio)
+foreach(_target fks_cdg fks_music fks_library fks_ocr fks_playlist fks-catalogue fks_core fks-song-keys FrankiesKaraokeStudio)
     if(MSVC)
-        target_compile_options(${_target} PRIVATE /W4 /utf-8 /permissive-)
+        # C++ only: the icon's resource script is compiled by rc.exe.
+        target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/utf-8;/permissive->")
         if(FKS_WARNINGS_AS_ERRORS)
-            target_compile_options(${_target} PRIVATE /WX)
+            target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/WX>")
         endif()
     else()
         target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)

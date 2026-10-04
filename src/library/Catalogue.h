@@ -4,11 +4,13 @@
 #include "library/MetadataOverrideStore.h"
 #include "library/UserStateStore.h"
 
+#include <QHash>
 #include <QList>
 #include <QSqlDatabase>
 #include <QString>
 #include <QVariantMap>
 
+#include <functional>
 #include <optional>
 
 struct CatalogueRoot {
@@ -76,6 +78,39 @@ struct ReviewSummary {
     qint64 unresolved = 0;
     qint64 conflicts = 0;
     qint64 manual = 0;
+};
+
+// A song's original key: the one chosen by hand, if any, and the one worked
+// out from its audio (see library/SongKeys.h). Both are keys of the backing
+// track itself, never the Key +/- transpose.
+struct SongKeyInfo {
+    // From the audio (empty status: not analysed yet).
+    QString status;      // "confident", "uncertain", "silent", "too_short", "not_audio"
+    int keyIndex = -1;   // 0-23 (music::MusicalKey::index), -1 for none
+    double confidence = 0.0;
+    // Chosen by the user (trusted metadata), -1 for none. Always wins.
+    int manualKeyIndex = -1;
+
+    bool isManual() const { return manualKeyIndex >= 0; }
+    // A detected key is shown only when confident.
+    int detectedKeyIndex() const
+    {
+        return status == QLatin1String("confident") && keyIndex >= 0 ? keyIndex : -1;
+    }
+    // The key to show: the user's, else a confident detected one, else none.
+    int shownKeyIndex() const { return isManual() ? manualKeyIndex : detectedKeyIndex(); }
+    bool shown() const { return shownKeyIndex() >= 0; }
+};
+
+// How far key analysis has got in the active music folder: MP3s of playable
+// songs, those analysed by the current version, and those with a shown key.
+struct SongKeySummary {
+    qint64 total = 0;
+    qint64 analysed = 0;
+    qint64 confident = 0;
+    qint64 manual = 0;  // songs with an original key chosen by hand
+
+    qint64 remaining() const { return total > analysed ? total - analysed : 0; }
 };
 
 struct PlaybackPaths {
@@ -161,8 +196,24 @@ public:
     QVariantMap compareMetadata(const QString& baselinePath, int exampleLimit = 10,
                                 QString* error = nullptr) const;
 
+    // Mirrors the trusted values into the catalogue. A value stored for a
+    // song in another folder than the active one goes to the same song in the
+    // active folder when it is found there safely: `copyToSong` first copies
+    // its store row to that song's identity (if it returns false the value
+    // stays with the song at its old path). One value per song: the song's
+    // own wins, else the newest moved one. After a successful sync,
+    // `replaced` lists the store rows that have been copied or superseded,
+    // for removal.
+    using CopyOverride = std::function<bool(const MovedMetadataOverride&)>;
     bool applyManualOverrides(const QList<MetadataOverride>& overrides,
-                              QString* error = nullptr);
+                              QString* error = nullptr,
+                              const CopyOverride& copyToSong = {},
+                              QList<MetadataOverride>* replaced = nullptr);
+    // Stored values saved at another folder's path that would follow this
+    // song (in the active folder) on the next sync: older copies of its
+    // correction, to be removed with it when it is cleared.
+    QList<MetadataOverride> movedCopiesOf(qint64 songId, const QList<MetadataOverride>& stored,
+                                          QString* error = nullptr) const;
     bool setManualOverride(qint64 songId, const std::optional<QString>& artist,
                            const std::optional<QString>& title,
                            qint64 updatedAt = 0, QString* error = nullptr);
@@ -172,7 +223,8 @@ public:
                             qint64 updatedAt = 0, QString* error = nullptr);
     bool clearManualOverride(qint64 songId, QString* error = nullptr);
     // The trusted values mirrored in the catalogue, with their song-file keys,
-    // used to re-seed a lost or damaged override store.
+    // used to re-seed a lost or damaged override store. All of them, or on
+    // any error (including a value without a song-file key) none.
     QList<MetadataOverride> trustedMirror(QString* error = nullptr) const;
     bool hasTrustedMirror(QString* error = nullptr) const;
     std::optional<MetadataOverride> metadataOverrideSnapshot(
@@ -193,6 +245,16 @@ public:
     // raw file/folder/tag data and the evidence behind the automatic result.
     QVariantMap reviewDetail(qint64 songId, QString* error = nullptr) const;
     bool hasSongs(QString* error = nullptr) const;
+    // The key of the MP3 the song would play (its preferred source first),
+    // if one has been worked out.
+    std::optional<SongKeyInfo> songKey(qint64 songId, QString* error = nullptr) const;
+    // songKey() for many songs at once (a few queries, not one per song);
+    // songs with nothing known are left out.
+    QHash<qint64, SongKeyInfo> songKeys(const QList<qint64>& songIds, QString* error = nullptr) const;
+    // Key-analysis progress of a catalogue file, on a read-only connection
+    // of its own: safe to call on a worker thread.
+    static std::optional<SongKeySummary> readSongKeySummary(const QString& databasePath,
+                                                            QString* error = nullptr);
 
     QByteArray computeSha256(qint64 fileId, QString* error = nullptr);
     bool mergeLooseDuplicates(qint64 firstSourceId, qint64 secondSourceId,
@@ -220,6 +282,13 @@ private:
     friend class MetadataResolver;
 
     static QString playlistSongLookupSql();
+    // The one song in the active folder at this value's path, if its
+    // automatic disc/track (or title) shows it is the same song; else 0.
+    qint64 movedActiveSongFor(const MetadataOverride& value, QString* error) const;
+    // The MP3s key analysis covers (see SongKeySummary), counted on any
+    // connection that has the enrichment cache attached as "enrich".
+    static std::optional<SongKeySummary> songKeySummaryOn(const QSqlDatabase& database,
+                                                          QString* error);
 
     bool ensureSchema(QString* error);
     bool backupBeforeV5Migration(int currentVersion, bool existedNonEmpty,

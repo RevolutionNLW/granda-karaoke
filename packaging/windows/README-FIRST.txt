@@ -208,7 +208,10 @@ PART F - FIRST TIME WITH THE REAL DRIVE (15 minutes plus the scan)
         30 minutes or more. You can search while it works.
 [ ] F4  Play 3 to 5 songs Frankie knows well: sound, lyrics, Key, Tempo.
 [ ] F5  Unplug and reconnect, only when no song is playing and the scan
-        has finished: in File Explorer right-click the drive > Eject, then
+        has finished. If "Work out song keys in the background" is turned
+        on (Settings > Metadata), turn it OFF first: Windows may refuse to
+        eject the drive while a song is being read for its key.
+        Then in File Explorer right-click the drive > Eject, then
         unplug. The status line says "Music drive not connected".
         Plug it back in: within a few seconds the library is connected
         again and songs play. (If Windows gives the drive a different

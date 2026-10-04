@@ -12,7 +12,6 @@
 #include "library/KnownLibraryRoots.h"
 #include "platform/SingleInstance.h"
 #include "playlist/PlaylistStore.h"
-#include "ui/Controls.h"
 #include "ui/Splash.h"
 #include "ui/Theme.h"
 
@@ -36,7 +35,8 @@ int main(int argc, char* argv[])
     QApplication::setApplicationDisplayName(QStringLiteral("Frankie's Karaoke Studio"));
     QApplication::setApplicationVersion(QStringLiteral(FKS_VERSION));
     theme::apply(app);
-    QApplication::setWindowIcon(ui::glyphIcon(ui::Glyph::App, theme::color::accent));
+    // The window icon is the application's own (the bundle's .icns on macOS,
+    // the executable's icon resource on Windows).
 
     // Everything the program writes lives in its own folder (see AppStorage).
     // Nothing is written anywhere until it is certain that folder is not

@@ -2,12 +2,14 @@
 
 #include "library/FilenameParser.h"
 #include "library/MetadataResolver.h"
+#include "library/SongKeys.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLoggingCategory>
@@ -21,6 +23,7 @@
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 
+#include <algorithm>
 #include <string>
 #endif
 
@@ -624,6 +627,13 @@ QString Catalogue::prepareEnrichmentCache(const QString& path)
                        "frames_json TEXT,created_at INTEGER NOT NULL,"
                        "PRIMARY KEY(cdg_quick_sha256,cdg_size,engine))"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS enrich.idx_title_screens_size ON title_screens(cdg_size)"),
+        // Song keys worked out from the audio, keyed by the MP3's audio
+        // content (mp3AudioDigest: tags excluded), so a moved, renamed or
+        // retagged copy shares the result. version is the analysis version
+        // (kSongKeyAnalysisVersion); older rows are redone in the background.
+        QStringLiteral("CREATE TABLE IF NOT EXISTS enrich.song_keys(mp3_audio_sha256 BLOB PRIMARY KEY,"
+                       "version INTEGER NOT NULL,status TEXT NOT NULL,key_index INTEGER,"
+                       "confidence REAL,detail_json TEXT,analysed_at INTEGER NOT NULL)"),
         QStringLiteral("PRAGMA enrich.user_version=1"),
     };
     for (const QString& statement : statements) {
@@ -692,12 +702,26 @@ void Catalogue::attachEnrichmentCache(const QStringList& libraryRoots)
 
 bool Catalogue::ensureCurrentTables(QString* error)
 {
-    // Additive tables of schema 5: created in place (no data is changed), so a
-    // catalogue already at version 5 gains them without another migration.
-    return execute(QStringLiteral(
-               "CREATE TABLE IF NOT EXISTS song_plays(song_id INTEGER PRIMARY KEY "
-               "REFERENCES songs(id) ON DELETE CASCADE,play_count INTEGER NOT NULL DEFAULT 0,"
-               "last_played_ms INTEGER)"), error);
+    // Additive tables and columns of schema 5: created in place (no data is
+    // changed), so a catalogue already at version 5 gains them without another
+    // migration, and older programs simply do not use them.
+    if (!execute(QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS song_plays(song_id INTEGER PRIMARY KEY "
+            "REFERENCES songs(id) ON DELETE CASCADE,play_count INTEGER NOT NULL DEFAULT 0,"
+            "last_played_ms INTEGER)"), error))
+        return false;
+    // The user's original key for a song, mirrored from the trusted store.
+    QSqlQuery columns(m_database);
+    if (!columns.exec(QStringLiteral("PRAGMA table_info(songs)"))) {
+        setError(sqlError(columns, QStringLiteral("Could not inspect songs")), error);
+        return false;
+    }
+    bool hasOriginalKey = false;
+    while (columns.next())
+        hasOriginalKey = hasOriginalKey || columns.value(1).toString() == QLatin1String("manual_original_key");
+    columns.finish();
+    return hasOriginalKey
+        || execute(QStringLiteral("ALTER TABLE songs ADD COLUMN manual_original_key INTEGER"), error);
 }
 
 bool Catalogue::backupBeforeV5Migration(int currentVersion, bool existedNonEmpty,
@@ -1212,6 +1236,14 @@ qint64 Catalogue::findSongByMp3Path(const QString& rootPath, const QString& relP
         }
         while (query.next())
             matches.insert(query.value(0).toLongLong());
+        if (query.lastError().isValid()) {
+            setError(sqlError(query, QStringLiteral("Song path lookup failed")), error);
+            return 0;
+        }
+    }
+    if (rootQuery.lastError().isValid()) {
+        setError(sqlError(rootQuery, QStringLiteral("Song root lookup failed")), error);
+        return 0;
     }
     return matches.size() == 1 ? *matches.constBegin() : 0;
 }
@@ -1242,6 +1274,14 @@ qint64 Catalogue::findUniqueActiveSongByMp3Path(const QString& relPath,
         }
         while (query.next())
             matches.insert(query.value(0).toLongLong());
+        if (query.lastError().isValid()) {
+            setError(sqlError(query, QStringLiteral("Active song path lookup failed")), error);
+            return 0;
+        }
+    }
+    if (rootQuery.lastError().isValid()) {
+        setError(sqlError(rootQuery, QStringLiteral("Active song root lookup failed")), error);
+        return 0;
     }
     return matches.size() == 1 ? *matches.constBegin() : 0;
 }
@@ -1698,7 +1738,9 @@ std::optional<MetadataOverride> Catalogue::metadataOverrideSnapshot(
         return std::nullopt;
     }
     if (!query.next()) {
-        setError(QStringLiteral("Song has no durable loose-file identity"), error);
+        setError(query.lastError().isValid()
+                     ? sqlError(query, QStringLiteral("Could not snapshot song metadata"))
+                     : QStringLiteral("Song has no durable loose-file identity"), error);
         return std::nullopt;
     }
     MetadataOverride result;
@@ -1726,7 +1768,8 @@ QVariant optionalValue(const std::optional<int>& value)
 
 const QString kSetTrusted = QStringLiteral(
     "UPDATE songs SET manual_artist=?,manual_title=?,manual_label=?,manual_series=?,"
-    "manual_disc_id=?,manual_track=?,manual_origin=?,manual_updated_at=? WHERE id=?");
+    "manual_disc_id=?,manual_track=?,manual_original_key=?,manual_origin=?,manual_updated_at=? "
+    "WHERE id=?");
 
 void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updatedAt, qint64 songId)
 {
@@ -1736,6 +1779,7 @@ void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updated
     query.addBindValue(optionalValue(value.series));
     query.addBindValue(optionalValue(value.trustedDiscId));
     query.addBindValue(optionalValue(value.trustedTrack));
+    query.addBindValue(optionalValue(value.originalKey));
     query.addBindValue(value.origin.isEmpty() ? QStringLiteral("manual") : value.origin);
     query.addBindValue(updatedAt > 0 ? updatedAt : QDateTime::currentMSecsSinceEpoch());
     query.addBindValue(songId);
@@ -1743,7 +1787,18 @@ void bindTrusted(QSqlQuery& query, const MetadataOverride& value, qint64 updated
 
 const QString kClearTrusted = QStringLiteral(
     "manual_artist=NULL,manual_title=NULL,manual_label=NULL,manual_series=NULL,"
-    "manual_disc_id=NULL,manual_track=NULL,manual_origin=NULL,manual_updated_at=NULL");
+    "manual_disc_id=NULL,manual_track=NULL,manual_original_key=NULL,manual_origin=NULL,"
+    "manual_updated_at=NULL");
+
+// Any trusted value at all: the names and details the resolver uses
+// (MetadataResolver::hasTrustedSql, which alone counts as a name correction)
+// or the user's original key, which leaves the names automatic.
+QString hasAnyTrustedSql(const QString& alias = {})
+{
+    const QString p = alias.isEmpty() ? QString() : alias + QLatin1Char('.');
+    return QStringLiteral("(%1 OR %2manual_original_key IS NOT NULL)")
+        .arg(MetadataResolver::hasTrustedSql(alias), p);
+}
 
 } // namespace
 
@@ -1763,6 +1818,16 @@ bool Catalogue::setTrustedMetadata(qint64 songId, const MetadataOverride& value,
 {
     if (!value.hasValues()) {
         setError(QStringLiteral("A metadata override must set at least one value"), error);
+        return false;
+    }
+    // Only what the override store accepts too, so the mirror can always
+    // restore it.
+    if (value.originalKey && (*value.originalKey < 0 || *value.originalKey > 23)) {
+        setError(QStringLiteral("Not a song key: %1").arg(*value.originalKey), error);
+        return false;
+    }
+    if (value.origin != QLatin1String("manual") && value.origin != QLatin1String("import")) {
+        setError(QStringLiteral("Unknown metadata origin: %1").arg(value.origin), error);
         return false;
     }
     if (!m_database.transaction()) {
@@ -1813,77 +1878,190 @@ bool Catalogue::clearManualOverride(qint64 songId, QString* error)
     return false;
 }
 
-bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
-                                     QString* error)
+qint64 Catalogue::movedActiveSongFor(const MetadataOverride& value, QString* error) const
 {
+    // The music folder moved: accept a unique relative-path match in the
+    // active folder only when its automatic disc/track (or, without a disc,
+    // title and artist) match the snapshot.
+    QString lookupError;
+    const qint64 candidate = findUniqueActiveSongByMp3Path(value.mp3RelPath, &lookupError);
+    if (!lookupError.isEmpty()) {
+        setError(lookupError, error);
+        return 0;
+    }
+    if (candidate == 0)
+        return 0;
+    QSqlQuery automatic(m_database);
+    automatic.prepare(QStringLiteral(
+        "SELECT COALESCE(auto_disc_id,''),COALESCE(auto_track,0),COALESCE(auto_title,''),"
+        "COALESCE(auto_artist,'') FROM songs WHERE id=?"));
+    automatic.addBindValue(candidate);
+    if (!automatic.exec()) {
+        setError(sqlError(automatic, QStringLiteral("Could not check a moved song")), error);
+        return 0;
+    }
+    if (!automatic.next())
+        return 0;
+    const bool matches = (!value.discId.trimmed().isEmpty() && value.track > 0
+                          && automatic.value(0).toString().compare(
+                                 value.discId, Qt::CaseInsensitive) == 0
+                          && automatic.value(1).toInt() == value.track)
+        || (value.discId.trimmed().isEmpty() && !value.autoTitle.trimmed().isEmpty()
+            && automatic.value(2).toString().compare(value.autoTitle,
+                                                     Qt::CaseInsensitive) == 0
+            && automatic.value(3).toString().compare(value.autoArtist,
+                                                     Qt::CaseInsensitive) == 0);
+    return matches ? candidate : 0;
+}
+
+QList<MetadataOverride> Catalogue::movedCopiesOf(qint64 songId,
+                                                 const QList<MetadataOverride>& stored,
+                                                 QString* error) const
+{
+    QList<MetadataOverride> copies;
+    QString lookupError;
+    const QString activePath = activeRoot(&lookupError).path;
+    if (!lookupError.isEmpty()) {
+        setError(lookupError, error);
+        return {};
+    }
+    if (activePath.isEmpty() || songId <= 0)
+        return copies;
+    const QString activeRootPath = canonicalPath(activePath);
+    for (const MetadataOverride& value : stored) {
+        if (!value.hasValues() || canonicalPath(value.rootPath) == activeRootPath)
+            continue;
+        const qint64 song = movedActiveSongFor(value, &lookupError);
+        if (!lookupError.isEmpty()) {
+            setError(lookupError, error);
+            return {};
+        }
+        if (song == songId)
+            copies.append(value);
+    }
+    return copies;
+}
+
+bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
+                                     QString* error,
+                                     const CopyOverride& copyToSong,
+                                     QList<MetadataOverride>* replaced)
+{
+    if (replaced)
+        replaced->clear();
     if (!m_database.transaction()) {
         setError(QStringLiteral("Could not begin metadata override sync: %1")
                      .arg(m_database.lastError().text()), error);
         return false;
     }
-    QSqlQuery manualSongs(m_database);
-    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ")
-                          + MetadataResolver::hasTrustedSql())) {
+    auto fail = [&](const QString& message) {
         m_database.rollback();
-        setError(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")), error);
+        setError(message, error);
         return false;
-    }
+    };
+    QSqlQuery manualSongs(m_database);
+    if (!manualSongs.exec(QStringLiteral("SELECT id FROM songs WHERE ") + hasAnyTrustedSql()))
+        return fail(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")));
     QList<qint64> changed;
     while (manualSongs.next())
         changed.append(manualSongs.value(0).toLongLong());
+    if (manualSongs.lastError().isValid())
+        return fail(sqlError(manualSongs, QStringLiteral("Could not inspect manual metadata")));
     QSqlQuery clear(m_database);
     if (!clear.exec(QStringLiteral("UPDATE songs SET ") + kClearTrusted + QStringLiteral(" WHERE ")
-                    + MetadataResolver::hasTrustedSql())) {
-        m_database.rollback();
-        setError(sqlError(clear, QStringLiteral("Could not reset manual metadata")), error);
-        return false;
-    }
+                    + hasAnyTrustedSql()))
+        return fail(sqlError(clear, QStringLiteral("Could not reset manual metadata")));
 
+    QString lookupError;
+    const QString activePath = activeRoot(&lookupError).path;
+    if (!lookupError.isEmpty())
+        return fail(lookupError);
+    const QString activeRootPath = activePath.isEmpty() ? QString() : canonicalPath(activePath);
+
+    // Where each value belongs: the song at its own path, and (for a value
+    // saved in another folder than the active one) the same song in the
+    // active folder, where Frankie sees it.
+    struct Entry {
+        const MetadataOverride* value = nullptr;
+        qint64 ownSong = 0;
+        qint64 movedSong = 0;
+        MovedMetadataOverride move;
+    };
+    QList<Entry> entries;
+    QList<qint64> songOrder;
+    QHash<qint64, QList<qsizetype>> bySong;
     for (const MetadataOverride& value : overrides) {
         if (!value.hasValues())
             continue;
-        qint64 songId = findSongByMp3Path(value.rootPath, value.mp3RelPath, error);
-        if (error && !error->isEmpty()) {
-            m_database.rollback();
-            return false;
-        }
-        if (songId == 0) {
-            // The music folder moved: accept a unique relative-path match only
-            // when its automatic disc/track (or title) matches the snapshot.
-            const qint64 moved = findUniqueActiveSongByMp3Path(value.mp3RelPath, error);
-            if (error && !error->isEmpty()) {
-                m_database.rollback();
-                return false;
-            }
-            if (moved != 0) {
-                QSqlQuery automatic(m_database);
-                automatic.prepare(QStringLiteral(
-                    "SELECT COALESCE(auto_disc_id,''),COALESCE(auto_track,0),COALESCE(auto_title,'') "
-                    "FROM songs WHERE id=?"));
-                automatic.addBindValue(moved);
-                if (automatic.exec() && automatic.next()) {
-                    const bool matches = (!value.discId.trimmed().isEmpty() && value.track > 0
-                                          && automatic.value(0).toString().compare(
-                                                 value.discId, Qt::CaseInsensitive) == 0
-                                          && automatic.value(1).toInt() == value.track)
-                        || (value.discId.trimmed().isEmpty() && !value.autoTitle.trimmed().isEmpty()
-                            && automatic.value(2).toString().compare(value.autoTitle,
-                                                                     Qt::CaseInsensitive) == 0);
-                    if (matches)
-                        songId = moved;
+        Entry entry;
+        entry.value = &value;
+        entry.ownSong = findSongByMp3Path(value.rootPath, value.mp3RelPath, &lookupError);
+        if (lookupError.isEmpty() && !activeRootPath.isEmpty()
+            && canonicalPath(value.rootPath) != activeRootPath) {
+            const qint64 song = movedActiveSongFor(value, &lookupError);
+            if (song != 0 && song != entry.ownSong && lookupError.isEmpty()) {
+                const auto target = metadataOverrideSnapshot(song, &lookupError);
+                if (target) {
+                    entry.movedSong = song;
+                    entry.move = {value, target->rootPath, target->mp3RelPath};
                 }
             }
         }
-        if (songId == 0)
+        if (!lookupError.isEmpty())
+            return fail(lookupError);
+        const qint64 song = entry.movedSong != 0 ? entry.movedSong : entry.ownSong;
+        if (song == 0)
             continue;
+        if (!bySong.contains(song))
+            songOrder.append(song);
+        bySong[song].append(entries.size());
+        entries.append(entry);
+    }
+
+    QList<QPair<qint64, const MetadataOverride*>> applied;
+    QList<MetadataOverride> removable;
+    for (qint64 song : std::as_const(songOrder)) {
+        const QList<qsizetype>& group = bySong.value(song);
+        // One value per song: the last one saved at the song's own path, else
+        // the newest that moved here. The others are superseded.
+        qsizetype winner = -1;
+        for (qsizetype index : group) {
+            if (entries.at(index).movedSong == 0)
+                winner = index;
+        }
+        bool copied = winner >= 0;
+        if (winner < 0) {
+            for (qsizetype index : group) {
+                if (winner < 0 || entries.at(index).value->updatedAt
+                                      >= entries.at(winner).value->updatedAt)
+                    winner = index;
+            }
+            copied = !copyToSong || copyToSong(entries.at(winner).move);
+            if (copied)
+                removable.append(*entries.at(winner).value);
+        }
+        if (!copied) {
+            // The store row could not follow: every value stays with the
+            // song at its own path, as stored.
+            for (qsizetype index : group) {
+                if (entries.at(index).ownSong != 0)
+                    applied.append({entries.at(index).ownSong, entries.at(index).value});
+            }
+            continue;
+        }
+        applied.append({song, entries.at(winner).value});
+        for (qsizetype index : group) {
+            if (index != winner && entries.at(index).movedSong != 0)
+                removable.append(*entries.at(index).value);
+        }
+    }
+
+    for (const auto& [songId, value] : std::as_const(applied)) {
         QSqlQuery set(m_database);
         set.prepare(kSetTrusted);
-        bindTrusted(set, value, value.updatedAt, songId);
-        if (!set.exec()) {
-            m_database.rollback();
-            setError(sqlError(set, QStringLiteral("Could not apply metadata override")), error);
-            return false;
-        }
+        bindTrusted(set, *value, value->updatedAt, songId);
+        if (!set.exec())
+            return fail(sqlError(set, QStringLiteral("Could not apply metadata override")));
         if (!changed.contains(songId))
             changed.append(songId);
     }
@@ -1893,8 +2071,11 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
             return false;
         }
     }
-    if (m_database.commit())
+    if (m_database.commit()) {
+        if (replaced)
+            *replaced = std::move(removable);
         return true;
+    }
     setError(QStringLiteral("Could not commit metadata override sync: %1")
                  .arg(m_database.lastError().text()), error);
     return false;
@@ -2206,6 +2387,181 @@ std::optional<ReviewSummary> Catalogue::readReviewSummary(const QString& databas
     return result;
 }
 
+namespace {
+
+// The copy of a song that would play (as activePlaybackPathsFor chooses it),
+// and only its own key: never another recording's. %1 picks the songs; the
+// first row of each song is its copy.
+const char* const kSongKeySql =
+    "SELECT so.id,k.status,k.key_index,k.confidence,so.manual_original_key FROM songs so "
+    "JOIN sources s ON s.song_id=so.id AND s.kind='loose_cdg' "
+    "JOIN library_roots r ON r.id=s.root_id "
+    "JOIN files mf ON mf.id=s.mp3_file_id JOIN files gf ON gf.id=s.graphics_file_id "
+    "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=mf.content_sha256 "
+    "WHERE %1 AND mf.present=1 AND gf.present=1 AND r.active=1 "
+    "AND (s.playable=1 OR s.unplayable_reason='root_offline') "
+    "ORDER BY so.id,CASE WHEN s.id=so.best_source_id THEN 0 ELSE 1 END,s.id";
+
+// The key of the row the query is on, if anything is known.
+std::optional<SongKeyInfo> songKeyOf(const QSqlQuery& query)
+{
+    if (query.value(1).isNull() && query.value(4).isNull())
+        return std::nullopt;
+    SongKeyInfo info;
+    info.status = query.value(1).toString();
+    info.keyIndex = query.value(2).isNull() ? -1 : query.value(2).toInt();
+    info.confidence = query.value(3).toDouble();
+    info.manualKeyIndex = query.value(4).isNull() ? -1 : query.value(4).toInt();
+    return info;
+}
+
+} // namespace
+
+QHash<qint64, SongKeyInfo> Catalogue::songKeys(const QList<qint64>& songIds, QString* error) const
+{
+    QHash<qint64, SongKeyInfo> keys;
+    for (qsizetype first = 0; first < songIds.size(); first += 500) {
+        QStringList ids;
+        for (qsizetype i = first; i < std::min(songIds.size(), first + 500); ++i)
+            ids.append(QString::number(songIds.at(i)));
+        QSqlQuery query(m_database);
+        if (!query.exec(QString::fromLatin1(kSongKeySql)
+                            .arg(QStringLiteral("so.id IN (%1)").arg(ids.join(QLatin1Char(',')))))) {
+            setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
+            return {};
+        }
+        qint64 previous = 0;
+        while (query.next()) {
+            const qint64 songId = query.value(0).toLongLong();
+            if (songId == previous)
+                continue;  // not the copy that would play
+            previous = songId;
+            if (const std::optional<SongKeyInfo> key = songKeyOf(query))
+                keys.insert(songId, *key);
+        }
+    }
+    return keys;
+}
+
+std::optional<SongKeyInfo> Catalogue::songKey(qint64 songId, QString* error) const
+{
+    QSqlQuery query(m_database);
+    query.prepare(QString::fromLatin1(kSongKeySql).arg(QStringLiteral("so.id=?"))
+                  + QStringLiteral(" LIMIT 1"));
+    query.addBindValue(songId);
+    if (!query.exec()) {
+        setError(sqlError(query, QStringLiteral("Song key lookup failed")), error);
+        return std::nullopt;
+    }
+    if (!query.next())
+        return std::nullopt;
+    return songKeyOf(query);
+}
+
+namespace {
+
+// Playable songs of the active music folder given an original key by hand
+// (they show a key whatever analysis has found). 0 where the catalogue
+// predates the column.
+qint64 manualKeyCount(const QSqlDatabase& database)
+{
+    QSqlQuery query(database);
+    return query.exec(QStringLiteral(
+               "SELECT count(DISTINCT so.id) FROM songs so JOIN sources s ON s.song_id=so.id "
+               "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+               "WHERE so.manual_original_key IS NOT NULL AND s.kind='loose_cdg' AND s.playable=1"))
+            && query.next()
+        ? query.value(0).toLongLong()
+        : 0;
+}
+
+} // namespace
+
+std::optional<SongKeySummary> Catalogue::songKeySummaryOn(const QSqlDatabase& database,
+                                                          QString* error)
+{
+    QSqlQuery query(database);
+    query.prepare(QStringLiteral(
+        "SELECT count(*),"
+        "sum(CASE WHEN k.version>=? THEN 1 ELSE 0 END),"
+        "sum(CASE WHEN k.status='confident' THEN 1 ELSE 0 END) FROM "
+        "(SELECT DISTINCT m.id AS file_id,m.content_sha256 AS digest FROM sources s "
+        "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+        "JOIN files m ON m.id=s.mp3_file_id "
+        "WHERE s.kind='loose_cdg' AND s.playable=1 AND m.present=1) t "
+        "LEFT JOIN enrich.song_keys k ON k.mp3_audio_sha256=t.digest"));
+    query.addBindValue(kSongKeyAnalysisVersion);
+    if (!query.exec() || !query.next()) {
+        if (error)
+            *error = query.lastError().text();
+        return std::nullopt;
+    }
+    SongKeySummary summary;
+    summary.total = query.value(0).toLongLong();
+    summary.analysed = query.value(1).toLongLong();
+    summary.confident = query.value(2).toLongLong();
+    summary.manual = manualKeyCount(database);
+    return summary;
+}
+
+std::optional<SongKeySummary> Catalogue::readSongKeySummary(const QString& databasePath,
+                                                            QString* error)
+{
+    const QString name = QStringLiteral("fks-song-key-summary-%1")
+                             .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    std::optional<SongKeySummary> result;
+    {
+        QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        database.setDatabaseName(databasePath);
+        database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=5000"));
+        if (!database.open()) {
+            if (error)
+                *error = database.lastError().text();
+        } else {
+            // Attached read-only like the connection itself. Without a cache
+            // file nothing has been analysed yet.
+            const QString cachePath = QFileInfo(databasePath).dir().filePath(
+                QStringLiteral("enrichment-cache.sqlite"));
+            QSqlQuery attach(database);
+            attach.prepare(QStringLiteral("ATTACH DATABASE ? AS enrich"));
+            attach.addBindValue(cachePath);
+            bool countOnly = !QFileInfo::exists(cachePath);
+            if (!countOnly && !attach.exec()) {
+                // Never counted as "nothing analysed": the caller keeps the
+                // progress it last knew.
+                if (error) {
+                    *error = QStringLiteral("could not read the key cache %1: %2")
+                                 .arg(cachePath, attach.lastError().text());
+                }
+            } else if (!countOnly) {
+                result = songKeySummaryOn(database, error);
+                if (!result && error && error->contains(QLatin1String("no such table"))) {
+                    error->clear();
+                    countOnly = true;  // a cache with no keys in it yet
+                }
+            }
+            if (countOnly) {
+                QSqlQuery count(database);
+                count.prepare(QStringLiteral(
+                    "SELECT count(DISTINCT m.id) FROM sources s "
+                    "JOIN library_roots r ON r.id=s.root_id AND r.active=1 "
+                    "JOIN files m ON m.id=s.mp3_file_id "
+                    "WHERE s.kind='loose_cdg' AND s.playable=1 AND m.present=1"));
+                if (count.exec() && count.next()) {
+                    result = SongKeySummary{};
+                    result->total = count.value(0).toLongLong();
+                    result->manual = manualKeyCount(database);
+                } else if (error) {
+                    *error = count.lastError().text();
+                }
+            }
+            database.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(name);
+    return result;
+}
+
 QVariantMap Catalogue::reviewDetail(qint64 songId, QString* error) const
 {
     QVariantMap result;
@@ -2264,15 +2620,21 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
     if (!query.exec(QStringLiteral(
             "SELECT so.id,so.manual_artist,so.manual_title,so.manual_label,so.manual_series,"
             "so.manual_disc_id,so.manual_track,COALESCE(so.manual_origin,'manual'),"
-            "COALESCE(so.manual_updated_at,0) FROM songs so WHERE ")
-            + MetadataResolver::hasTrustedSql(QStringLiteral("so")))) {
+            "COALESCE(so.manual_updated_at,0),so.manual_original_key FROM songs so WHERE ")
+            + hasAnyTrustedSql(QStringLiteral("so")))) {
         setError(sqlError(query, QStringLiteral("Could not read trusted metadata")), error);
         return result;
     }
     while (query.next()) {
-        auto value = metadataOverrideSnapshot(query.value(0).toLongLong(), nullptr);
-        if (!value)
-            continue;
+        // Every value or none: the store is rebuilt from this list, and a
+        // value left out of it would then be erased by the next sync.
+        QString snapshotError;
+        auto value = metadataOverrideSnapshot(query.value(0).toLongLong(), &snapshotError);
+        if (!value) {
+            setError(QStringLiteral("Could not read the trusted metadata of song %1: %2")
+                         .arg(query.value(0).toLongLong()).arg(snapshotError), error);
+            return {};
+        }
         auto text = [&](int column) {
             return query.value(column).isNull() ? std::nullopt
                                                 : std::optional<QString>(query.value(column).toString());
@@ -2286,7 +2648,13 @@ QList<MetadataOverride> Catalogue::trustedMirror(QString* error) const
                                                       : std::optional<int>(query.value(6).toInt());
         value->origin = query.value(7).toString();
         value->updatedAt = query.value(8).toLongLong();
+        value->originalKey = query.value(9).isNull() ? std::nullopt
+                                                     : std::optional<int>(query.value(9).toInt());
         result.append(*value);
+    }
+    if (query.lastError().isValid()) {
+        setError(sqlError(query, QStringLiteral("Could not read trusted metadata")), error);
+        return {};
     }
     return result;
 }
@@ -2295,7 +2663,7 @@ bool Catalogue::hasTrustedMirror(QString* error) const
 {
     QSqlQuery query(m_database);
     if (!query.exec(QStringLiteral("SELECT EXISTS(SELECT 1 FROM songs WHERE ")
-                    + MetadataResolver::hasTrustedSql() + QStringLiteral(")"))
+                    + hasAnyTrustedSql() + QStringLiteral(")"))
         || !query.next()) {
         setError(sqlError(query, QStringLiteral("Could not inspect trusted metadata")), error);
         return false;

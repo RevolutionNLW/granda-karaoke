@@ -39,6 +39,7 @@ fks_add_test(tst_metadatareview LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_librarysort LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_settings LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 fks_add_test(tst_splash LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
+fks_add_test(tst_songkeys LIBS fks_core ENV "QT_QPA_PLATFORM=offscreen")
 
 # Synthetic songs for trying an installation (packaged with Windows builds).
 add_executable(fks-make-test-songs fks-make-test-songs.cpp CdgTestData.h)

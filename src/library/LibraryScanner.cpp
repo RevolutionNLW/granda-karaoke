@@ -7,7 +7,9 @@
 #include "library/Id3Reader.h"
 #include "library/MetadataResolver.h"
 #include "library/MetadataOverrideStore.h"
+#include "library/WritePriority.h"
 #include "library/SidecarParser.h"
+#include "library/SongKeys.h"
 #include "library/TitleScreenText.h"
 #include "library/UserStateStore.h"
 #include "cdg/CdgDecoder.h"
@@ -18,6 +20,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -31,6 +34,7 @@
 #include <QThread>
 
 #include <array>
+#include <cmath>
 #include <utility>
 
 namespace {
@@ -190,6 +194,7 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
 {
     MetadataResolver::Options options;
     options.shouldStop = [this] { return !waitWhilePaused(); };
+    options.yieldRequested = [] { return writepriority::userWriteWaiting(); };
     // Never waits: a cancelled scan must stop inside the resolver's long
     // in-memory stages too, or closing the program would wait for them.
     options.cancelled = [this] { return shouldStop(); };
@@ -218,18 +223,41 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
     QMutexLocker lock(&MetadataOverrideStore::synchronisation());
     MetadataOverrideStore store(m_overrideStorePath);
     QList<MetadataOverride> overrides;
-    if (syncError.isEmpty() && store.open(&syncError, roots, false))
-        overrides = store.all(&syncError);
-    if (syncError.isEmpty() && overrides.isEmpty() && catalogue.hasTrustedMirror(&syncError))
-        syncError = QStringLiteral("the override store is empty but the catalogue holds "
-                                   "corrections; keeping them");
+    bool established = false;
+    if (syncError.isEmpty() && store.open(&syncError, roots, false)) {
+        established = store.isEstablished(&syncError);
+        if (syncError.isEmpty())
+            overrides = store.all(&syncError);
+    }
+    // A store just created (lost, or damaged and set aside) is not the
+    // truth yet, even after the user cleared their last correction.
+    if (syncError.isEmpty() && !established && catalogue.hasTrustedMirror(&syncError))
+        syncError = QStringLiteral("the override store has not been restored yet but the "
+                                   "catalogue holds corrections; keeping them");
     if (!syncError.isEmpty()) {
         qWarning().noquote() << "Manual metadata corrections were not synchronised:"
                              << syncError;
         return true;
     }
-    if (!catalogue.applyManualOverrides(overrides, error))
+    // A correction saved for a song that is now in another (the active)
+    // folder follows it there: its store row is copied to the song's own
+    // identity first, and the old row is removed only once the catalogue
+    // shows the value. A row that cannot be copied stays where it was.
+    const auto copyToSong = [&store](const MovedMetadataOverride& move) {
+        QString copyError;
+        if (store.copyOverride(move, &copyError))
+            return true;
+        qWarning().noquote() << "A manual metadata correction was not moved to"
+                             << move.rootPath << move.mp3RelPath << ":" << copyError;
         return false;
+    };
+    QList<MetadataOverride> replaced;
+    if (!catalogue.applyManualOverrides(overrides, error, copyToSong, &replaced))
+        return false;
+    QString removeError;
+    if (!replaced.isEmpty() && !store.removeOverrides(replaced, &removeError))
+        qWarning().noquote() << "Moved manual metadata corrections were not tidied up:"
+                             << removeError;
     return true;
 }
 
@@ -472,8 +500,9 @@ bool LibraryScanner::pauseOutsideTransaction(QSqlDatabase& database) const
 {
     // Never sleep through playback while holding the write lock: other
     // connections (such as a correction saved from the review screen) must
-    // be able to write meanwhile.
-    if (m_paused.load() && !m_cancelled.load()) {
+    // be able to write meanwhile. A user's change waiting to be written is
+    // let in the same way, at once (see WritePriority.h).
+    if ((m_paused.load() || writepriority::userWriteWaiting()) && !m_cancelled.load()) {
         // If the batch cannot be committed, stop rather than sleep holding
         // the lock; if a new batch cannot start, stop rather than continue
         // outside a transaction. Either way the next scan resumes the work.
@@ -496,8 +525,10 @@ bool LibraryScanner::pauseOutsideTransaction(QSqlDatabase& database) const
 
 bool LibraryScanner::waitWhilePaused() const
 {
-    while (m_paused.load() && !m_cancelled.load())
-        QThread::msleep(20);
+    // Never called inside a transaction, nor with the override store's lock
+    // held, so a user's change it waits for can always be written.
+    while ((m_paused.load() || writepriority::userWriteWaiting()) && !m_cancelled.load())
+        QThread::msleep(m_paused.load() ? 20 : 5);
     return !shouldStop();
 }
 
@@ -512,6 +543,8 @@ void LibraryScanner::reportProgress(const QString& phase, qint64 done, qint64 to
 
 void LibraryScanner::scan(const QString& requestedRoot)
 {
+    // Songs key analysis could not read are tried again after each scan.
+    m_keySkip.clear();
     m_sourceFileReads = 0;
     m_scanTimer.start();
     m_progressTimer.invalidate();
@@ -772,6 +805,8 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
             }
             if (!info.isFile())
                 continue;
+            if (const int delay = m_readDelayMs.load(); delay > 0)
+                QThread::msleep(delay);
             const QString relPath = QDir::fromNativeSeparators(QDir(rootPath).relativeFilePath(info.absoluteFilePath()));
             const QString relDir = QFileInfo(relPath).path() == QLatin1String(".")
                 ? QStringLiteral("") : QFileInfo(relPath).path();
@@ -1078,6 +1113,8 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     for (qint64 zipId : zipRows) {
         if (shouldStop())
             break;
+        if (!pauseOutsideTransaction(database))
+            break;
         QSqlQuery members(database);
         members.prepare(QStringLiteral("SELECT name,method,encrypted,damaged,kind FROM zip_members WHERE zip_file_id=? ORDER BY id"));
         members.addBindValue(zipId);
@@ -1210,6 +1247,8 @@ bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
         if (!pauseOutsideTransaction(database))
             break;
         ++m_sourceFileReads;
+        if (const int delay = m_readDelayMs.load(); delay > 0)
+            QThread::msleep(delay);
         const QString path = QDir(rootPath).filePath(file.second);
         const Id3Tags tags = readId3Tags(path);
         // Empty tags from a file that has vanished are not a real result: keep it
@@ -1261,13 +1300,28 @@ bool LibraryScanner::mergeZipDuplicates(Catalogue& catalogue, qint64 rootId,
         *error = queryError(zips, QStringLiteral("Could not load ZIP duplicate candidates"));
         return false;
     }
+    // Rows are read out and the query finished before anything waits or
+    // writes: a read left open across a wait (for playback, or a user's
+    // change written meanwhile) could not be turned into a write afterwards.
+    const auto rowsOf = [](QSqlQuery& query, int columns) {
+        QList<QVariantList> rows;
+        while (query.next()) {
+            QVariantList row;
+            for (int column = 0; column < columns; ++column)
+                row.append(query.value(column));
+            rows.append(row);
+        }
+        query.finish();
+        return rows;
+    };
+    const QList<QVariantList> zipRows = rowsOf(zips, 10);
     qint64 merged = 0;
-    while (zips.next()) {
+    for (const QVariantList& zip : zipRows) {
         if (shouldStop() || counts.value(QStringLiteral("rootOffline")).toBool())
             break;
         if (!waitWhilePaused())
             break;
-        const QJsonObject zipParsed = QJsonDocument::fromJson(zips.value(5).toByteArray()).object();
+        const QJsonObject zipParsed = QJsonDocument::fromJson(zip.at(5).toByteArray()).object();
         const QString zipStem = QFileInfo(zipParsed.value(QStringLiteral("rawPath")).toString()).completeBaseName().toCaseFolded();
         QSqlQuery loose(database);
         loose.prepare(QStringLiteral(
@@ -1275,14 +1329,14 @@ bool LibraryScanner::mergeZipDuplicates(Catalogue& catalogue, qint64 rootId,
             "FROM sources s JOIN files m ON m.id=s.mp3_file_id JOIN files g ON g.id=s.graphics_file_id "
             "WHERE s.root_id=? AND s.kind='loose_cdg' AND m.present=1 AND g.present=1 AND m.size=? AND g.size=?"));
         loose.addBindValue(rootId);
-        loose.addBindValue(zips.value(6));
-        loose.addBindValue(zips.value(8));
+        loose.addBindValue(zip.at(6));
+        loose.addBindValue(zip.at(8));
         if (!loose.exec()) {
             *error = queryError(loose, QStringLiteral("Could not inspect loose duplicate candidates"));
             return false;
         }
-        while (loose.next()) {
-            const QJsonObject looseParsed = QJsonDocument::fromJson(loose.value(8).toByteArray()).object();
+        for (const QVariantList& candidate : rowsOf(loose, 9)) {
+            const QJsonObject looseParsed = QJsonDocument::fromJson(candidate.at(8).toByteArray()).object();
             const QString looseStem = QFileInfo(looseParsed.value(QStringLiteral("rawPath")).toString()).completeBaseName().toCaseFolded();
             const bool sameIdentity = (!zipStem.isEmpty() && zipStem == looseStem)
                 || (!zipParsed.value(QStringLiteral("discId")).toString().isEmpty()
@@ -1294,18 +1348,18 @@ bool LibraryScanner::mergeZipDuplicates(Catalogue& catalogue, qint64 rootId,
             // skips this candidate; its crc32 stays NULL so the next scan retries it.
             QString readError;
             auto crcFor = [&](int idColumn, int pathColumn, int crcColumn, quint32* value) -> bool {
-                if (!loose.value(crcColumn).isNull()) {
-                    *value = loose.value(crcColumn).toUInt();
+                if (!candidate.at(crcColumn).isNull()) {
+                    *value = candidate.at(crcColumn).toUInt();
                     return true;
                 }
                 ++m_sourceFileReads;
-                if (!readCrc32(QDir(rootPath).filePath(loose.value(pathColumn).toString()),
+                if (!readCrc32(QDir(rootPath).filePath(candidate.at(pathColumn).toString()),
                                m_cancelled, m_paused, value, &readError))
                     return false;
                 QSqlQuery store(database);
                 store.prepare(QStringLiteral("UPDATE files SET crc32=? WHERE id=?"));
                 store.addBindValue(qulonglong(*value));
-                store.addBindValue(loose.value(idColumn));
+                store.addBindValue(candidate.at(idColumn));
                 return store.exec();
             };
             quint32 mp3Crc = 0;
@@ -1321,16 +1375,16 @@ bool LibraryScanner::mergeZipDuplicates(Catalogue& catalogue, qint64 rootId,
                 if (rootGone(rootPath, counts))
                     break;
                 qWarning().noquote() << "Skipping ZIP duplicate check:" << readError
-                                     << loose.value(3).toString();
+                                     << candidate.at(3).toString();
                 continue;
             }
-            if (mp3Crc != zips.value(7).toUInt() || cdgCrc != zips.value(9).toUInt())
+            if (mp3Crc != zip.at(7).toUInt() || cdgCrc != zip.at(9).toUInt())
                 continue;
-            const qint64 oldSong = zips.value(1).toLongLong();
+            const qint64 oldSong = zip.at(1).toLongLong();
             QSqlQuery attach(database);
             attach.prepare(QStringLiteral("UPDATE sources SET song_id=? WHERE id=?"));
-            attach.addBindValue(loose.value(1));
-            attach.addBindValue(zips.value(0));
+            attach.addBindValue(candidate.at(1));
+            attach.addBindValue(zip.at(0));
             if (!attach.exec()) {
                 *error = queryError(attach, QStringLiteral("Could not merge ZIP duplicate"));
                 return false;
@@ -1787,4 +1841,280 @@ bool LibraryScanner::readTitleScreens(Catalogue& catalogue, qint64 rootId,
     counts.insert(QStringLiteral("titleScreensWithFrames"), recognised);
     counts.insert(QStringLiteral("titleScreensWithoutFrame"), withoutTitleScreen);
     return true;
+}
+
+namespace {
+
+QString keyDetailJson(const music::KeyAnalysis& analysis)
+{
+    QJsonObject detail;
+    if (analysis.key)
+        detail.insert(QStringLiteral("key"), QString::fromStdString(analysis.key->name()));
+    if (analysis.runnerUp)
+        detail.insert(QStringLiteral("runnerUp"), QString::fromStdString(analysis.runnerUp->name()));
+    detail.insert(QStringLiteral("correlation"), analysis.correlation);
+    detail.insert(QStringLiteral("runnerUpCorrelation"), analysis.runnerUpCorrelation);
+    detail.insert(QStringLiteral("margin"), analysis.margin);
+    detail.insert(QStringLiteral("parallelMargin"), analysis.parallelMargin);
+    detail.insert(QStringLiteral("agreement"), analysis.agreement);
+    detail.insert(QStringLiteral("windows"), analysis.windows);
+    detail.insert(QStringLiteral("tuningCents"), analysis.tuningCents);
+    detail.insert(QStringLiteral("seconds"), analysis.seconds);
+    detail.insert(QStringLiteral("voicedSeconds"), analysis.voicedSeconds);
+    detail.insert(QStringLiteral("tuningConsistency"), analysis.tuningConsistency);
+    // The whole profile, so the decision can be re-tuned without decoding again.
+    QJsonArray chroma;
+    for (const double value : analysis.chroma)
+        chroma.append(std::round(value * 10000.0) / 10000.0);
+    detail.insert(QStringLiteral("chroma"), chroma);
+    return QString::fromUtf8(QJsonDocument(detail).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
+
+void LibraryScanner::analyseSongKeys(std::shared_ptr<SongKeyEngine> engine)
+{
+    QVariantMap summary;
+    qint64 decoded = 0;
+    qint64 reused = 0;
+    qint64 recorded = 0;  // songs with no usable audio, recorded as such
+    qint64 failed = 0;
+    qint64 unwritten = 0;  // songs whose result could not be written
+    qint64 decodeMs = 0;
+    // Why this batch could not work, or the first song it could not use.
+    QString detail;
+    const auto finish = [&](const QString& reason, const std::optional<SongKeySummary>& progress) {
+        summary.insert(QStringLiteral("reason"), reason);
+        summary.insert(QStringLiteral("decoded"), decoded);
+        summary.insert(QStringLiteral("reused"), reused + recorded);
+        summary.insert(QStringLiteral("failed"), failed);
+        summary.insert(QStringLiteral("skipped"), unwritten);
+        summary.insert(QStringLiteral("decodeMs"), decodeMs);
+        if (!detail.isEmpty())
+            summary.insert(QStringLiteral("detail"), detail);
+        if (progress) {
+            summary.insert(QStringLiteral("total"), progress->total);
+            summary.insert(QStringLiteral("analysed"), progress->analysed);
+            summary.insert(QStringLiteral("confident"), progress->confident);
+            summary.insert(QStringLiteral("manual"), progress->manual);
+        }
+        emit songKeyBatchFinished(summary);
+    };
+    // Its own stop test: never the scan's time limit, and playback, a
+    // yield request or closing all end the batch rather than wait in it.
+    const auto stop = [this] {
+        return m_cancelled.load() || m_keyYield.load() || m_paused.load();
+    };
+    if (!engine || stop()) {
+        if (!engine)
+            detail = QStringLiteral("no audio decoder");
+        finish(engine ? QStringLiteral("stopped") : QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    Catalogue catalogue(m_databasePath, m_cacheDirectory);
+    QString error;
+    if (!catalogue.open(&error, m_knownRoots)) {
+        qWarning().noquote() << "Song keys: could not open the catalogue:" << error;
+        detail = QStringLiteral("could not open the library: %1").arg(error);
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    // Results that would be lost at the end of the session are not worth
+    // the drive's time.
+    if (!catalogue.enrichmentCacheIsDurable()) {
+        detail = QStringLiteral("the key cache file cannot be used");
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    QSqlDatabase database = catalogue.database();
+    const CatalogueRoot root = catalogue.activeRoot(&error);
+    if (root.id == 0 || !QFileInfo(root.path).isDir()) {
+        finish(root.id == 0 ? QStringLiteral("done") : QStringLiteral("offline"),
+               Catalogue::songKeySummaryOn(database, &error));
+        return;
+    }
+
+    // The next MP3s without a current result: most-sung songs first, then
+    // folder by folder (kind to a spinning drive).
+    QStringList skipped;
+    for (const qint64 id : std::as_const(m_keySkip))
+        skipped.append(QString::number(id));
+    QSqlQuery targets(database);
+    targets.prepare(QStringLiteral(
+        "SELECT m.id,m.rel_path,m.content_sha256,max(COALESCE(p.play_count,0)) AS plays "
+        "FROM sources s JOIN files m ON m.id=s.mp3_file_id "
+        "LEFT JOIN song_plays p ON p.song_id=s.song_id "
+        "WHERE s.root_id=? AND s.kind='loose_cdg' AND s.playable=1 AND m.present=1 "
+        "AND (m.content_sha256 IS NULL OR NOT EXISTS(SELECT 1 FROM enrich.song_keys k "
+        "WHERE k.mp3_audio_sha256=m.content_sha256 AND k.version>=?))%1 "
+        "GROUP BY m.id ORDER BY plays DESC,m.rel_dir,m.id LIMIT 40")
+        .arg(skipped.isEmpty() ? QString()
+                               : QStringLiteral(" AND m.id NOT IN (%1)").arg(skipped.join(QLatin1Char(',')))));
+    targets.addBindValue(root.id);
+    targets.addBindValue(kSongKeyAnalysisVersion);
+    if (!targets.exec()) {
+        detail = queryError(targets, QStringLiteral("could not list songs"));
+        qWarning().noquote() << "Song keys:" << detail;
+        finish(QStringLiteral("unavailable"), std::nullopt);
+        return;
+    }
+    struct Target { qint64 id; QString relPath; QByteArray digest; };
+    QList<Target> list;
+    while (targets.next())
+        list.append({targets.value(0).toLongLong(), targets.value(1).toString(), targets.value(2).toByteArray()});
+    targets.finish();
+
+    // Each result is written on its own (no transaction is ever held across
+    // a decode), so other connections are never kept waiting.
+    const auto store = [&](const QByteArray& digest, const QString& status, int keyIndex,
+                           double confidence, const QString& detailJson) {
+        QSqlQuery insert(database);
+        insert.prepare(QStringLiteral(
+            "INSERT OR REPLACE INTO enrich.song_keys(mp3_audio_sha256,version,status,key_index,"
+            "confidence,detail_json,analysed_at) VALUES(?,?,?,?,?,?,?)"));
+        insert.addBindValue(digest);
+        insert.addBindValue(kSongKeyAnalysisVersion);
+        insert.addBindValue(status);
+        insert.addBindValue(keyIndex >= 0 ? QVariant(keyIndex) : QVariant(QMetaType::fromType<int>()));
+        insert.addBindValue(confidence);
+        insert.addBindValue(detailJson);
+        insert.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        if (!insert.exec()) {
+            const QString problem = queryError(insert, QStringLiteral("could not store a result"));
+            qWarning().noquote() << "Song keys:" << problem;
+            if (detail.isEmpty())
+                detail = problem;
+            return false;
+        }
+        return true;
+    };
+    // A song whose file could not be used this session (tried again next time).
+    const auto passOver = [&](qint64 id, const QString& problem) {
+        m_keySkip.insert(id);
+        if (detail.isEmpty())
+            detail = problem;
+    };
+
+    QElapsedTimer batch;
+    batch.start();
+    QString reason = list.isEmpty() ? QStringLiteral("done") : QStringLiteral("more");
+    QVariantMap counts;
+    for (const Target& target : std::as_const(list)) {
+        if (stop()) {
+            reason = QStringLiteral("stopped");
+            break;
+        }
+        if (batch.hasExpired(kKeyBatchMs))
+            break;
+        const QString path = QDir(root.path).filePath(target.relPath);
+        // The digest is taken afresh (128 KiB), so a file changed since the
+        // last scan can never be given another file's key.
+        QByteArray digest;
+        ++m_sourceFileReads;
+        QElapsedTimer reading;
+        reading.start();
+        const bool digested = mp3AudioDigest(path, &digest);
+        if (reading.elapsed() >= 20000) {
+            qWarning().noquote() << "Song keys: reading the start of" << target.relPath << "took"
+                                 << reading.elapsed() / 1000 << "s";
+        }
+        if (!digested) {
+            if (rootGone(root.path, counts)) {
+                reason = QStringLiteral("offline");
+                break;
+            }
+            passOver(target.id, QStringLiteral("could not read %1").arg(target.relPath));
+            ++failed;
+            continue;
+        }
+        if (digest != target.digest) {
+            QSqlQuery update(database);
+            update.prepare(QStringLiteral("UPDATE files SET content_sha256=? WHERE id=?"));
+            update.addBindValue(digest);
+            update.addBindValue(target.id);
+            if (!update.exec()) {
+                // Perhaps a scan holds the catalogue: this file waits for later.
+                const QString problem = queryError(update, QStringLiteral("could not store a digest"));
+                qWarning().noquote() << "Song keys:" << problem;
+                passOver(target.id, problem);
+                ++unwritten;
+                continue;
+            }
+        }
+        QSqlQuery known(database);
+        known.prepare(QStringLiteral("SELECT 1 FROM enrich.song_keys WHERE mp3_audio_sha256=? AND version>=?"));
+        known.addBindValue(digest);
+        known.addBindValue(kSongKeyAnalysisVersion);
+        if (known.exec() && known.next()) {
+            ++reused;  // the same audio, already analysed (a copy, or a rebuilt catalogue)
+            continue;
+        }
+        known.finish();
+
+        music::KeyAnalysis analysis;
+        QString engineDetail;
+        QElapsedTimer timer;
+        timer.start();
+        const SongKeyEngine::Outcome outcome = engine->analyse(path, stop, &analysis, &engineDetail);
+        if (timer.elapsed() >= 20000) {
+            qWarning().noquote() << "Song keys:" << target.relPath << "took" << timer.elapsed() / 1000
+                                 << "s to analyse";
+        }
+        switch (outcome) {
+        case SongKeyEngine::Outcome::Interrupted:
+            reason = QStringLiteral("stopped");
+            break;
+        case SongKeyEngine::Outcome::EngineUnavailable:
+            qWarning().noquote() << "Song keys: the audio decoder is unavailable:" << engineDetail;
+            detail = QStringLiteral("the audio decoder is unavailable: %1").arg(engineDetail);
+            reason = QStringLiteral("unavailable");
+            break;
+        case SongKeyEngine::Outcome::Unreadable:
+            if (rootGone(root.path, counts)) {
+                reason = QStringLiteral("offline");
+                break;
+            }
+            qInfo().noquote() << "Song keys: could not read" << target.relPath << "-" << engineDetail;
+            passOver(target.id, QStringLiteral("could not read %1: %2").arg(target.relPath, engineDetail));
+            ++failed;
+            break;
+        case SongKeyEngine::Outcome::NotAudio: {
+            // Recorded, so it is not tried again until the file or the
+            // analysis changes.
+            qInfo().noquote() << "Song keys: no usable audio in" << target.relPath << "-" << engineDetail;
+            QJsonObject failure;
+            failure.insert(QStringLiteral("error"), engineDetail);
+            if (store(digest, QStringLiteral("not_audio"), -1, 0.0,
+                      QString::fromUtf8(QJsonDocument(failure).toJson(QJsonDocument::Compact)))) {
+                ++recorded;
+            } else {
+                m_keySkip.insert(target.id);
+                ++unwritten;
+            }
+            ++failed;
+            break;
+        }
+        case SongKeyEngine::Outcome::Analysed:
+            decodeMs += timer.elapsed();
+            if (store(digest, QString::fromLatin1(music::statusName(analysis.status)),
+                      analysis.key ? analysis.key->index() : -1, analysis.confidence,
+                      keyDetailJson(analysis))) {
+                ++decoded;
+            } else {
+                m_keySkip.insert(target.id);
+                ++unwritten;
+            }
+            break;
+        }
+        if (reason != QLatin1String("more"))
+            break;
+    }
+    // Counting takes a moment on a large library: not when asked to stop.
+    std::optional<SongKeySummary> progress;
+    if (reason != QLatin1String("stopped")) {
+        progress = Catalogue::songKeySummaryOn(database, &error);
+        if (!progress)
+            qWarning().noquote() << "Song keys: could not count progress:" << error;
+    }
+    finish(reason, progress);
 }

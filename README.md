@@ -133,11 +133,92 @@ refuse a v5 catalogue as newer than supported; restore that backup to go back.
 `fks-catalogue --db <path> metadata-stats` reports confidence and source counts, and
 `compare --baseline <other.sqlite>` compares two catalogues song by song.
 
+## Song Keys
+
+The library can show each song's **musical key** (C, F#m, Bb ...) in a **Key** column,
+worked out from the music itself (never from file names or tags). This is the key of the
+karaoke track as recorded, which may differ from the original hit record. It is not the
+player bar's Key control, which shifts the song by semitones: the Now Playing line shows
+the song's key and the key heard, e.g. `Key C → D` at +2, with "Original key: C /
+Current key: D (+2)" in its tooltip, and changes as Key is pressed. The Key column stays
+hidden until analysis is on or keys are known, and gives way on a small screen at a large
+interface size so Artist and Song keep their room. Keys are always spelt the
+familiar way (Db, Eb, F#, Ab, Bb; C#m, Ebm, F#m, G#m, Bbm), never B#, E#, Cb or Fb.
+
+Working keys out means reading every song, so it is **off until turned on** in
+Settings > Metadata > Song keys. Once on, it works in short batches between other library
+work, stops the moment a song starts and waits 45 seconds after one ends (Autoplay may be
+about to start the next), gives way to scans at once, and carries on in later sessions
+where it left off; the same page shows progress and an estimate of the time left. On a
+2.1 GHz cloud CPU a 4-minute song took about 0.5 s in a release build (decoding the MP3 is
+most of it), so 50,000 songs is roughly 7 hours of work plus reading from the drive and the
+rests between batches: expect 8 to 15 hours spread over several sessions. Measure on the
+real laptop and drive with `fks-song-keys` (below).
+
+**Set Song Key.** A key can also be chosen by hand: select a song in the library and press
+**Set Song Key** (in the library's footer, beside Add to Playlist). A small popup lists the
+24 keys (major and minor, in the spellings above); one click saves it and closes. It is the
+key the backing track is *recorded* in, before any Key +/- adjustment: a song recorded in C
+and sung at +2 is set to C, and the Now Playing line then shows `Key C → D`. A key chosen by
+hand always wins over the detected one, is never replaced by analysis, and is kept with the
+other trusted corrections in `metadata-overrides.sqlite` (field `original_key`; mirrored in
+the catalogue), so it survives restarts, rescans and catalogue rebuilds. **Clear Manual Key**
+in the same popup goes back to the detected key (or blank). The detected key itself stays in
+`enrichment-cache.sqlite`, untouched. The Key cell in the table is display only: clicking
+anywhere in a row, the Key cell included, just selects the song.
+
+**How.** The MP3 is decoded read-only with the GStreamer components the player already
+uses, to mono at 11 kHz. Spectral peaks between 60 Hz and 2 kHz are gathered into a
+12-note profile, corrected for the recording's tuning, with every loud-enough second
+counting the same (so silent or spoken intros, fades and a last-chorus key change do not
+decide it), and compared with major and minor key templates (Sha'ath's audio-derived
+profiles). No extra library or plugin is needed on macOS or Windows.
+
+**Limits.** Automatic key finding is imperfect. On 30 real karaoke tracks checked by hand
+(independent published keys plus the backing audio itself), 20 keys were shown and 19 were
+exact; one was a fifth away; the rest stayed blank. Most mistakes are the relative major/minor (C for Am), a fifth away (G for C) or
+major for minor. So a key is shown only when the evidence
+is clear: a strong match, clearly better than any other key (major versus minor included),
+consistent through the song, and tuning not near a quarter-tone. Only passages with a
+clear note in the 60 Hz to 2 kHz band count, so silence, hiss, drums alone, a DC offset
+and a hum below the band are not counted. (A mains buzz with strong harmonics inside the
+band is a real series of notes and can still suggest a key; it matters only for a file
+with nothing else in it.) Everything else stays
+blank, as do songs shorter than 30 s, mostly silent, or unreadable. Songs that modulate
+get the key heard longest. The thresholds were set on synthetic music and must be checked
+against real songs (see below) before they are trusted.
+
+**Storage.** Results go in `enrichment-cache.sqlite` (table `song_keys`), which outlives
+catalogue rebuilds, keyed by the MP3's audio content with its tags ignored: a moved,
+renamed or retagged song keeps its key without being read again, and a rebuilt catalogue
+only reads 128 KiB of each song to find its key again. Each row keeps the key, status
+(`confident`, `uncertain`, `silent`, `too_short`, `not_audio`), a confidence, the analysis
+version and the evidence (correlations, runner-up, margins, agreement, tuning and the
+song's whole 12-note profile, so the decision can be re-tuned later without decoding the
+songs again). Raising
+`kSongKeyAnalysisVersion` re-analyses in the background, showing the old key meanwhile.
+A damaged file is recorded and not tried again; a file that cannot be read (the drive
+went away) is tried again next session. Nothing is ever written to the music folder.
+
+**Checking on real songs.** `fks-song-keys` analyses files read-only and prints each key
+with its evidence and timing, and estimates for 1,000 / 10,000 / 50,000 songs:
+
+```bash
+build/fks-song-keys --limit 30 "$FKS_TEST_MEDIA_DIR"
+build/fks-song-keys --expect keys.tsv --limit 30 "$FKS_TEST_MEDIA_DIR"
+```
+
+`keys.tsv` lists songs whose key is known independently, one per line as
+`<part of the file name><TAB><key>`; the report then counts exact, relative, fifth and
+parallel mistakes, for all songs and for those whose key would be shown.
+
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
 | `src/cdg/CdgDecoder.*` | CD+G decoding (plain C++, no Qt/GStreamer) |
+| `src/music/` | Musical keys, transposition and key detection from samples (plain C++) |
+| `src/SongKeyAnalyser.*` | Decodes a song read-only with GStreamer for key detection |
 | `src/KaraokePlayer.*` | GStreamer audio playback; drives the CDG decoder from the audio position |
 | `src/SongPair.*` | Finds the matching `.mp3`/`.cdg` companion and checks both are readable |
 | `src/SongSettings.*` | Content identity and atomic per-song Key/Tempo JSON storage |

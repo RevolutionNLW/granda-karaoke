@@ -16,6 +16,7 @@ class LibraryView;
 class PlaylistStore;
 class QComboBox;
 class QKeySequenceEdit;
+class QCheckBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -76,6 +77,8 @@ public:
     QKeySequenceEdit* shortcutEditor();
     QLabel* shortcutMessage();
     QLabel* metadataCounts();
+    QCheckBox* songKeysCheckBox();
+    QLabel* songKeyStatus();
     // Whether a page has been made yet (pages are made when first shown).
     bool isPageBuilt(const QString& name) const { return m_built.value(pageIndex(name)); }
     QMessageBox* shortcutConflictPrompt() const { return m_conflictPrompt; }
@@ -100,6 +103,7 @@ private:
     QWidget* buildAbout();
     void refreshMetadataCounts();
     void refreshMetadataStatus();
+    void refreshSongKeyStatus();
     bool confirmForgetAll();
     bool songInProgress() const;
     void refreshScale();
@@ -143,6 +147,8 @@ private:
     QLabel* m_forgetMessage = nullptr;
     QLabel* m_metadataCounts = nullptr;
     QLabel* m_reprocessStatus = nullptr;
+    QCheckBox* m_songKeys = nullptr;
+    QLabel* m_songKeyStatus = nullptr;
     QTreeWidget* m_shortcutList = nullptr;
     QLineEdit* m_shortcutFilter = nullptr;
     QLabel* m_shortcutEditorTitle = nullptr;
