@@ -61,6 +61,10 @@ protected:
     void paintEvent(QPaintEvent* event) override;
 };
 
+// The width of the widest song key as shown in a Key column ("C#m \u2192 D#m"
+// and the like, see songKeyDisplay()), in this font.
+int songKeyTextWidth(const QFont& font);
+
 // Carries a table's column-header strip on over its vertical scroll bar, so
 // the scroll bar starts below the column captions instead of beside them.
 void extendHeaderOverScrollBar(QTreeView* view);

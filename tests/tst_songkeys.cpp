@@ -328,6 +328,7 @@ private slots:
     void aMissingDecoderSaysSoInsteadOfResting();
     void aKeyErrorGoesOnceItIsOutOfDate();
     void playlistsShowTheSameKeyAsTheLibrary();
+    void transposedKeyFallsBackToTheDetectedKey();
 
 private:
     QTemporaryDir m_dir;
@@ -1033,6 +1034,14 @@ void TestSongKeys::libraryAndPlayerBarShowTheKeys()
     controller.setSongKeyAnalysisEnabled(true);  // the real GStreamer engine
     QVERIFY(!results->isColumnHidden(LibraryResultsModel::KeyColumn));
     QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+    // Now Playing shows the key of the song being sung (not one only loaded).
+    QTest::qWait(200);
+    QVERIFY(!window.songKeyLabel()->isVisible());
+    QTest::mouseClick(window.playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    player.pause();
+    QTest::keyClick(&window, Qt::Key_Escape);  // from the lyrics to the player bar
+    QVERIFY(!window.lyricsVisible());
     QTRY_VERIFY_WITH_TIMEOUT(window.songKeyLabel()->isVisible(), 5000);
     QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C"));
     QCOMPARE(window.songKeyLabel()->toolTip(), QStringLiteral("Original key: C"));
@@ -1053,12 +1062,13 @@ void TestSongKeys::libraryAndPlayerBarShowTheKeys()
     QVERIFY(window.openSong(other));
     QVERIFY(!window.songKeyLabel()->isVisible());
 
-    // The library table shows the key in its own column.
+    // The library table shows the key in its own column, with the Key the
+    // song was last sung at (-2 above).
     LibraryView* view = window.libraryView();
     view->searchBox()->setText(QStringLiteral("C Song"));
     QTRY_COMPARE_WITH_TIMEOUT(view->songResultCount(), 1, 3000);
     QCOMPARE(view->resultsList()->model()->index(0, LibraryResultsModel::KeyColumn).data().toString(),
-             QStringLiteral("C"));
+             QStringLiteral("C \u2192 Bb"));
 }
 
 void TestSongKeys::manualOriginalKeyWinsAndSurvives()
@@ -1225,6 +1235,9 @@ void TestSongKeys::manualOriginalKeyIsSeparateFromTranspose()
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     QVERIFY(window.openSong(root + QLatin1Char('/') + known));
+    QTest::mouseClick(window.playButton(), Qt::LeftButton);
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    player.pause();  // still being sung: Now Playing shows its key
     QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key G"));  // detected
 
     // The loaded song's Now Playing key follows a key set by hand at once.
@@ -2523,6 +2536,76 @@ void TestSongKeys::playlistsShowTheSameKeyAsTheLibrary()
     // Analysis turned off with keys known: the column stays, as in the library.
     controller.setSongKeyAnalysisEnabled(false);
     QVERIFY(view->keyColumnShown());
+}
+
+void TestSongKeys::transposedKeyFallsBackToTheDetectedKey()
+{
+    // The original key is the one set by hand, else a confident detected
+    // one; the key shown after it is that original moved by the song's Key.
+    // Library, playlist and Now Playing agree through every change.
+    QTemporaryDir temporary;
+    const QString root = temporary.filePath(QStringLiteral("music"));
+    const auto [known, unknown] = writeManualKeyLibrary(m_fixtures, root);
+    QVERIFY(!known.isEmpty());
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")), {},
+                                 temporary.filePath(QStringLiteral("app/metadata-overrides.sqlite")));
+    controller.setSongKeyTimings(quickTimings());
+    QSignalSpy finished(&controller, &LibraryController::scanFinished);
+    QVERIFY(controller.chooseRoot(root));
+    QTRY_VERIFY_WITH_TIMEOUT(finished.count() >= 1, 20000);
+    controller.setSongKeyAnalysisEnabled(true);
+    QTRY_VERIFY_WITH_TIMEOUT(analysedAll(controller, 2), 60000);
+    controller.setSongKeyAnalysisEnabled(false);
+    const qint64 gSong = controller.findSongByMp3Path(root, known);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 playlistId = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Keys"), &playlistId));
+    QVERIFY(playlists.addItem(playlistId, *controller.songRef(gSong)));
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.setShowErrorDialogs(false);
+    window.resize(1366, 768);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    PlaylistView* view = window.playlistView();
+    LibraryView* library = window.libraryView();
+    QTRY_VERIFY(view->keyColumnShown());
+    library->searchBox()->setText(QStringLiteral("G Song"));
+    QTRY_COMPARE_WITH_TIMEOUT(library->songResultCount(), 1, 3000);
+    const auto libraryKey = [library] {
+        return library->resultsList()->model()->index(0, LibraryResultsModel::KeyColumn).data().toString();
+    };
+    QCOMPARE(libraryKey(), QStringLiteral("G"));  // detected
+    QCOMPARE(view->rowKeyText(0), QStringLiteral("G"));
+
+    // Key +2 for the selected song, before it plays.
+    library->resultsList()->setCurrentIndex(library->resultsList()->model()->index(0, 0));
+    window.keyUpButton()->click();
+    window.keyUpButton()->click();
+    QCOMPARE(player.state(), KaraokePlayer::State::Empty);
+    QCOMPARE(libraryKey(), QStringLiteral("G \u2192 A"));
+    QCOMPARE(view->rowKeyText(0), QStringLiteral("G \u2192 A"));
+
+    // A key set by hand replaces the detected one, the Key kept.
+    QString error;
+    QVERIFY2(controller.setManualOriginalKey(gSong, 0, &error), qPrintable(error));  // C
+    QCOMPARE(libraryKey(), QStringLiteral("C \u2192 D"));
+    QCOMPARE(view->rowKeyText(0), QStringLiteral("C \u2192 D"));
+    window.playButton()->click();
+    QCOMPARE(player.state(), KaraokePlayer::State::Playing);
+    player.pause();
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key C \u2192 D"));
+
+    // Cleared: back to the detected key everywhere, still at +2.
+    QVERIFY2(controller.setManualOriginalKey(gSong, std::nullopt, &error), qPrintable(error));
+    QCOMPARE(libraryKey(), QStringLiteral("G \u2192 A"));
+    QCOMPARE(view->rowKeyText(0), QStringLiteral("G \u2192 A"));
+    QCOMPARE(window.songKeyLabel()->text(), QStringLiteral("Key G \u2192 A"));
+    QCOMPARE(player.keySemitones(), 2);
+    QVERIFY(!controller.songKeyDetails(gSong)->isManual());
 }
 
 QTEST_MAIN(TestSongKeys)

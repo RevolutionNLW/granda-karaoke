@@ -124,6 +124,8 @@ add_library(fks_core STATIC
     src/MetadataReviewDialog.h
     src/PlaylistView.cpp
     src/PlaylistView.h
+    src/RememberedSettings.cpp
+    src/RememberedSettings.h
     src/Logging.cpp
     src/Logging.h
     src/SongPair.cpp

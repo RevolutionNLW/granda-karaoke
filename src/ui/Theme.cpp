@@ -192,11 +192,13 @@ QSplitter::handle { background: transparent; }
 QSplitter::handle:hover { background: #2a2d32; }
 
 /* ---- Scroll bars --------------------------------------------------- */
-QScrollBar:vertical { background: transparent; width: 11px; margin: 2px 2px 2px 0px; }
-QScrollBar:horizontal { background: transparent; height: 11px; margin: 0px 2px 2px 2px; }
-QScrollBar::handle:vertical { background: #34373e; border-radius: 4px; min-height: 32px; }
-QScrollBar::handle:horizontal { background: #34373e; border-radius: 4px; min-width: 32px; }
-QScrollBar::handle:hover { background: #4a4e56; }
+/* Plain to see on the dark rows: a list with more songs than fit shows a
+   lane and a light handle, so the rest of it is never out of mind. */
+QScrollBar:vertical { background: #2a2d33; border-radius: 5px; width: 13px; margin: 2px 2px 2px 0px; }
+QScrollBar:horizontal { background: #2a2d33; border-radius: 5px; height: 13px; margin: 0px 2px 2px 2px; }
+QScrollBar::handle:vertical { background: #7a808b; border-radius: 5px; min-height: 32px; }
+QScrollBar::handle:horizontal { background: #7a808b; border-radius: 5px; min-width: 32px; }
+QScrollBar::handle:hover { background: #969ca6; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 

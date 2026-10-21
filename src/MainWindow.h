@@ -21,6 +21,7 @@ class MetadataReviewDialog;
 class PlaylistPlayback;
 class PlaylistStore;
 class PlaylistView;
+class RememberedSettingsIndex;
 struct PlaylistEntry;
 class QStackedWidget;
 class QLabel;
@@ -68,8 +69,8 @@ public:
     QPushButton* tempoUpButton() const { return m_tempoUpButton; }
     QPushButton* tempoResetButton() const { return m_tempoResetButton; }
     QLabel* keyValueLabel() const { return m_keyValueLabel; }
-    // The loaded song's own key and the key heard with Key applied (hidden
-    // while the song's key is not known).
+    // The song being sung: its own key and the key heard with Key applied
+    // (hidden while nothing is being sung or its key is not known).
     QLabel* songKeyLabel() const { return m_songKeyLabel; }
     QLabel* tempoValueLabel() const { return m_tempoValueLabel; }
     QString statusText() const;
@@ -136,8 +137,37 @@ private:
     void onPlay();
     void onPause();
     void onStop();
-    void changeKey(int delta);
-    void changeTempo(int delta);
+    // What Play, Key and Tempo act on. While a song is being sung (or a song
+    // opened from a file waits for Play), that song: Key and Tempo change
+    // what is heard. Otherwise the song selected in the pane in use: Play
+    // starts it, and Key and Tempo set how it will start, remembered at once.
+    // A selection never takes the controls from the song being sung.
+    struct ControlTarget {
+        enum class Kind { None, Loaded, Selected };
+        Kind kind = Kind::None;
+        qint64 songId = 0;
+    };
+    ControlTarget controlTarget() const;
+    // The catalogue song selected in the pane in use (0 for none).
+    qint64 selectedSongId() const;
+    // Play starts the selection (nothing is being sung, paused or waiting
+    // for Play), and whether there is one to start.
+    bool playStartsSelection() const;
+    bool hasPlayableSelection() const;
+    // A song just loaded for singing: its identity and settings are known
+    // for its rows from now on.
+    void noteLoadedSong();
+    void playSelectedSong();
+    void changeSettings(const std::function<void(SongSettings&)>& change);
+    bool changeSelectedSettings(qint64 songId, const std::function<void(SongSettings&)>& change);
+    SongSettings defaultSongSettings() const;
+    // The Key/Tempo a song starts from: its remembered ones, else the defaults.
+    SongSettings songSettingsFor(const QString& identity) const;
+    SongSettings selectedSongSettings(qint64 songId);
+    QString identityOf(const SongPair& pair);
+    // A library or playlist row's Key setting, for its Key column.
+    int rowTranspose(qint64 songId);
+    void refreshRowKeys();
     void persistCurrentSettings();
     void showLyrics();
     void hideLyrics();
@@ -190,6 +220,10 @@ private:
 
     QString m_songIdentity;
     bool m_identityWarningLogged = false;
+    std::unique_ptr<RememberedSettingsIndex> m_remembered;
+    // Song identities worked out this session, by the files' names, sizes
+    // and times (working one out reads the whole song).
+    QHash<QString, QString> m_identities;
     QString m_errorText;
     bool m_showErrorDialogs = true;
     bool m_previewing = false;

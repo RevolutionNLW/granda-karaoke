@@ -94,6 +94,13 @@ public:
     PlayHistoryEntry playHistory(const QString& identity) const;
     // The catalogue song for a song file opened directly, or 0.
     qint64 songIdForMp3File(const QString& mp3Path) const;
+    // The catalogue song for each MP3 path remembered earlier (e.g. with a
+    // song's Key/Tempo), keyed by the path given; paths with no song are left
+    // out. Matched by name against the music folders first, so the music
+    // drive is normally not touched; a file remembered in a music folder
+    // that is no longer there (moved to another drive letter, say) is found
+    // at the same place in the active folder.
+    QHash<QString, qint64> songIdsForRememberedFiles(const QStringList& mp3Paths) const;
     PlaybackPaths playbackPathsFor(qint64 songId, QString* error = nullptr) const;
     PlaybackPaths playbackPathsForAny(qint64 songId, QString* error = nullptr) const;
     std::optional<SongRef> songRef(qint64 songId, QString* error = nullptr) const;

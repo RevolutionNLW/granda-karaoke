@@ -57,7 +57,8 @@ struct PlaylistColumns {
     QRect disc;
 };
 
-PlaylistColumns playlistColumns(const QRect& row, bool withKey)
+// keyWidth: the room the Key column's text needs (0: no Key column).
+PlaylistColumns playlistColumns(const QRect& row, int keyWidth)
 {
     PlaylistColumns columns;
     const int gap = theme::px(12);
@@ -66,9 +67,9 @@ PlaylistColumns playlistColumns(const QRect& row, bool withKey)
     const int left = columns.number.right() + theme::px(10);
     const int available = inner.right() - left;
     const int disc = available >= theme::px(440) ? theme::px(104) : 0;
-    // The key is short ("C", "F#m", "Bbm"), so its column is narrow; it is
-    // left out rather than squeeze the song and artist in a narrow pane.
-    const int key = withKey && available - disc >= theme::px(260) ? theme::px(38) : 0;
+    // The key ("C", "F#m \u2192 G#m") is left out rather than squeeze the song
+    // and artist in a narrow pane (it still fits a laptop screen at 150%).
+    const int key = keyWidth > 0 && available - disc - keyWidth - gap >= theme::px(160) ? keyWidth : 0;
     const int names = available - disc - (key ? key + gap : 0);
     const int songWidth = names * 54 / 100;
     columns.song = QRect(left, row.top(), songWidth - gap, row.height());
@@ -112,7 +113,8 @@ public:
         if (strong)
             painter->fillRect(QRect(option.rect.left(), option.rect.top(), theme::px(3),
                                     option.rect.height()), theme::color::accent);
-        const PlaylistColumns columns = playlistColumns(option.rect, m_keys());
+        const PlaylistColumns columns = playlistColumns(
+            option.rect, m_keys() ? ui::songKeyTextWidth(option.font) : 0);
         const QColor main = strong ? theme::color::selectionText : theme::color::text;
         const QColor secondary = strong ? theme::color::selectionText
                                         : theme::color::secondaryText;
@@ -201,7 +203,8 @@ protected:
         painter.setFont(font);
         painter.setPen(theme::color::textMuted);
         const PlaylistColumns columns = playlistColumns(
-            QRect(0, 0, m_list->viewport()->width(), height() - 1), m_keys());
+            QRect(0, 0, m_list->viewport()->width(), height() - 1),
+            m_keys() ? ui::songKeyTextWidth(m_list->font()) : 0);
         const auto caption = [&painter](const QRect& rect, const QString& text) {
             if (rect.width() > 0)
                 painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter, text);
@@ -518,8 +521,10 @@ PlaylistView::PlaylistView(PlaylistStore* store, LibraryController* libraryContr
         refreshItems();
         emit displayedPlaylistChanged(displayedPlaylistId() != 0);
     });
-    connect(m_items, &QListWidget::currentItemChanged,
-            this, [this] { updateButtons(); });
+    connect(m_items, &QListWidget::currentItemChanged, this, [this] {
+        updateButtons();
+        emit selectionChanged();
+    });
     connect(m_items, &QListWidget::itemDoubleClicked,
             this, [this] { playSelected(); });
     connect(m_newButton, &QPushButton::clicked, this, &PlaylistView::createPlaylist);
@@ -578,6 +583,12 @@ void PlaylistView::setKeyColumnShown(bool shown)
     m_columnHeader->update();
 }
 
+void PlaylistView::setTransposeProvider(TransposeProvider provider)
+{
+    m_transpose = std::move(provider);
+    refreshKeys();
+}
+
 void PlaylistView::refreshKeys()
 {
     // Looked up only while the column is shown, all rows in one go.
@@ -592,8 +603,10 @@ void PlaylistView::refreshKeys()
     const QHash<qint64, SongKeyInfo> keys = m_libraryController->songKeys(songIds);
     for (int row = 0; row < m_items->count(); ++row) {
         QListWidgetItem* item = m_items->item(row);
-        const auto key = keys.constFind(item->data(SongIdRole).toLongLong());
-        const QString text = key != keys.constEnd() ? songKeyName(key->shownKeyIndex()) : QString();
+        const qint64 songId = item->data(SongIdRole).toLongLong();
+        const auto key = keys.constFind(songId);
+        const QString text = key != keys.constEnd()
+            ? songKeyDisplay(key->shownKeyIndex(), m_transpose ? m_transpose(songId) : 0) : QString();
         if (item->data(KeyRole).toString() != text)
             item->setData(KeyRole, text);
     }
@@ -651,6 +664,12 @@ qint64 PlaylistView::selectedItemId() const
 {
     const QListWidgetItem* selected = m_items->currentItem();
     return selected ? selected->data(ItemIdRole).toLongLong() : 0;
+}
+
+qint64 PlaylistView::selectedSongId() const
+{
+    const QListWidgetItem* selected = m_items->currentItem();
+    return selected ? selected->data(SongIdRole).toLongLong() : 0;
 }
 
 void PlaylistView::refresh()

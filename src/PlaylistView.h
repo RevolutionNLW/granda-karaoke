@@ -35,6 +35,9 @@ public:
     void showMessage(const QString& message);
     qint64 displayedPlaylistId() const;
     qint64 selectedItemId() const;
+    // The catalogue song of the selected row (0 for none, or a song that is
+    // not in the library now).
+    qint64 selectedSongId() const;
     void setNamePrompt(NamePrompt prompt) { m_namePrompt = std::move(prompt); }
     void setDeleteConfirmation(DeleteConfirmation confirm)
     {
@@ -75,10 +78,17 @@ public:
     bool keyColumnShown() const { return m_showKeys; }
     // The key shown in a row ("" for none), for tests.
     QString rowKeyText(int row) const;
+    // Each song's Key setting in semitones, for its row's Key ("C \u2192 D");
+    // refreshKeys() shows a change.
+    using TransposeProvider = std::function<int(qint64 songId)>;
+    void setTransposeProvider(TransposeProvider provider);
+    void refreshKeys();
 
 public slots:
     void refresh();
     void addSong(qint64 songId);
+    // Asks for the selected row to be played (playRequested).
+    void playSelected();
 
 signals:
     void playRequested(PlaylistEntry entry, bool autoplay);
@@ -86,6 +96,8 @@ signals:
     void backRequested();
     // The playlist pane was used with the mouse (tabs, buttons, a drop).
     void interacted();
+    // Another row (or none) is selected.
+    void selectionChanged();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -95,11 +107,9 @@ private:
     void refreshItems(qint64 selectItemId = 0, bool ensureVisible = false);
     void updateButtons();
     void updatePlaybackMarkers();
-    void refreshKeys();
     void createPlaylist();
     void renamePlaylist();
     void deletePlaylist();
-    void playSelected();
     void moveSelected(int delta);
     void removeSelected();
     bool canAcceptDrop(const QMimeData* mimeData) const;
@@ -119,6 +129,7 @@ private:
     bool m_active = false;
     bool m_confirmRemove = true;
     bool m_showKeys = false;
+    TransposeProvider m_transpose;
     QLabel* m_message;
     QListWidget* m_items;
     QPushButton* m_newButton;

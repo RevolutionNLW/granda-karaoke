@@ -34,6 +34,7 @@
 #include <QTreeView>
 #include <QtTest>
 
+#include <cmath>
 #include <utility>
 #include <memory>
 
@@ -266,6 +267,8 @@ private slots:
     void removedOrDeletedOriginDoesNotAdvance();
     void libraryRefreshPreservesPlaylistPosition();
     void unavailableStoreLeavesLibraryUsable();
+    void playlistsHoldHundredsOfSongs();
+    void aLongPlaylistPlainlyScrolls();
 };
 
 void TestPlaylistView::initTestCase()
@@ -2275,6 +2278,193 @@ void TestPlaylistView::unavailableStoreLeavesLibraryUsable()
     QTest::mouseClick(window.libraryView()->singButton(), Qt::LeftButton);
     QCOMPARE(player.state(), KaraokePlayer::State::Playing);
     player.stop();
+}
+
+void TestPlaylistView::playlistsHoldHundredsOfSongs()
+{
+    // Frankie saw playlists stop at 15 or 16 songs: about what one screen
+    // shows. Songs past the first screenful are added, shown, reordered,
+    // played on by Autoplay and kept, at 20, 50, 100 and 500 songs.
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    const QString path = temporary.filePath(QStringLiteral("app/playlists.sqlite"));
+    auto playlists = std::make_unique<PlaylistStore>(path);
+    QVERIFY(playlists->open(nullptr, controller.libraryRoots()));
+    QVERIFY(playlists->setAutoplay(false));
+    qint64 other = 0;
+    QVERIFY(playlists->createPlaylist(QStringLiteral("Other"), &other));
+    addSong(*playlists, controller, other, songs.secondId);
+    const QList<qint64> otherItems = itemIds(*playlists, other);
+    qint64 playlistId = 0;
+    QVERIFY(playlists->createPlaylist(QStringLiteral("Party"), &playlistId));
+    QVERIFY(playlists->setLastPlaylistId(playlistId));
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    auto window = std::make_unique<MainWindow>(&player, &settings, &controller, playlists.get());
+    window->setShowErrorDialogs(false);
+    window->resize(1366, 705);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+    PlaylistView* view = window->playlistView();
+    QListWidget* list = view->itemList();
+    QCOMPARE(view->displayedPlaylistId(), playlistId);
+    LibraryView* library = window->libraryView();
+
+    // 20 songs one at a time with Add to Playlist: each lands at the end
+    // and is shown, beyond what fits on the screen too.
+    const qint64 shortSongs[] = {songs.firstId, songs.thirdId, songs.fourthId};
+    for (int i = 0; i < 20; ++i) {
+        library->searchBox()->clear();
+        library->refreshSearch();
+        const int row = libraryRowForSongId(library, shortSongs[i % 3]);
+        QVERIFY(row >= 0);
+        library->resultsList()->setCurrentIndex(library->resultsList()->model()->index(row, 0));
+        QTest::mouseClick(library->addToPlaylistButton(), Qt::LeftButton);
+        QCOMPARE(playlists->items(playlistId).size(), i + 1);
+        QCOMPARE(list->count(), i + 1);
+        QCOMPARE(list->currentRow(), i);
+        QVERIFY2(list->viewport()->rect().contains(list->visualItemRect(list->currentItem())),
+                 qPrintable(QStringLiteral("song %1 added out of sight").arg(i + 1)));
+    }
+    QVERIFY(list->verticalScrollBar()->maximum() > 0);  // more than one screenful
+    QVERIFY(list->verticalScrollBar()->isVisible());
+
+    // Reordered across the old boundary: dragged from row 18 to the top, and
+    // moved down past row 16 with the Down button.
+    list->scrollToItem(list->item(17));
+    QList<qint64> expected = itemIds(*playlists, playlistId);
+    {
+        auto dragged = itemMimeData(list, 17);
+        list->scrollToTop();
+        QCoreApplication::processEvents();
+        const QRect top = list->visualItemRect(list->item(0));
+        QVERIFY(sendDrop(list->viewport(), QPoint(top.center().x(), top.top() + 2), dragged.get(),
+                         Qt::CopyAction | Qt::MoveAction));
+        expected.move(17, 0);
+        QCOMPARE(itemIds(*playlists, playlistId), expected);
+        QCOMPARE(view->selectedItemId(), expected.first());
+    }
+    list->setCurrentRow(14);
+    for (int i = 0; i < 3; ++i)
+        QTest::mouseClick(view->moveDownButton(), Qt::LeftButton);
+    expected.move(14, 17);
+    QCOMPARE(itemIds(*playlists, playlistId), expected);
+    QCOMPARE(list->currentRow(), 17);
+
+    // Removed past the boundary and added again.
+    view->setConfirmRemove(false);
+    list->setCurrentRow(16);
+    QTest::mouseClick(view->removeButton(), Qt::LeftButton);
+    expected.removeAt(16);
+    QCOMPARE(itemIds(*playlists, playlistId), expected);
+    addSong(*playlists, controller, playlistId, songs.firstId);
+    view->refresh();
+    QCOMPARE(list->count(), 20);
+    expected = itemIds(*playlists, playlistId);
+
+    // Autoplay carries on from row 15 to 16 to 17.
+    QVERIFY(playlists->setAutoplay(true));
+    view->refresh();
+    list->setCurrentRow(14);
+    QTest::mouseClick(view->playButton(), Qt::LeftButton);
+    QCOMPARE(window->playlistPlayback()->context()->itemId, expected.at(14));
+    QTRY_COMPARE_WITH_TIMEOUT(window->playlistPlayback()->context()->itemId, expected.at(15), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(window->playlistPlayback()->context()->itemId, expected.at(16), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(window->playlistPlayback()->context()->itemId, expected.at(17), 5000);
+    window->stopButton()->click();
+    QVERIFY(playlists->setAutoplay(false));
+
+    // Bigger playlists: every song is listed and the last can be scrolled to.
+    for (const int size : {50, 100, 500}) {
+        while (playlists->items(playlistId).size() < size)
+            addSong(*playlists, controller, playlistId, shortSongs[playlists->items(playlistId).size() % 3]);
+        view->refresh();
+        QCOMPARE(list->count(), size);
+        list->scrollToItem(list->item(size - 1));
+        QVERIFY(list->viewport()->rect().contains(list->visualItemRect(list->item(size - 1))));
+    }
+    expected = itemIds(*playlists, playlistId);
+    QCOMPARE(expected.size(), 500);
+
+    // A restart shows the whole playlist in its order; the other is as it was.
+    window.reset();
+    playlists = std::make_unique<PlaylistStore>(path);
+    QVERIFY(playlists->open(nullptr, controller.libraryRoots()));
+    QCOMPARE(itemIds(*playlists, playlistId), expected);
+    QCOMPARE(itemIds(*playlists, other), otherItems);
+    MainWindow restarted(&player, &settings, &controller, playlists.get());
+    restarted.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&restarted));
+    QCOMPARE(restarted.playlistView()->displayedPlaylistId(), playlistId);
+    QCOMPARE(restarted.playlistView()->itemList()->count(), 500);
+}
+
+void TestPlaylistView::aLongPlaylistPlainlyScrolls()
+{
+    // A playlist longer than its pane shows a scroll bar that can be seen
+    // against the dark rows (WCAG's 3:1 for parts of a control), at every
+    // interface size on a laptop screen; the old one all but vanished, so
+    // the songs past the first screenful seemed not to be there.
+    auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
+    const QFont plainFont = QApplication::font();
+    theme::apply(*app);
+    const auto plain = qScopeGuard([app, plainFont] {
+        theme::setScalePercent(100);
+        app->setStyleSheet(QString());
+        QApplication::setFont(plainFont);
+    });
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
+    QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
+    qint64 playlistId = 0;
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Long"), &playlistId));
+    for (int i = 0; i < 40; ++i)
+        addSong(playlists, controller, playlistId, songs.firstId);
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    MainWindow window(&player, &settings, &controller, &playlists);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QListWidget* list = window.playlistView()->itemList();
+    // Relative luminance and contrast ratio, as WCAG defines them.
+    const auto luminance = [](QColor color) {
+        const auto channel = [](double value) {
+            return value <= 0.03928 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(color.redF()) + 0.7152 * channel(color.greenF())
+            + 0.0722 * channel(color.blueF());
+    };
+    const auto contrast = [&luminance](QColor a, QColor b) {
+        const double x = luminance(a) + 0.05;
+        const double y = luminance(b) + 0.05;
+        return std::max(x, y) / std::min(x, y);
+    };
+    for (const int percent : {80, 100, 125, 150}) {
+        theme::setScalePercent(percent);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::ApplicationFontChange);
+        QCoreApplication::processEvents();
+        window.resize(1366, 705);
+        QCoreApplication::processEvents();
+        const QString at = QStringLiteral("at %1%").arg(percent);
+        QScrollBar* bar = list->verticalScrollBar();
+        QVERIFY2(bar->isVisible() && bar->maximum() > 0, qPrintable(at));
+        bar->setValue(0);  // the handle at the top, the lane free below it
+        QCoreApplication::processEvents();
+        const QImage image = bar->grab().toImage();
+        // The handle against the lane it lies in, and the lane against the rows.
+        const QColor lane = image.pixelColor(image.width() / 2, image.height() * 9 / 10);
+        double handle = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x)
+                handle = std::max(handle, contrast(image.pixelColor(x, y), lane));
+        }
+        QVERIFY2(handle >= 3.0, qPrintable(QStringLiteral("%1: handle contrast %2").arg(at).arg(handle)));
+        QVERIFY2(lane != theme::color::rowBase, qPrintable(at));
+    }
 }
 
 QTEST_MAIN(TestPlaylistView)

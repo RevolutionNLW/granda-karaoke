@@ -3,6 +3,7 @@
 #include "SongPair.h"
 
 #include <QHash>
+#include <QList>
 #include <QSet>
 #include <QString>
 
@@ -18,6 +19,15 @@ struct SongSettings {
     int tempoPercent = 100;
 
     SongSettings clamped() const;
+    bool operator==(const SongSettings&) const = default;
+};
+
+// One song's remembered Key/Tempo, with the MP3 it was last remembered for.
+struct RememberedSongSettings {
+    QString identity;
+    SongSettings settings;
+    QString lastPath;
+    QString updated;  // when it was last remembered (ISO 8601, UTC)
 };
 
 // A path-independent fingerprint of the CDG content and MP3 audio payload.
@@ -38,6 +48,14 @@ public:
         Q_UNUSED(id)
         return true;
     }
+    // Every remembered song (empty for a store that cannot list them).
+    virtual QList<RememberedSongSettings> rememberedSongs() const { return {}; }
+    // The MP3 a song's settings were last remembered for (empty if unknown).
+    virtual QString lastPathFor(const QString& id) const
+    {
+        Q_UNUSED(id)
+        return {};
+    }
     // Forgets every song's Key/Tempo, after keeping a copy of the old file
     // (its path in backupPath). Not every store can.
     virtual bool forgetAll(QString* backupPath = nullptr, QString* error = nullptr)
@@ -57,6 +75,8 @@ public:
     bool store(const QString& id, const SongSettings& settings,
                const SongPair& pair) override;
     bool hasSettingsFor(const QString& id) const override { return m_entries.contains(id); }
+    QList<RememberedSongSettings> rememberedSongs() const override;
+    QString lastPathFor(const QString& id) const override { return m_entries.value(id).lastPath; }
     bool forgetAll(QString* backupPath = nullptr, QString* error = nullptr) override;
 
     QString path() const { return m_path; }

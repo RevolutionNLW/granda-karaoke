@@ -61,6 +61,15 @@ SongSettings SongSettingsStore::settingsFor(const QString& id) const
     return it == m_entries.cend() ? SongSettings{} : it->settings;
 }
 
+QList<RememberedSongSettings> SongSettingsStore::rememberedSongs() const
+{
+    QList<RememberedSongSettings> songs;
+    songs.reserve(m_entries.size());
+    for (auto it = m_entries.cbegin(); it != m_entries.cend(); ++it)
+        songs.append({it.key(), it->settings, it->lastPath, it->updated});
+    return songs;
+}
+
 bool SongSettingsStore::store(const QString& id, const SongSettings& settings,
                               const SongPair& pair)
 {

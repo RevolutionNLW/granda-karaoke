@@ -652,6 +652,65 @@ qint64 LibraryController::songIdForMp3File(const QString& mp3Path) const
     return 0;
 }
 
+QHash<QString, qint64> LibraryController::songIdsForRememberedFiles(const QStringList& mp3Paths) const
+{
+    QHash<QString, qint64> found;
+    if (!isAvailable() || mp3Paths.isEmpty())
+        return found;
+    const QList<CatalogueRoot> roots = m_catalogue.roots();
+    const auto active = std::find_if(roots.cbegin(), roots.cend(),
+                                     [](const CatalogueRoot& root) { return root.active; });
+    // The path inside a music folder, by name alone (empty when outside it).
+    const auto relativeTo = [](const QString& file, const QString& rootPath) {
+#ifdef Q_OS_WIN
+        const Qt::CaseSensitivity sensitivity = Qt::CaseInsensitive;
+#else
+        const Qt::CaseSensitivity sensitivity = Qt::CaseSensitive;
+#endif
+        const QString path = QDir::cleanPath(QDir::fromNativeSeparators(file));
+        QString root = QDir::cleanPath(QDir::fromNativeSeparators(rootPath));
+        if (!root.endsWith(QLatin1Char('/')))
+            root += QLatin1Char('/');
+        return path.startsWith(root, sensitivity) ? path.mid(root.size()) : QString();
+    };
+    QHash<QString, bool> folders;
+    const auto folderStillThere = [&folders](const QString& folder) {
+        if (const auto known = folders.constFind(folder); known != folders.cend())
+            return *known;
+        return *folders.insert(folder, QFileInfo::exists(folder));
+    };
+    for (const QString& path : mp3Paths) {
+        qint64 songId = 0;
+        if (active != roots.cend()) {
+            if (const QString relative = relativeTo(path, active->path); !relative.isEmpty())
+                songId = m_catalogue.findSongByMp3Path(active->path, relative);
+            // Only from a folder that is no longer there: two folders that
+            // both exist may hold different songs at the same place.
+            for (const CatalogueRoot& root : roots) {
+                if (songId != 0)
+                    break;
+                if (root.id == active->id)
+                    continue;
+                if (const QString relative = relativeTo(path, root.path);
+                    !relative.isEmpty() && !folderStillThere(root.path))
+                    songId = m_catalogue.findSongByMp3Path(active->path, relative);
+            }
+        }
+        for (const CatalogueRoot& root : roots) {
+            if (songId != 0)
+                break;
+            if (const QString relative = relativeTo(path, root.path); !relative.isEmpty())
+                songId = m_catalogue.findSongByMp3Path(root.path, relative);
+        }
+        // Spelt differently from its folder (a link, say): ask the file system.
+        if (songId == 0)
+            songId = songIdForMp3File(path);
+        if (songId != 0)
+            found.insert(path, songId);
+    }
+    return found;
+}
+
 QList<CatalogueSearchRow> LibraryController::browse(QString* error) const
 {
     if (!isAvailable()) {

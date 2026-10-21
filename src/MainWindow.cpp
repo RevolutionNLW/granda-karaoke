@@ -7,6 +7,7 @@
 #include "MetadataReviewDialog.h"
 #include "LyricsView.h"
 #include "PlaylistView.h"
+#include "RememberedSettings.h"
 #include "SongPair.h"
 #include "playlist/PlaylistPlayback.h"
 #include "playlist/PlaylistStore.h"
@@ -23,6 +24,7 @@
 #include <QElapsedTimer>
 #include <QCloseEvent>
 #include <QFileDialog>
+#include <QDateTime>
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
@@ -109,6 +111,7 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     , m_libraryController(libraryController)
     , m_playlistStore(playlistStore)
     , m_playlistPlayback(new PlaylistPlayback(playlistStore, this))
+    , m_remembered(std::make_unique<RememberedSettingsIndex>(settingsStore, libraryController))
 {
     Q_ASSERT(m_player);
     Q_ASSERT(m_settingsStore);
@@ -174,19 +177,23 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     connect(m_playButton, &QPushButton::clicked, this, &MainWindow::onPlay);
     connect(m_pauseButton, &QPushButton::clicked, this, &MainWindow::onPause);
     connect(m_stopButton, &QPushButton::clicked, this, &MainWindow::onStop);
-    connect(m_keyDownButton, &QPushButton::clicked, this, [this] { changeKey(-kKeyStep); });
-    connect(m_keyUpButton, &QPushButton::clicked, this, [this] { changeKey(kKeyStep); });
-    connect(m_keyResetButton, &QPushButton::clicked, this, [this] {
-        m_player->setKeySemitones(0);
-        persistCurrentSettings();
-        updateControls();
+    connect(m_keyDownButton, &QPushButton::clicked, this, [this] {
+        changeSettings([](SongSettings& settings) { settings.keySemitones -= kKeyStep; });
     });
-    connect(m_tempoDownButton, &QPushButton::clicked, this, [this] { changeTempo(-kTempoStep); });
-    connect(m_tempoUpButton, &QPushButton::clicked, this, [this] { changeTempo(kTempoStep); });
+    connect(m_keyUpButton, &QPushButton::clicked, this, [this] {
+        changeSettings([](SongSettings& settings) { settings.keySemitones += kKeyStep; });
+    });
+    connect(m_keyResetButton, &QPushButton::clicked, this, [this] {
+        changeSettings([](SongSettings& settings) { settings.keySemitones = 0; });
+    });
+    connect(m_tempoDownButton, &QPushButton::clicked, this, [this] {
+        changeSettings([](SongSettings& settings) { settings.tempoPercent -= kTempoStep; });
+    });
+    connect(m_tempoUpButton, &QPushButton::clicked, this, [this] {
+        changeSettings([](SongSettings& settings) { settings.tempoPercent += kTempoStep; });
+    });
     connect(m_tempoResetButton, &QPushButton::clicked, this, [this] {
-        m_player->setTempoPercent(100);
-        persistCurrentSettings();
-        updateControls();
+        changeSettings([](SongSettings& settings) { settings.tempoPercent = 100; });
     });
 
     connect(m_player, &KaraokePlayer::stateChanged, this, &MainWindow::onStateChanged);
@@ -231,10 +238,15 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
         m_playlistView->itemList()->viewport()->installEventFilter(this);
         connect(m_playlistView, &PlaylistView::interacted, this, [this] { setPlaylistInUse(true); });
         connect(m_library, &LibraryView::interacted, this, [this] { setPlaylistInUse(false); });
-        // Now Playing follows name corrections for the song loaded.
+        // Now Playing follows name corrections for the song loaded, and the
+        // rows' Key follows songs found again after a scan.
         const auto retitle = [this] {
             m_titlePath.clear();
             m_titleSongId = -1;
+            m_songKeyForId = -1;  // an original key can come with the catalogue
+            m_identities.clear();  // the files may have changed
+            m_remembered->invalidate();
+            refreshRowKeys();
             updateControls();
         };
         connect(m_libraryController, &LibraryController::catalogueChanged, this, retitle);
@@ -247,6 +259,12 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
                 this, &MainWindow::updateKeyColumn);
         m_libraryController->requestSongKeySummary();
         connect(m_libraryController, &LibraryController::libraryReady, this, retitle);
+        // Key/Tempo and Play follow the selection when nothing is being sung.
+        connect(m_library, &LibraryView::selectionChanged, this, &MainWindow::updateControls);
+        connect(m_playlistView, &PlaylistView::selectionChanged, this, &MainWindow::updateControls);
+        const auto transpose = [this](qint64 songId) { return rowTranspose(songId); };
+        m_library->setTransposeProvider(transpose);
+        m_playlistView->setTransposeProvider(transpose);
         // Enter is decided here first (see eventFilter).
         m_library->searchBox()->installEventFilter(this);
         m_playlistView->itemList()->installEventFilter(this);
@@ -435,6 +453,13 @@ void MainWindow::runAction(const QString& id)
         || id.startsWith(QLatin1String("key.")) || id.startsWith(QLatin1String("tempo."));
     if (lyricsVisible() && !songControl && id != QLatin1String("app.exit"))
         return;
+    // Play, Key and Tempo on the lyrics page are for the song being sung,
+    // never for a song selected on the hidden home screen (the lyrics can
+    // stay up after a song ends).
+    if (lyricsVisible() && !songActive()
+        && (id.startsWith(QLatin1String("key.")) || id.startsWith(QLatin1String("tempo."))
+            || (id == QLatin1String("playback.playPause") && playStartsSelection())))
+        return;
     // A maintenance preview is never replaced from the keyboard.
     if (m_previewing
         && (id == QLatin1String("library.sing") || id == QLatin1String("playlist.play")
@@ -453,10 +478,14 @@ void MainWindow::runAction(const QString& id)
     else if (id == QLatin1String("playback.stop"))
         press(m_stopButton);
     else if (id == QLatin1String("playback.restart")) {
-        // From the beginning, as Stop then Play would (not for a preview).
+        // The song loaded, from its beginning, as in v0.1.0 (not a preview,
+        // and never the selection, which only Play starts).
         if (m_player->hasSong() && !m_previewing) {
+            m_playlistPlayback->cancelPendingAutoplay();
             m_player->stop();
-            onPlay();
+            m_errorText.clear();
+            m_player->play();
+            updateControls();
         }
     } else if (id == QLatin1String("playback.autoplay"))
         press(m_playlistView ? m_playlistView->autoplayButton() : nullptr);
@@ -562,6 +591,9 @@ void MainWindow::applyPreference(const QString& key)
         m_player->setVolumePercent(m_preferences->number(key, 100));
     } else if (key == pref::AudioOutput) {
         m_player->setAudioOutput(m_preferences->text(key));
+    } else if (key == pref::DefaultKey || key == pref::DefaultTempo) {
+        refreshRowKeys();  // songs with nothing remembered start from these
+        updateControls();
     } else if (key == pref::KeepDisplayAwake) {
         applyDisplaySleep();
     } else if (key == pref::ScalePercent) {
@@ -608,6 +640,17 @@ SettingsDialog* MainWindow::openSettings()
         context.openNeedsReview = [this] { openMetadataReview(); };
         // After Settings has closed, as the window's close button would.
         context.quit = [this] { QTimer::singleShot(0, this, [this] { close(); }); };
+        context.songSettingsForgotten = [this] {
+            m_remembered->invalidate();
+            // A song loaded but not being sung starts from the defaults too.
+            if (m_player->hasSong() && !songActive() && !m_previewing) {
+                const SongSettings defaults = defaultSongSettings();
+                m_player->setKeySemitones(defaults.keySemitones);
+                m_player->setTempoPercent(defaults.tempoPercent);
+            }
+            refreshRowKeys();
+            updateControls();
+        };
         m_settings = new SettingsDialog(context, this);
         m_settings->setAttribute(Qt::WA_DeleteOnClose);
         connect(m_settings, &QDialog::finished, this, &MainWindow::restoreFocus);
@@ -670,6 +713,7 @@ void MainWindow::setPlaylistInUse(bool playlist)
                                  : static_cast<QWidget*>(m_library->searchBox());
     if (!lyricsVisible() && keyboard->isEnabled() && focusWidget() != keyboard)
         keyboard->setFocus(Qt::MouseFocusReason);
+    updateControls();  // Play, Key and Tempo follow the pane's selection
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event)
@@ -957,6 +1001,7 @@ void MainWindow::singLibrarySong(qint64 songId)
     if (!loadSong(paths.mp3Path))
         return;
     m_playSongId = songId;
+    noteLoadedSong();
     m_playlistPlayback->clear();
     updateControls();
     // Singing a library song starts it straight away (and shows its lyrics),
@@ -1009,6 +1054,7 @@ void MainWindow::playPlaylistItem(PlaylistEntry entry, bool autoplay)
         return;
     }
     m_playSongId = resolution.songId;
+    noteLoadedSong();
     updateControls();
     m_playlistPlayback->startedFromPlaylist(entry.playlistId, entry.itemId);
     m_player->play();
@@ -1040,6 +1086,7 @@ bool MainWindow::openSong(const QString& path)
     // A file opened directly counts as its catalogue song when it is one.
     if (m_libraryController)
         m_playSongId = m_libraryController->songIdForMp3File(m_player->song().mp3Path);
+    noteLoadedSong();
     m_playlistPlayback->clear();
     updateControls();
     return true;
@@ -1088,11 +1135,7 @@ bool MainWindow::loadSong(const QString& path)
     }
     // A song sung before keeps its own Key/Tempo; any other starts from the
     // defaults chosen in Settings (normally 0 and 100%).
-    const SongSettings settings = (!m_songIdentity.isEmpty()
-                                   && m_settingsStore->hasSettingsFor(m_songIdentity)
-        ? m_settingsStore->settingsFor(m_songIdentity)
-        : SongSettings{m_preferences->number(pref::DefaultKey, 0),
-                       m_preferences->number(pref::DefaultTempo, 100)}).clamped();
+    const SongSettings settings = songSettingsFor(m_songIdentity);
     m_player->setKeySemitones(settings.keySemitones);
     m_player->setTempoPercent(settings.tempoPercent);
     updateControls();
@@ -1101,6 +1144,13 @@ bool MainWindow::loadSong(const QString& path)
 
 void MainWindow::onPlay()
 {
+    // Nothing being sung: Play starts the song selected, as Sing This Song
+    // or the playlist's Play would.
+    if (playStartsSelection()) {
+        if (hasPlayableSelection())
+            playSelectedSong();
+        return;
+    }
     setPreviewing(false);  // the main Play button is normal singing
     m_playlistPlayback->cancelPendingAutoplay();
     m_errorText.clear();
@@ -1120,18 +1170,195 @@ void MainWindow::onStop()
     hideLyrics();
 }
 
-void MainWindow::changeKey(int delta)
+MainWindow::ControlTarget MainWindow::controlTarget() const
 {
-    m_player->setKeySemitones(m_player->keySemitones() + delta);
+    using State = KaraokePlayer::State;
+    using Kind = ControlTarget::Kind;
+    if (m_previewing)
+        return {};  // Key/Tempo belong to singing, not to a maintenance preview
+    const State state = m_player->state();
+    const bool hasSong = m_player->hasSong();
+    if (hasSong && (state == State::Playing || state == State::Paused || state == State::Ready))
+        return {Kind::Loaded, m_playSongId};
+    // Without a library the song last opened stays the one to play.
+    if (!m_library)
+        return hasSong ? ControlTarget{Kind::Loaded, m_playSongId} : ControlTarget{};
+    if (const qint64 songId = selectedSongId())
+        return {Kind::Selected, songId};
+    return {};
+}
+
+bool MainWindow::playStartsSelection() const
+{
+    using State = KaraokePlayer::State;
+    if (!m_library || m_previewing)
+        return false;
+    const State state = m_player->state();
+    return !(m_player->hasSong()
+             && (state == State::Playing || state == State::Paused || state == State::Ready));
+}
+
+bool MainWindow::hasPlayableSelection() const
+{
+    if (!m_library)
+        return false;
+    // A playlist row goes to the playlist's Play even when its song cannot
+    // be found now (which then says so).
+    return m_playlistView->isActive() ? m_playlistView->selectedItemId() != 0
+                                      : m_library->selectedSongId() != 0;
+}
+
+void MainWindow::noteLoadedSong()
+{
+    if (m_playSongId <= 0 || m_songIdentity.isEmpty())
+        return;
+    std::optional<SongSettings> settings;
+    if (m_settingsStore->hasSettingsFor(m_songIdentity)) {
+        settings = m_settingsStore->settingsFor(m_songIdentity).clamped();
+        // Moved or renamed since its settings were remembered: they are
+        // remembered for where it is now, so its rows show them after a
+        // restart too.
+        const QString last = m_settingsStore->lastPathFor(m_songIdentity);
+        if (!last.isEmpty()
+            && last != QFileInfo(m_player->song().mp3Path).absoluteFilePath())
+            m_settingsStore->store(m_songIdentity, *settings, m_player->song());
+    }
+    m_remembered->learn(m_playSongId, m_songIdentity, settings);
+    refreshRowKeys();
+}
+
+qint64 MainWindow::selectedSongId() const
+{
+    if (!m_library)
+        return 0;
+    return m_playlistView->isActive() ? m_playlistView->selectedSongId()
+                                      : m_library->selectedSongId();
+}
+
+void MainWindow::playSelectedSong()
+{
+    if (m_playlistView->isActive())
+        m_playlistView->playSelected();
+    else
+        singLibrarySong(m_library->selectedSongId());
+}
+
+void MainWindow::changeSettings(const std::function<void(SongSettings&)>& change)
+{
+    const ControlTarget target = controlTarget();
+    if (target.kind == ControlTarget::Kind::Selected) {
+        changeSelectedSettings(target.songId, change);
+        return;
+    }
+    if (target.kind == ControlTarget::Kind::None)
+        return;
+    SongSettings settings{m_player->keySemitones(), m_player->tempoPercent()};
+    change(settings);
+    settings = settings.clamped();
+    m_player->setKeySemitones(settings.keySemitones);
+    m_player->setTempoPercent(settings.tempoPercent);
     persistCurrentSettings();
+    refreshRowKeys();
     updateControls();
 }
 
-void MainWindow::changeTempo(int delta)
+bool MainWindow::changeSelectedSettings(qint64 songId,
+                                        const std::function<void(SongSettings&)>& change)
 {
-    m_player->setTempoPercent(m_player->tempoPercent() + delta);
-    persistCurrentSettings();
+    // Remembered under the song's identity, exactly as if it were playing,
+    // so it starts from them. Nothing is played or loaded.
+    QString error;
+    const PlaybackPaths paths = m_libraryController->playbackPathsForAny(songId, &error);
+    SongPair pair;
+    if (paths.playable() && QFileInfo::exists(paths.mp3Path) && QFileInfo::exists(paths.graphicsPath))
+        pair = resolveSongPair(paths.mp3Path).pair;
+    const QString identity = pair.isValid() ? identityOf(pair) : QString();
+    if (identity.isEmpty()) {
+        qCWarning(lcUi).noquote() << "Key/Tempo of song" << songId << "not changed:" << error
+                                  << paths.reason;
+        const QString message = QStringLiteral(
+            "This song's Key and Tempo can't be changed right now (is its music drive connected?).");
+        if (m_playlistView->isActive())
+            m_playlistView->showMessage(message);
+        else
+            m_library->showMessage(message);
+        return false;
+    }
+    SongSettings settings = songSettingsFor(identity);
+    change(settings);
+    settings = settings.clamped();
+    const bool saved = m_settingsStore->store(identity, settings, pair);
+    m_remembered->learn(songId, identity, settings);
+    // The same song, stopped in the player, would start from them too.
+    if (m_player->hasSong() && identity == m_songIdentity) {
+        m_player->setKeySemitones(settings.keySemitones);
+        m_player->setTempoPercent(settings.tempoPercent);
+    }
+    qCInfo(lcUi) << "Key/Tempo for song" << songId << "before it plays:" << settings.keySemitones
+                 << settings.tempoPercent << (saved ? "(saved)" : "(NOT saved)");
+    if (!saved) {
+        // Still used until the program closes, but not kept after that.
+        const QString message = QStringLiteral(
+            "This song's Key and Tempo are used for now, but could not be saved for next time.");
+        if (m_playlistView->isActive())
+            m_playlistView->showMessage(message);
+        else
+            m_library->showMessage(message);
+    }
+    refreshRowKeys();
     updateControls();
+    return true;
+}
+
+SongSettings MainWindow::defaultSongSettings() const
+{
+    // A song sung before keeps its own Key/Tempo; any other starts from the
+    // defaults chosen in Settings (normally 0 and 100%).
+    return SongSettings{m_preferences->number(pref::DefaultKey, 0),
+                        m_preferences->number(pref::DefaultTempo, 100)}.clamped();
+}
+
+SongSettings MainWindow::songSettingsFor(const QString& identity) const
+{
+    return !identity.isEmpty() && m_settingsStore->hasSettingsFor(identity)
+        ? m_settingsStore->settingsFor(identity).clamped()
+        : defaultSongSettings();
+}
+
+SongSettings MainWindow::selectedSongSettings(qint64 songId)
+{
+    return m_remembered->settingsFor(songId).value_or(defaultSongSettings());
+}
+
+QString MainWindow::identityOf(const SongPair& pair)
+{
+    const QFileInfo mp3(pair.mp3Path);
+    const QFileInfo cdg(pair.cdgPath);
+    const QString key = QStringLiteral("%1|%2|%3|%4|%5|%6")
+        .arg(mp3.absoluteFilePath()).arg(mp3.size()).arg(mp3.lastModified().toMSecsSinceEpoch())
+        .arg(cdg.absoluteFilePath()).arg(cdg.size()).arg(cdg.lastModified().toMSecsSinceEpoch());
+    if (const auto known = m_identities.constFind(key); known != m_identities.cend())
+        return *known;
+    const QString identity = songIdentity(pair);
+    if (!identity.isEmpty())
+        m_identities.insert(key, identity);
+    return identity;
+}
+
+int MainWindow::rowTranspose(qint64 songId)
+{
+    // The song being sung shows the Key heard now.
+    if (songActive() && songId == m_playSongId)
+        return m_player->keySemitones();
+    return selectedSongSettings(songId).keySemitones;
+}
+
+void MainWindow::refreshRowKeys()
+{
+    if (!m_library)
+        return;
+    m_library->refreshKeys();
+    m_playlistView->refreshKeys();
 }
 
 void MainWindow::persistCurrentSettings()
@@ -1146,8 +1373,9 @@ void MainWindow::persistCurrentSettings()
         }
         return;
     }
-    m_settingsStore->store(m_songIdentity,
-        SongSettings{m_player->keySemitones(), m_player->tempoPercent()}, m_player->song());
+    const SongSettings settings{m_player->keySemitones(), m_player->tempoPercent()};
+    m_settingsStore->store(m_songIdentity, settings, m_player->song());
+    m_remembered->learn(m_playSongId, m_songIdentity, settings);
 }
 
 void MainWindow::showLyrics()
@@ -1188,6 +1416,13 @@ void MainWindow::onStateChanged(KaraokePlayer::State state)
     // Pause, never for a maintenance preview), when its audio first advances.
     const KaraokePlayer::State previous = m_lastPlayerState;
     m_lastPlayerState = state;
+    // The song being sung shows its live Key in the rows; once it is not,
+    // its remembered one (or the default) again.
+    const auto active = [](KaraokePlayer::State s) {
+        return s == KaraokePlayer::State::Playing || s == KaraokePlayer::State::Paused;
+    };
+    if (active(previous) != active(state))
+        refreshRowKeys();
     if (state == KaraokePlayer::State::Playing) {
         if (previous != KaraokePlayer::State::Paused && previous != KaraokePlayer::State::Playing)
             m_playStartPending = !m_previewing && m_playSongId != 0 && m_libraryController;
@@ -1279,7 +1514,10 @@ void MainWindow::updateControls()
     const State state = m_player->state();
     const bool hasSong = m_player->hasSong();
 
-    m_songLabel->setText(hasSong ? songTitle() : QStringLiteral("No song loaded"));
+    // Now Playing is what is being played: nothing once it is stopped or has
+    // finished, and never a song that is only selected.
+    const bool playing = hasSong && (state == State::Playing || state == State::Paused);
+    m_songLabel->setText(playing ? songTitle() : QStringLiteral("Nothing playing"));
 
     const QString time = formatTime(m_player->positionMs());
     const QString total = m_player->durationMs() > 0
@@ -1302,10 +1540,12 @@ void MainWindow::updateControls()
         status = QStringLiteral("Paused at %1. Press Resume to carry on.").arg(time);
         break;
     case State::Stopped:
-        status = QStringLiteral("Stopped. Press Play to start from the beginning.");
+        status = m_library ? QStringLiteral("Stopped. Choose a song and press Play.")
+                           : QStringLiteral("Stopped. Press Play to start from the beginning.");
         break;
     case State::Finished:
-        status = QStringLiteral("Finished. Press Play to sing it again.");
+        status = m_library ? QStringLiteral("Finished. Choose a song and press Play.")
+                           : QStringLiteral("Finished. Press Play to sing it again.");
         break;
     case State::Error:
         status = QStringLiteral("Sorry, this song could not be played.");
@@ -1321,7 +1561,9 @@ void MainWindow::updateControls()
 
     m_playButton->setText(state == State::Paused ? QStringLiteral("Resume") : QStringLiteral("Play"));
     m_playButton->setToolTip(m_playButton->text());
-    m_playButton->setEnabled(hasSong && state != State::Playing);
+    const ControlTarget target = controlTarget();
+    m_playButton->setEnabled(state != State::Playing
+                             && (playStartsSelection() ? hasPlayableSelection() : hasSong));
     m_pauseButton->setEnabled(state == State::Playing);
     // Play and Pause share one place in the player bar.
     m_pauseButton->setVisible(state == State::Playing);
@@ -1332,12 +1574,20 @@ void MainWindow::updateControls()
     if (m_library)
         m_library->setPlayingSongId(songActive() ? m_playSongId : 0);
 
-    const int key = hasSong ? m_player->keySemitones() : 0;
-    const int tempo = hasSong ? m_player->tempoPercent() : 100;
+    // Key and Tempo show the settings of the song they act on: the one being
+    // sung, or the selected one before it plays (a preview's, unchangeable).
+    SongSettings shown;
+    if (target.kind == ControlTarget::Kind::Selected)
+        shown = selectedSongSettings(target.songId);
+    else if (target.kind == ControlTarget::Kind::Loaded || (m_previewing && hasSong))
+        shown = SongSettings{m_player->keySemitones(), m_player->tempoPercent()};
+    const int key = shown.keySemitones;
+    const int tempo = shown.tempoPercent;
     m_keyValueLabel->setText(key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key));
-    // Original key -> current key, only for a song whose key is known
-    // (never for a maintenance preview).
-    const qint64 keySongId = hasSong && !m_previewing ? m_playSongId : 0;
+    // Original key -> current key, only beside a song being sung whose key
+    // is known (never for a maintenance preview).
+    const int liveKey = m_player->keySemitones();
+    const qint64 keySongId = songActive() ? m_playSongId : 0;
     if (keySongId != m_songKeyForId) {
         m_songKeyForId = keySongId;
         m_songKeyIndex = -1;
@@ -1348,18 +1598,17 @@ void MainWindow::updateControls()
     }
     if (m_songKeyIndex >= 0) {
         const QString original = songKeyName(m_songKeyIndex);
-        const QString current = transposedKeyName(m_songKeyIndex, key);
-        const QString shift = key > 0 ? QStringLiteral("+%1").arg(key) : QString::number(key);
-        m_songKeyLabel->setText(key == 0 ? QStringLiteral("Key %1").arg(original)
-                                         : QStringLiteral("Key %1 \u2192 %2").arg(original, current));
-        m_songKeyLabel->setToolTip(key == 0
+        const QString current = transposedKeyName(m_songKeyIndex, liveKey);
+        const QString shift = liveKey > 0 ? QStringLiteral("+%1").arg(liveKey) : QString::number(liveKey);
+        m_songKeyLabel->setText(QStringLiteral("Key %1").arg(songKeyDisplay(m_songKeyIndex, liveKey)));
+        m_songKeyLabel->setToolTip(liveKey == 0
             ? QStringLiteral("Original key: %1").arg(original)
             : QStringLiteral("Original key: %1\nCurrent key: %2 (%3)").arg(original, current, shift));
     }
-    m_songKeyLabel->setVisible(m_songKeyIndex >= 0);
+    m_songKeyLabel->setVisible(keySongId > 0 && m_songKeyIndex >= 0);
     m_tempoValueLabel->setText(QStringLiteral("%1%").arg(tempo));
     // Key/Tempo belong to singing, not to a maintenance preview.
-    const bool adjustable = hasSong && !m_previewing;
+    const bool adjustable = target.kind != ControlTarget::Kind::None;
     m_keyDownButton->setEnabled(adjustable && key > kMinKey);
     m_keyUpButton->setEnabled(adjustable && key < kMaxKey);
     m_keyResetButton->setEnabled(adjustable);

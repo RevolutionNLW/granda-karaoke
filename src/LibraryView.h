@@ -56,6 +56,11 @@ public:
     // Whether any song key can be shown (analysis on, or keys already known):
     // the Key column stays out of the way until then.
     void setKeyColumnAvailable(bool available);
+    // Each song's Key setting in semitones, for its row's Key ("C \u2192 D");
+    // refreshKeys() shows a change.
+    using TransposeProvider = std::function<int(qint64 songId)>;
+    void setTransposeProvider(TransposeProvider provider);
+    void refreshKeys();
     // Set Song Key: the original key of the selected song, chosen by hand.
     // Returns the popup (nullptr when no song is selected).
     SongKeyPicker* openSongKeyPicker();
@@ -65,6 +70,8 @@ signals:
     // The library was used with the mouse (e.g. its sort or buttons).
     void interacted();
     void addRequested(qint64 songId);
+    // Another song (or none) is selected.
+    void selectionChanged();
 
 public slots:
     void refreshSearch();
@@ -114,6 +121,7 @@ private:
     bool m_active = true;
     bool m_keyColumnWanted = true;  // the user's choice; see applyColumnWidths()
     bool m_keyColumnAvailable = false;
+    TransposeProvider m_transpose;
     // The (trimmed) search text the results show, so typing only spaces
     // does not search again and lose the list's place.
     QString m_shownQuery;

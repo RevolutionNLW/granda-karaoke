@@ -1,8 +1,12 @@
 #include "ui/Controls.h"
 
+#include "SongSettings.h"
+#include "library/SongKeys.h"
 #include "ui/Theme.h"
 
 #include <QEvent>
+#include <QFontMetrics>
+#include <QHash>
 #include <QFrame>
 #include <QHeaderView>
 #include <QIconEngine>
@@ -12,6 +16,8 @@
 #include <QStyleOptionComboBox>
 #include <QStylePainter>
 #include <QTreeView>
+
+#include <algorithm>
 
 namespace ui {
 
@@ -218,6 +224,23 @@ void ToggleSwitch::paintEvent(QPaintEvent*)
     const qreal x = isChecked() ? track.right() - 2 - knob : track.left() + 2;
     painter.setBrush(isEnabled() ? QColor(0xf6, 0xf2, 0xea) : QColor(0x8a, 0x86, 0x7f));
     painter.drawEllipse(QRectF(x, track.top() + 2, knob, knob));
+}
+
+int songKeyTextWidth(const QFont& font)
+{
+    // Asked while painting rows: worked out once per font.
+    static QHash<QString, int> widths;
+    const QString fontKey = font.key();
+    if (const auto known = widths.constFind(fontKey); known != widths.cend())
+        return *known;
+    const QFontMetrics metrics(font);
+    int widest = 0;
+    for (int key = 0; key < 24; ++key) {
+        for (int semitones = kMinKey; semitones <= kMaxKey; ++semitones)
+            widest = std::max(widest, metrics.horizontalAdvance(songKeyDisplay(key, semitones)));
+    }
+    widths.insert(fontKey, widest);
+    return widest;
 }
 
 } // namespace ui

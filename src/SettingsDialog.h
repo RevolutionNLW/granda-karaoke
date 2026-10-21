@@ -44,6 +44,8 @@ public:
         std::function<void()> openNeedsReview;
         // Closes the program (asking first if the user chose so).
         std::function<void()> quit;
+        // Every song's Key/Tempo was just forgotten.
+        std::function<void()> songSettingsForgotten;
     };
     // Asked before a shortcut is moved from one action to another; returns
     // true to move it (tests replace the question).

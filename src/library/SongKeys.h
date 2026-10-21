@@ -42,3 +42,8 @@ public:
 QString songKeyName(int keyIndex);
 // The key heard with the song transposed by `semitones`, e.g. "D" for C at +2.
 QString transposedKeyName(int keyIndex, int semitones);
+// How a song's key is shown everywhere (library, playlists, Now Playing): the
+// original key alone ("C"), or with the key heard at the song's Key setting
+// ("C \u2192 D" at +2, "C \u2192 Bb" at -2). Empty when the key is not known:
+// no key is made up from the Key setting alone.
+QString songKeyDisplay(int keyIndex, int semitones);

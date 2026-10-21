@@ -208,9 +208,10 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
         m_resultsModel->setPlayCountProvider([controller](qint64 songId) {
             return controller->playStats(songId).playCount;
         });
-        m_resultsModel->setKeyProvider([controller](qint64 songId) {
+        m_resultsModel->setKeyProvider([this, controller](qint64 songId) {
             const std::optional<SongKeyInfo> key = controller->songKey(songId);
-            return key ? songKeyName(key->shownKeyIndex()) : QString();
+            return key ? songKeyDisplay(key->shownKeyIndex(), m_transpose ? m_transpose(songId) : 0)
+                       : QString();
         });
     }
     m_results->setModel(m_resultsModel);
@@ -331,6 +332,7 @@ LibraryView::LibraryView(LibraryController* controller, QWidget* parent)
                 updateSelectionActions();
                 if (selectedSongId() != m_keyErrorSongId)
                     clearKeyError();  // it was about another song
+                emit selectionChanged();
             });
     connect(m_results, &QAbstractItemView::doubleClicked, this,
             [this](const QModelIndex&) { singSelected(); });
@@ -375,11 +377,11 @@ void LibraryView::applyColumnWidths()
     columns->resizeSection(LibraryResultsModel::LabelColumn, share(18, 100, 180));
     columns->resizeSection(LibraryResultsModel::DiscColumn, share(15, 106, 140));
     columns->resizeSection(LibraryResultsModel::PlaysColumn, theme::px(64));
-    // Room for the widest key ("G#m", "Bbm") and the caption. The Key column
-    // gives way when Artist and Song would be left narrower than Label (a
-    // small screen at a large interface size); the player bar still shows
-    // the key of the song being sung.
-    const int keyWidth = theme::px(52);
+    // Room for the widest key ("G#m \u2192 A#m" and the like) and the caption.
+    // The Key column gives way when Artist and Song would be left narrower
+    // than Label (a small screen at a large interface size); the player bar
+    // still shows the key of the song being sung.
+    const int keyWidth = std::max(theme::px(52), ui::songKeyTextWidth(m_results->font()) + theme::px(24));
     columns->resizeSection(LibraryResultsModel::KeyColumn, keyWidth);
     int fixed = keyWidth;
     for (const int column : {int(LibraryResultsModel::LabelColumn), int(LibraryResultsModel::DiscColumn),
@@ -392,6 +394,17 @@ void LibraryView::applyColumnWidths()
     const bool room = (width - fixed) / 2 >= label;
     m_results->setColumnHidden(LibraryResultsModel::KeyColumn,
                                !(m_keyColumnWanted && m_keyColumnAvailable && room));
+}
+
+void LibraryView::setTransposeProvider(TransposeProvider provider)
+{
+    m_transpose = std::move(provider);
+    refreshKeys();
+}
+
+void LibraryView::refreshKeys()
+{
+    m_resultsModel->forgetKeys();
 }
 
 void LibraryView::setKeyColumnAvailable(bool available)

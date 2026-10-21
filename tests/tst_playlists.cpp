@@ -69,6 +69,7 @@ private slots:
     void catalogueIsolationAndStableRescan();
     void indexedCatalogueResolversScale();
     void schemaCorruptionAndStorageSafety();
+    void hundredsOfSongsKeepTheirOrder();
 };
 
 void TestPlaylists::lifecyclePersistenceAndPreferences()
@@ -376,6 +377,71 @@ void TestPlaylists::schemaCorruptionAndStorageSafety()
     PlaylistStore unavailable(blocker + QStringLiteral("/playlists.sqlite"));
     QVERIFY(!unavailable.open(&error));
     QVERIFY(!unavailable.isOpen());
+}
+
+void TestPlaylists::hundredsOfSongsKeepTheirOrder()
+{
+    // No playlist is limited to a screenful (Frankie reported 15 or 16):
+    // hundreds of songs are kept, in order, through reordering, removing,
+    // adding again and reopening, and the next song is found past any point.
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    const QString path = temporary.filePath(QStringLiteral("app/playlists.sqlite"));
+    QList<qint64> expected;
+    qint64 big = 0;
+    qint64 small = 0;
+    {
+        PlaylistStore store(path);
+        QVERIFY(store.open());
+        QVERIFY(store.createPlaylist(QStringLiteral("Big"), &big));
+        QVERIFY(store.createPlaylist(QStringLiteral("Small"), &small));
+        for (int i = 1; i <= 3; ++i)
+            QVERIFY(store.addItem(small, song(1000 + i, QStringLiteral("Small %1").arg(i))));
+        for (const int size : {20, 50, 100, 500}) {
+            while (expected.size() < size) {
+                const qint64 id = expected.size() + 1;
+                QVERIFY(store.addItem(big, song(id, QStringLiteral("Song %1").arg(id))));
+                expected.append(id);
+            }
+            QCOMPARE(itemSongIds(store, big), expected);
+            QCOMPARE(store.playlist(big)->itemCount, size);
+        }
+        const QList<PlaylistEntry> entries = store.items(big);
+        for (int i = 0; i < entries.size(); ++i)
+            QCOMPARE(entries.at(i).position, i);
+
+        // Across the old boundary, both ways.
+        QVERIFY(store.moveItem(entries.at(2).itemId, 17));
+        expected.move(2, 17);
+        QVERIFY(store.moveItem(entries.at(18).itemId, 1));
+        expected.move(expected.indexOf(entries.at(18).songId), 1);
+        QVERIFY(store.moveItem(entries.at(400).itemId, 15));
+        expected.move(expected.indexOf(entries.at(400).songId), 15);
+        QCOMPARE(itemSongIds(store, big), expected);
+
+        // The next song after positions 14, 15 and 16, and after the last.
+        const QList<PlaylistEntry> moved = store.items(big);
+        for (const int row : {14, 15, 16, 498}) {
+            const auto next = store.itemAfter(big, moved.at(row).itemId);
+            QVERIFY(next);
+            QCOMPARE(next->songId, moved.at(row + 1).songId);
+        }
+        QVERIFY(!store.itemAfter(big, moved.last().itemId));
+
+        // Removed and added again (at the end).
+        QVERIFY(store.removeItem(moved.at(16).itemId));
+        expected.removeAt(16);
+        QVERIFY(store.addItem(big, song(moved.at(16).songId, QStringLiteral("Again"))));
+        expected.append(moved.at(16).songId);
+        QCOMPARE(itemSongIds(store, big), expected);
+    }
+    PlaylistStore reopened(path);
+    QVERIFY(reopened.open());
+    QCOMPARE(itemSongIds(reopened, big), expected);
+    const QList<PlaylistEntry> entries = reopened.items(big);
+    for (int i = 0; i < entries.size(); ++i)
+        QCOMPARE(entries.at(i).position, i);
+    QCOMPARE(itemSongIds(reopened, small), (QList<qint64>{1001, 1002, 1003}));
 }
 
 QTEST_GUILESS_MAIN(TestPlaylists)

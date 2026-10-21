@@ -12,3 +12,11 @@ QString transposedKeyName(int keyIndex, int semitones)
         return {};
     return QString::fromStdString(key->transposed(semitones).name());
 }
+
+QString songKeyDisplay(int keyIndex, int semitones)
+{
+    const QString original = songKeyName(keyIndex);
+    if (original.isEmpty() || semitones == 0)
+        return original;
+    return original + QStringLiteral(" \u2192 ") + transposedKeyName(keyIndex, semitones);
+}

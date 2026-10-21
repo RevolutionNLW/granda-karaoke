@@ -438,11 +438,14 @@ void TestLibrarySort::playsCountOncePerSungStart()
     QTest::qWait(300);
     QCOMPARE(plays(QStringLiteral("help")), 1);
     QVERIFY(QFileInfo(player.song().mp3Path).fileName().contains(QStringLiteral("Ring of Fire")));
-    // Play then sings the song still loaded (the preview's), which is a real play of it.
+    // Play starts the song selected (which still fails), never the preview's
+    // song left loaded and shown nowhere.
+    QVERIFY(window.playButton()->isEnabled());
     QTest::mouseClick(window.playButton(), Qt::LeftButton);
-    QTRY_COMPARE_WITH_TIMEOUT(player.state(), KaraokePlayer::State::Finished, 4000);
+    QTest::qWait(300);
+    QVERIFY(player.state() != KaraokePlayer::State::Playing);
     QCOMPARE(plays(QStringLiteral("help")), 1);
-    QCOMPARE(plays(QStringLiteral("ringSunfly")), 1);
+    QCOMPARE(plays(QStringLiteral("ringSunfly")), 0);
     QCOMPARE(plays(QStringLiteral("ringLegends")), 2);
     QVERIFY(!QFileInfo::exists(settingsPath));
 }

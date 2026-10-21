@@ -595,6 +595,8 @@ void SettingsDialog::forgetAllSongSettings()
     QString backup;
     QString error;
     if (m_context.songSettings->forgetAll(&backup, &error)) {
+        if (m_context.songSettingsForgotten)
+            m_context.songSettingsForgotten();
         m_forgetMessage->setText(backup.isEmpty()
             ? QStringLiteral("Done: every song now starts at its original key and speed.")
             : QStringLiteral("Done. The old settings were kept in %1").arg(backup));
