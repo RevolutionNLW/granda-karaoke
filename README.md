@@ -269,3 +269,6 @@ FKS_TEST_MEDIA_DIR="$HOME/Music/Frankies-Karaoke-Studio" build/tests/tst_karaoke
 ```
 
 Logs: `~/Library/Application Support/Granda/FrankiesKaraokeStudio/frankies-karaoke-studio.log`
+
+The self-contained macOS release package (`.app` and `.dmg`) is described in
+`packaging/macos/README.md`.
