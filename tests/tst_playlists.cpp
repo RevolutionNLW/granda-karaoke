@@ -70,6 +70,7 @@ private slots:
     void indexedCatalogueResolversScale();
     void schemaCorruptionAndStorageSafety();
     void hundredsOfSongsKeepTheirOrder();
+    void severalSongsAreAddedAtTheEndTogether();
 };
 
 void TestPlaylists::lifecyclePersistenceAndPreferences()
@@ -442,6 +443,47 @@ void TestPlaylists::hundredsOfSongsKeepTheirOrder()
     for (int i = 0; i < entries.size(); ++i)
         QCOMPARE(entries.at(i).position, i);
     QCOMPARE(itemSongIds(reopened, small), (QList<qint64>{1001, 1002, 1003}));
+}
+
+void TestPlaylists::severalSongsAreAddedAtTheEndTogether()
+{
+    QTemporaryDir temporary;
+    const QString path = temporary.filePath(QStringLiteral("app/playlists.sqlite"));
+    qint64 playlistId = 0;
+    qint64 otherId = 0;
+    QList<qint64> added;
+    {
+        PlaylistStore store(path);
+        QVERIFY(store.open());
+        QVERIFY(store.createPlaylist(QStringLiteral("Party"), &playlistId));
+        QVERIFY(store.createPlaylist(QStringLiteral("Other"), &otherId));
+        QVERIFY(store.addItem(playlistId, song(1, QStringLiteral("One"))));
+        QVERIFY(store.addItem(playlistId, song(2, QStringLiteral("Two"))));
+        QVERIFY(store.addItem(otherId, song(9, QStringLiteral("Nine"))));
+        QString error;
+        QVERIFY(!store.addItems(playlistId, {}, &added, &error));
+        QVERIFY(!error.isEmpty());
+        QVERIFY(added.isEmpty());
+        QVERIFY2(store.addItems(playlistId, {song(3, QStringLiteral("Three")), song(1, QStringLiteral("One")),
+                                             song(4, QStringLiteral("Four"))},
+                                &added, &error),
+                 qPrintable(error));
+        QCOMPARE(added.size(), 3);
+    }
+    PlaylistStore store(path);
+    QVERIFY(store.open());
+    const QList<PlaylistEntry> items = store.items(playlistId);
+    QCOMPARE(items.size(), 5);
+    QList<qint64> songs;
+    for (int i = 0; i < items.size(); ++i) {
+        QCOMPARE(items.at(i).position, i);
+        songs.append(items.at(i).songId);
+    }
+    QCOMPARE(songs, QList<qint64>({1, 2, 3, 1, 4}));  // a song already there is added again, as Add does
+    QCOMPARE(QList<qint64>({items.at(2).itemId, items.at(3).itemId, items.at(4).itemId}), added);
+    QCOMPARE(store.itemAfter(playlistId, items.at(1).itemId)->itemId, added.first());
+    QVERIFY(!store.itemAfter(playlistId, added.last()));
+    QCOMPARE(store.items(otherId).size(), 1);
 }
 
 QTEST_GUILESS_MAIN(TestPlaylists)

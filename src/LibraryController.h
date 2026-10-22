@@ -41,6 +41,9 @@ public:
     ~LibraryController() override;
 
     bool isAvailable() const { return m_catalogue.isOpen(); }
+    // The enrichment cache, for results kept between sessions; empty when it
+    // could not be used this session.
+    QString enrichmentCachePath() const;
     QString openError() const { return m_openError; }
     bool hasActiveRoot() const;
     CatalogueRoot activeRoot() const;

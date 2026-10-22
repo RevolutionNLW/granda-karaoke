@@ -56,6 +56,10 @@ public:
     void play();   // Starts from the beginning, or resumes when paused.
     void pause();
     void stop();   // Stops and resets audio and lyrics to the beginning.
+    // Ends the song now as if it had reached its end (Finished, so Autoplay
+    // moves on as usual): for the silence at the end of a file, which
+    // Smart Autoplay End skips. Only while Playing.
+    void finishEarly();
     void setKeySemitones(int semitones);
     void setTempoPercent(int percent);
     // The sound output to use, by the name the system shows for it (see
@@ -114,6 +118,8 @@ private:
     void resetActiveTempo();
     void applyKey();
     void handleMessage(GstMessage* message);
+    // The song is over: its end, or finishEarly (early).
+    void finishSong(bool early);
     void handleError(GstMessage* message, bool report);
     void discardPendingMessages();
     void checkAudioSink();

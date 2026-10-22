@@ -21,6 +21,12 @@ bool cdgContentDigest(const QString& path, QByteArray* digest, qint64* graphicsP
 // that differ only in their tags.
 bool mp3AudioDigest(const QString& path, QByteArray* digest);
 
+// SHA-256 of the whole MP3 audio payload (recognised tags excluded, every
+// byte of the audio read). For results that may end a song early (Smart
+// Autoplay End), where two recordings sharing only their first and last
+// 64 KiB must never be taken for one another.
+bool mp3CompleteAudioDigest(const QString& path, QByteArray* digest);
+
 // A cheap pre-filter: SHA-256 of the size and the first and last 64 KiB.
 // Equal quick digests only nominate a pair for the complete comparison.
 bool quickFileDigest(const QString& path, QByteArray* digest);

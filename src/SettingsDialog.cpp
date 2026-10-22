@@ -519,6 +519,17 @@ QWidget* SettingsDialog::buildPlayback()
             prefs->text(pref::AutoplayAtStartup, QStringLiteral("remember")))));
     });
     addHint(layout, QStringLiteral("Autoplay only ever moves on through a playlist."), page);
+    auto* skipSilence = new QCheckBox(QStringLiteral("Skip trailing silence during Autoplay"), page);
+    skipSilence->setObjectName(QStringLiteral("skipTrailingSilence"));
+    layout->addWidget(skipSilence);
+    connect(skipSilence, &QCheckBox::toggled, prefs,
+            [prefs](bool on) { prefs->setFlag(pref::SkipTrailingSilence, on); });
+    m_refreshers.append([skipSilence, prefs] {
+        const QSignalBlocker blocker(skipSilence);
+        skipSilence->setChecked(prefs->flag(pref::SkipTrailingSilence, true));
+    });
+    addHint(layout, QStringLiteral("The next song starts soon after the music ends, "
+                                   "instead of after the silence at the end of the file."), page);
 
     addSection(layout, QStringLiteral("Songs sung for the first time"), page);
     const auto stepper = [this, prefs, page, layout](const QString& title, const QString& key,
@@ -575,7 +586,8 @@ QWidget* SettingsDialog::buildPlayback()
     auto* restore = makeButton(QStringLiteral("Restore Playback Defaults"), page,
                                QStringLiteral("ghostButton"));
     connect(restore, &QPushButton::clicked, this, [prefs] {
-        for (const QString& key : {pref::AutoplayAtStartup, pref::DefaultKey, pref::DefaultTempo,
+        for (const QString& key : {pref::AutoplayAtStartup, pref::SkipTrailingSilence,
+                                   pref::DefaultKey, pref::DefaultTempo,
                                    pref::ReturnHomeAtEnd, pref::KeepDisplayAwake})
             prefs->reset(key);
     });

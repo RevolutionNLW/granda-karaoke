@@ -1,5 +1,6 @@
 #include "LibraryResultsModel.h"
 
+#include <QMap>
 #include <QMimeData>
 
 LibraryResultsModel::LibraryResultsModel(QObject* parent)
@@ -117,16 +118,21 @@ QStringList LibraryResultsModel::mimeTypes() const
 
 QMimeData* LibraryResultsModel::mimeData(const QModelIndexList& indexes) const
 {
+    // Every song dragged, in the order shown ("12" or "12,7,30"): a drop
+    // adds them to the playlist in that order.
     auto* mimeData = new QMimeData;
-    qint64 songId = 0;
+    QMap<int, qint64> songsByRow;
     for (const QModelIndex& index : indexes) {
-        const qint64 candidate = data(index, SongIdRole).toLongLong();
-        if (candidate == 0 || (songId != 0 && candidate != songId))
+        const qint64 songId = data(index, SongIdRole).toLongLong();
+        if (songId == 0)
             return mimeData;
-        songId = candidate;
+        songsByRow.insert(index.row(), songId);
     }
-    if (songId != 0)
-        mimeData->setData(SongMimeType, QByteArray::number(songId));
+    QList<QByteArray> songIds;
+    for (const qint64 songId : std::as_const(songsByRow))
+        songIds.append(QByteArray::number(songId));
+    if (!songIds.isEmpty())
+        mimeData->setData(SongMimeType, songIds.join(','));
     return mimeData;
 }
 

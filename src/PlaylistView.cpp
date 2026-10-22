@@ -292,12 +292,14 @@ protected:
 
     void dragEnterEvent(QDragEnterEvent* event) override
     {
+        showRowIndicatorFor(event->mimeData());
         QListWidget::dragEnterEvent(event);
         acceptStoreDrop(event);
     }
 
     void dragMoveEvent(QDragMoveEvent* event) override
     {
+        showRowIndicatorFor(event->mimeData());
         QListWidget::dragMoveEvent(event);
         acceptStoreDrop(event);
         const int y = event->position().toPoint().y();
@@ -310,6 +312,13 @@ protected:
     }
 
 private:
+    // The line between rows shows where a song being moved will go. Songs
+    // from the library always go to the end, so no line is shown for them.
+    void showRowIndicatorFor(const QMimeData* mimeData)
+    {
+        setDropIndicatorShown(mimeData && mimeData->hasFormat(PlaylistItemMimeType));
+    }
+
     void acceptStoreDrop(QDropEvent* event)
     {
         if (!m_acceptsDrop || !m_acceptsDrop(event->mimeData())) {
@@ -333,14 +342,20 @@ std::optional<qint64> playlistItemId(const QMimeData* mimeData)
     return ok && itemId != 0 ? std::optional<qint64>(itemId) : std::nullopt;
 }
 
-std::optional<qint64> librarySongId(const QMimeData* mimeData)
+// The library songs dragged, in order; empty unless every one is valid.
+QList<qint64> librarySongIds(const QMimeData* mimeData)
 {
     if (!mimeData || !mimeData->hasFormat(LibraryResultsModel::SongMimeType))
-        return std::nullopt;
-    bool ok = false;
-    const qint64 songId = mimeData->data(
-        LibraryResultsModel::SongMimeType).toLongLong(&ok);
-    return ok && songId != 0 ? std::optional<qint64>(songId) : std::nullopt;
+        return {};
+    QList<qint64> songIds;
+    for (const QByteArray& field : mimeData->data(LibraryResultsModel::SongMimeType).split(',')) {
+        bool ok = false;
+        const qint64 songId = field.toLongLong(&ok);
+        if (!ok || songId <= 0)
+            return {};
+        songIds.append(songId);
+    }
+    return songIds;
 }
 
 // A playlist song's name as shown: its title, else its disc and track, else
@@ -992,26 +1007,27 @@ bool PlaylistView::eventFilter(QObject* watched, QEvent* event)
         auto* drop = static_cast<QDropEvent*>(event);
         const qint64 playlistId = displayedPlaylistId();
         const auto draggedItem = playlistItemId(drop->mimeData());
-        const auto draggedSong = drop->mimeData()->hasFormat(PlaylistItemMimeType)
-            ? std::nullopt : librarySongId(drop->mimeData());
+        const QList<qint64> draggedSongs = drop->mimeData()->hasFormat(PlaylistItemMimeType)
+            ? QList<qint64>() : librarySongIds(drop->mimeData());
         if (!canAcceptDrop(drop->mimeData())) {
             drop->ignore();
             return true;
-        }
-
-        int targetRow = m_items->count();
-        const QModelIndex targetIndex = m_items->indexAt(drop->position().toPoint());
-        if (targetIndex.isValid()) {
-            const QRect targetRect = m_items->visualRect(targetIndex);
-            targetRow = targetIndex.row()
-                + (drop->position().y() < targetRect.top() + targetRect.height() / 2.0
-                       ? 0 : 1);
         }
 
         QString error;
         qint64 selectedId = 0;
         bool changed = false;
         if (draggedItem) {
+            // A song of this playlist dragged within it moves to the exact
+            // row it is dropped on: how Frankie rearranges a playlist.
+            int targetRow = m_items->count();
+            const QModelIndex targetIndex = m_items->indexAt(drop->position().toPoint());
+            if (targetIndex.isValid()) {
+                const QRect targetRect = m_items->visualRect(targetIndex);
+                targetRow = targetIndex.row()
+                    + (drop->position().y() < targetRect.top() + targetRect.height() / 2.0
+                           ? 0 : 1);
+            }
             const auto current = m_store->item(*draggedItem);
             if (!current || current->playlistId != playlistId) {
                 drop->ignore();
@@ -1025,10 +1041,23 @@ bool PlaylistView::eventFilter(QObject* watched, QEvent* event)
             if (!changed && error.isEmpty())
                 changed = true;
         } else {
-            const auto song = m_libraryController->songRef(*draggedSong, &error);
-            if (song)
-                changed = m_store->insertItem(playlistId, targetRow, *song,
-                                              &selectedId, &error);
+            // Songs from the library are added to the end of the playlist,
+            // in the order dragged, whichever row they are dropped on:
+            // adding a song never disturbs the order already there.
+            QList<SongRef> songs;
+            for (const qint64 songId : draggedSongs) {
+                const auto song = m_libraryController->songRef(songId, &error);
+                if (!song) {
+                    songs.clear();
+                    break;
+                }
+                songs.append(*song);
+            }
+            QList<qint64> added;
+            if (!songs.isEmpty())
+                changed = m_store->addItems(playlistId, songs, &added, &error);
+            if (changed)
+                selectedId = added.last();
         }
         if (!changed) {
             if (!error.isEmpty())
@@ -1069,13 +1098,12 @@ bool PlaylistView::canAcceptDrop(const QMimeData* mimeData) const
     const bool hasPlaylistItem = mimeData
         && mimeData->hasFormat(PlaylistItemMimeType);
     const auto draggedItem = playlistItemId(mimeData);
-    const auto draggedSong = hasPlaylistItem
-        ? std::nullopt : librarySongId(mimeData);
+    const bool hasLibrarySongs = !hasPlaylistItem && !librarySongIds(mimeData).isEmpty();
     const auto itemEntry = m_store && m_store->isOpen() && draggedItem
         ? m_store->item(*draggedItem) : std::nullopt;
     return m_store && m_store->isOpen() && playlistId != 0
         && ((itemEntry && itemEntry->playlistId == playlistId)
-            || (draggedSong && m_libraryController));
+            || (hasLibrarySongs && m_libraryController));
 }
 
 void PlaylistView::showStoreError(const QString& fallback, const QString& detail)

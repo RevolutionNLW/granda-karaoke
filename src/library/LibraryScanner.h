@@ -87,6 +87,11 @@ private:
     bool shouldStop() const;
     bool waitWhilePaused() const;
     bool pauseOutsideTransaction(class QSqlDatabase& database) const;
+    // A batch's transaction holds the write lock from its start, so none of
+    // its rows can be refused as busy; a busy lock is waited for (see
+    // writepriority::beginBackgroundWrite). False: *error says why.
+    bool beginBatch(QSqlDatabase& database, QString* error) const;
+    bool commitBatch(QSqlDatabase& database, QString* error) const;
     void reportProgress(const QString& phase, qint64 done, qint64 total,
                         const QString& relPath, bool force = false);
     bool walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,

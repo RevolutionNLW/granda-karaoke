@@ -3,6 +3,7 @@
 #include "library/FilenameParser.h"
 #include "library/MetadataResolver.h"
 #include "library/SongKeys.h"
+#include "library/WritePriority.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -634,6 +635,14 @@ QString Catalogue::prepareEnrichmentCache(const QString& path)
         QStringLiteral("CREATE TABLE IF NOT EXISTS enrich.song_keys(mp3_audio_sha256 BLOB PRIMARY KEY,"
                        "version INTEGER NOT NULL,status TEXT NOT NULL,key_index INTEGER,"
                        "confidence REAL,detail_json TEXT,analysed_at INTEGER NOT NULL)"),
+        // Where each recording's music ends (Smart Autoplay End), keyed by
+        // the MP3's complete audio (mp3CompleteAudioDigest: a result that
+        // may end a song early is never shared by recordings that only
+        // begin and end alike) and versioned by music::kAudibleEndVersion.
+        QStringLiteral("CREATE TABLE IF NOT EXISTS enrich.audible_ends(mp3_complete_audio_sha256 BLOB PRIMARY KEY,"
+                       "version INTEGER NOT NULL,status TEXT NOT NULL,duration_ms INTEGER NOT NULL,"
+                       "audible_end_ms INTEGER NOT NULL,end_at_ms INTEGER NOT NULL,reference_db REAL,"
+                       "silence_db REAL,reason TEXT,analysed_at INTEGER NOT NULL)"),
         QStringLiteral("PRAGMA enrich.user_version=1"),
     };
     for (const QString& statement : statements) {
@@ -686,7 +695,7 @@ void Catalogue::attachEnrichmentCache(const QStringList& libraryRoots)
         || !query.value(0).toBool())
         return;
     query.finish();
-    if (!m_database.transaction())
+    if (!writepriority::beginWrite(m_database))
         return;
     if (query.exec(QStringLiteral(
             "INSERT OR IGNORE INTO enrich.title_screens(cdg_quick_sha256,cdg_size,engine,status,frames_json,"
@@ -784,8 +793,9 @@ bool Catalogue::ensureSchema(QString* error)
     if (currentVersion == SchemaVersion)
         return ensureCurrentTables(error);
 
-    if (!m_database.transaction()) {
-        setError(QStringLiteral("Could not begin schema migration: %1").arg(m_database.lastError().text()), error);
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
+        setError(QStringLiteral("Could not begin schema migration: %1").arg(beginError), error);
         return false;
     }
     const QStringList statements = {
@@ -1004,6 +1014,9 @@ bool Catalogue::addRoot(const QString& path, qint64* id, QString* error)
     }
     if (id)
         *id = find.value(0).toLongLong();
+    // A statement left unfinished keeps a read open, and SQLite refuses the
+    // next write at once (without waiting) while another connection writes.
+    find.finish();
     QSqlQuery activateFirst(m_database);
     if (!activateFirst.exec(QStringLiteral(
             "UPDATE library_roots SET active=1 WHERE id=(SELECT min(id) FROM library_roots) "
@@ -1027,9 +1040,10 @@ bool Catalogue::setActiveRoot(qint64 rootId, QString* error)
         setError(QStringLiteral("Library root was not found"), error);
         return false;
     }
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not change active library root: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     QSqlQuery clear(m_database);
@@ -1479,9 +1493,10 @@ bool Catalogue::setPlayStats(qint64 songId, const SongPlayStats& stats, QString*
 bool Catalogue::rebuildPlayProjection(const QList<PlayHistoryEntry>& history,
                                       QList<PlayHistoryEntry>* unmatched, QString* error)
 {
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not begin play history projection: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     QSqlQuery clear(m_database);
@@ -1591,9 +1606,10 @@ bool Catalogue::ensureSongRows(qint64 rootId, QString* error)
     while (missing.next())
         sourceIds.append(missing.value(0).toLongLong());
     missing.finish();
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not begin song creation transaction: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     QSqlQuery create(m_database);
@@ -1830,9 +1846,10 @@ bool Catalogue::setTrustedMetadata(qint64 songId, const MetadataOverride& value,
         setError(QStringLiteral("Unknown metadata origin: %1").arg(value.origin), error);
         return false;
     }
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not begin metadata override transaction: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     QSqlQuery update(m_database);
@@ -1856,9 +1873,10 @@ bool Catalogue::setTrustedMetadata(qint64 songId, const MetadataOverride& value,
 
 bool Catalogue::clearManualOverride(qint64 songId, QString* error)
 {
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not begin metadata override transaction: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     QSqlQuery update(m_database);
@@ -1949,9 +1967,10 @@ bool Catalogue::applyManualOverrides(const QList<MetadataOverride>& overrides,
 {
     if (replaced)
         replaced->clear();
-    if (!m_database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginWrite(m_database, &beginError)) {
         setError(QStringLiteral("Could not begin metadata override sync: %1")
-                     .arg(m_database.lastError().text()), error);
+                     .arg(beginError), error);
         return false;
     }
     auto fail = [&](const QString& message) {

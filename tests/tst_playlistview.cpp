@@ -235,7 +235,8 @@ private slots:
     void removeDeclinedPreservesViewAndStore();
     void removeConfirmsBeforeMutationAndUsesCapturedItem();
     void removeOnlyOneOccurrenceKeepsLibraryFilesAndOtherPlaylist();
-    void libraryDropsInsertAtRequestedRows();
+    void libraryDropsAppendAtTheBottom();
+    void libraryDropsOfSeveralSongsAppendInOrder();
     void internalDropsMoveUpAndDown();
     void longPlaylistDragAutoScrollsAndUsesStoreDrop();
     void dropsWhilePlayingDoNotTouchPlayback();
@@ -491,17 +492,162 @@ void TestPlaylistView::removeOnlyOneOccurrenceKeepsLibraryFilesAndOtherPlaylist(
                               + QStringLiteral("/PV001-01 - Test Singer - First Song.cdg")));
 }
 
-void TestPlaylistView::libraryDropsInsertAtRequestedRows()
+void TestPlaylistView::libraryDropsAppendAtTheBottom()
 {
+    // Adding a song from the library means "add it to the playlist": it goes
+    // to the end whichever row it is dropped on, so the order Frankie made
+    // is never disturbed. (Songs dragged within the playlist still move to
+    // the exact row: internalDropsMoveUpAndDown.)
+    QTemporaryDir temporary;
+    LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
+    const LibrarySongs songs = prepareLibrary(temporary, controller);
+    const QString playlistsPath = temporary.filePath(QStringLiteral("app/playlists.sqlite"));
+    auto playlists = std::make_unique<PlaylistStore>(playlistsPath);
+    QVERIFY(playlists->open(nullptr, controller.libraryRoots()));
+    QVERIFY(playlists->setAutoplay(true));
+    qint64 playlistId = 0;
+    QVERIFY(playlists->createPlaylist(QStringLiteral("Drop Targets"), &playlistId));
+    qint64 emptyId = 0;
+    QVERIFY(playlists->createPlaylist(QStringLiteral("Empty"), &emptyId));
+    QVERIFY(playlists->setLastPlaylistId(playlistId));
+    addSong(*playlists, controller, playlistId, songs.secondId);
+    addSong(*playlists, controller, playlistId, songs.fourthId);
+    addSong(*playlists, controller, playlistId, songs.thirdId);
+
+    BusTestPlayer player;
+    SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
+    auto window = std::make_unique<MainWindow>(&player, &settings, &controller, playlists.get());
+    window->resize(1000, 700);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window.get()));
+    LibraryView* library = window->libraryView();
+    QVERIFY(library->resultsList()->dragEnabled());
+    QCOMPARE(library->resultsList()->dragDropMode(), QAbstractItemView::DragOnly);
+    QCOMPARE(library->resultsList()->defaultDropAction(), Qt::CopyAction);
+    QVERIFY(!library->resultsList()->acceptDrops());
+    PlaylistView* view = window->playlistView();
+    QListWidget* list = view->itemList();
+    QCoreApplication::processEvents();
+    QCOMPARE(view->displayedPlaylistId(), playlistId);
+
+    const auto dragged = [library](const QString& search) {
+        library->searchBox()->setText(search);
+        library->refreshSearch();
+        return itemMimeData(library->resultsList(), 0);
+    };
+    auto first = dragged(QStringLiteral("First Song"));
+    QVERIFY(first);
+    QVERIFY(first->hasFormat(QStringLiteral("application/x-fks-song-id")));
+    QVERIFY(!first->hasFormat(QStringLiteral("application/x-qabstractitemmodeldatalist")));
+
+    QMimeData genericModelData;
+    genericModelData.setData(QStringLiteral("application/x-qabstractitemmodeldatalist"),
+                             QByteArray("not accepted"));
+    QVERIFY(!sendDrop(list->viewport(), list->visualItemRect(list->item(0)).center(),
+                      &genericModelData));
+    QCOMPARE(songIds(*playlists, playlistId),
+             QList<qint64>({songs.secondId, songs.fourthId, songs.thirdId}));
+
+    // No line between rows: a library song does not go where it is dropped.
+    QRect target = list->visualItemRect(list->item(0));
+    QDragEnterEvent enter(target.center(), Qt::CopyAction, first.get(), Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(list->viewport(), &enter);
+    QVERIFY(enter.isAccepted());
+    QVERIFY(!list->showDropIndicator());
+    QDragLeaveEvent leave;
+    QCoreApplication::sendEvent(list->viewport(), &leave);
+
+    // Over the first row (its upper half, which used to mean "before it").
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1), first.get()));
+    QCOMPARE(songIds(*playlists, playlistId),
+             QList<qint64>({songs.secondId, songs.fourthId, songs.thirdId, songs.firstId}));
+    QCOMPARE(playlists->item(view->selectedItemId())->songId, songs.firstId);
+    QCOMPARE(view->selectedItemId(), itemIds(*playlists, playlistId).last());
+
+    // Over a middle row, either half.
+    auto fourth = dragged(QStringLiteral("Fourth Song"));
+    target = list->visualItemRect(list->item(1));
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1), fourth.get()));
+    auto second = dragged(QStringLiteral("Second Song"));
+    target = list->visualItemRect(list->item(2));
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.bottom() - 1), second.get()));
+    QCOMPARE(songIds(*playlists, playlistId),
+             QList<qint64>({songs.secondId, songs.fourthId, songs.thirdId, songs.firstId,
+                            songs.fourthId, songs.secondId}));
+
+    // Over the last row, and below the songs.
+    auto third = dragged(QStringLiteral("Third Song"));
+    target = list->visualItemRect(list->item(list->count() - 1));
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1), third.get()));
+    const int endY = list->visualItemRect(list->item(list->count() - 1)).bottom() + 8;
+    const QPoint emptyPoint(list->viewport()->width() / 2, qMin(endY, list->viewport()->height() - 2));
+    QVERIFY(!list->indexAt(emptyPoint).isValid());
+    QVERIFY(sendDrop(list->viewport(), emptyPoint, first.get()));
+    const QList<qint64> expected = {songs.secondId, songs.fourthId, songs.thirdId, songs.firstId,
+                                    songs.fourthId, songs.secondId, songs.thirdId, songs.firstId};
+    QCOMPARE(songIds(*playlists, playlistId), expected);
+    QCOMPARE(list->count(), expected.size());
+    QCOMPARE(playlists->item(view->selectedItemId())->songId, songs.firstId);
+    QCOMPARE(list->currentRow(), list->count() - 1);
+    // Moving a song within the playlist still shows where it will go.
+    auto moving = itemMimeData(list, 0);
+    QDragEnterEvent moveEnter(target.center(), Qt::CopyAction | Qt::MoveAction, moving.get(),
+                              Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(list->viewport(), &moveEnter);
+    QVERIFY(list->showDropIndicator());
+    QCoreApplication::sendEvent(list->viewport(), &leave);
+
+    // An empty playlist.
+    view->playlistChooser()->setCurrentIndex(view->playlistChooser()->findData(emptyId));
+    QCOMPARE(view->displayedPlaylistId(), emptyId);
+    QCOMPARE(list->count(), 0);
+    QVERIFY(sendDrop(list->viewport(), QPoint(list->viewport()->width() / 2, 10), second.get()));
+    QCOMPARE(songIds(*playlists, emptyId), QList<qint64>({songs.secondId}));
+    QCOMPARE(songIds(*playlists, playlistId), expected);  // the other playlist untouched
+
+    // The stored order is the order after a restart, and the order Autoplay follows.
+    const QList<qint64> storedItems = itemIds(*playlists, playlistId);
+    window.reset();
+    playlists.reset();
+    PlaylistStore reopened(playlistsPath);
+    QVERIFY(reopened.open(nullptr, controller.libraryRoots()));
+    QCOMPARE(songIds(reopened, playlistId), expected);
+    QCOMPARE(itemIds(reopened, playlistId), storedItems);
+    QCOMPARE(songIds(reopened, emptyId), QList<qint64>({songs.secondId}));
+    for (int i = 0; i + 1 < storedItems.size(); ++i) {
+        const auto next = reopened.itemAfter(playlistId, storedItems.at(i));
+        QVERIFY(next);
+        QCOMPARE(next->itemId, storedItems.at(i + 1));
+    }
+    QVERIFY(!reopened.itemAfter(playlistId, storedItems.last()));
+
+    // Autoplay from the song before the first one dropped plays the dropped song next.
+    MainWindow restarted(&player, &settings, &controller, &reopened);
+    restarted.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&restarted));
+    PlaylistView* restartedView = restarted.playlistView();
+    restartedView->playlistChooser()->setCurrentIndex(restartedView->playlistChooser()->findData(playlistId));
+    QCOMPARE(restartedView->displayedPlaylistId(), playlistId);
+    restartedView->itemList()->setCurrentRow(2);
+    QCOMPARE(restartedView->selectedItemId(), storedItems.at(2));
+    restartedView->playSelected();
+    QTRY_COMPARE_WITH_TIMEOUT(restarted.playlistPlayback()->context()->itemId, storedItems.at(3), 8000);
+    QVERIFY(sameFile(player.song().mp3Path, songs.firstMp3));
+}
+
+void TestPlaylistView::libraryDropsOfSeveralSongsAppendInOrder()
+{
+    // Several songs dropped at once go to the end in the order dragged,
+    // all of them or none.
     QTemporaryDir temporary;
     LibraryController controller(temporary.filePath(QStringLiteral("app/library.sqlite")));
     const LibrarySongs songs = prepareLibrary(temporary, controller);
     PlaylistStore playlists(temporary.filePath(QStringLiteral("app/playlists.sqlite")));
     QVERIFY(playlists.open(nullptr, controller.libraryRoots()));
     qint64 playlistId = 0;
-    QVERIFY(playlists.createPlaylist(QStringLiteral("Drop Targets"), &playlistId));
+    QVERIFY(playlists.createPlaylist(QStringLiteral("Several"), &playlistId));
     addSong(playlists, controller, playlistId, songs.secondId);
-    addSong(playlists, controller, playlistId, songs.fourthId);
+    addSong(playlists, controller, playlistId, songs.firstId);
 
     BusTestPlayer player;
     SongSettingsStore settings(temporary.filePath(QStringLiteral("settings.json")));
@@ -509,75 +655,54 @@ void TestPlaylistView::libraryDropsInsertAtRequestedRows()
     window.resize(1000, 700);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    LibraryView* library = window.libraryView();
-    QVERIFY(library->resultsList()->dragEnabled());
-    QCOMPARE(library->resultsList()->dragDropMode(), QAbstractItemView::DragOnly);
-    QCOMPARE(library->resultsList()->defaultDropAction(), Qt::CopyAction);
-    QVERIFY(!library->resultsList()->acceptDrops());
     PlaylistView* view = window.playlistView();
     QListWidget* list = view->itemList();
     QCoreApplication::processEvents();
 
-    library->searchBox()->setText(QStringLiteral("First Song"));
+    // As the library writes them: every song in the order shown.
+    LibraryView* library = window.libraryView();
+    library->searchBox()->clear();
     library->refreshSearch();
-    QCOMPARE(library->songResultCount(), 1);
-    auto firstTop = itemMimeData(library->resultsList(), 0);
-    QVERIFY(firstTop);
-    QVERIFY(firstTop->hasFormat(QStringLiteral("application/x-fks-song-id")));
-    QVERIFY(!firstTop->hasFormat(
-        QStringLiteral("application/x-qabstractitemmodeldatalist")));
-    QRect target = list->visualItemRect(list->item(0));
+    const QAbstractItemModel* model = library->resultsList()->model();
+    const int fourthRow = libraryRowForSongId(library, songs.fourthId);
+    const int thirdRow = libraryRowForSongId(library, songs.thirdId);
+    QVERIFY(fourthRow >= 0 && thirdRow >= 0);
+    std::unique_ptr<QMimeData> both(model->mimeData(
+        {model->index(std::max(fourthRow, thirdRow), 0), model->index(std::min(fourthRow, thirdRow), 1),
+         model->index(std::min(fourthRow, thirdRow), 0)}));
+    const QList<qint64> shownOrder = fourthRow < thirdRow
+        ? QList<qint64>({songs.fourthId, songs.thirdId})
+        : QList<qint64>({songs.thirdId, songs.fourthId});
+    QCOMPARE(both->data(QStringLiteral("application/x-fks-song-id")),
+             QByteArray::number(shownOrder.at(0)) + ',' + QByteArray::number(shownOrder.at(1)));
 
-    QMimeData genericModelData;
-    genericModelData.setData(QStringLiteral("application/x-qabstractitemmodeldatalist"),
-                             QByteArray("not accepted"));
-    QVERIFY(!sendDrop(list->viewport(), target.center(), &genericModelData));
+    const QRect target = list->visualItemRect(list->item(0));
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1), both.get()));
     QCOMPARE(songIds(playlists, playlistId),
-             QList<qint64>({songs.secondId, songs.fourthId}));
+             QList<qint64>({songs.secondId, songs.firstId}) + shownOrder);
+    QCOMPARE(playlists.item(view->selectedItemId())->songId, shownOrder.last());
 
-    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1),
-                     firstTop.get()));
+    QMimeData three;
+    three.setData(QStringLiteral("application/x-fks-song-id"),
+                  QByteArray::number(songs.thirdId) + ',' + QByteArray::number(songs.secondId) + ','
+                      + QByteArray::number(songs.thirdId));
+    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.bottom() - 1), &three));
     QCOMPARE(songIds(playlists, playlistId),
-             QList<qint64>({songs.firstId, songs.secondId, songs.fourthId}));
-    QCOMPARE(playlists.item(view->selectedItemId())->songId, songs.firstId);
+             QList<qint64>({songs.secondId, songs.firstId}) + shownOrder
+                 + QList<qint64>({songs.thirdId, songs.secondId, songs.thirdId}));
 
-    library->searchBox()->setText(QStringLiteral("Third Song"));
-    library->refreshSearch();
-    auto thirdUpper = itemMimeData(library->resultsList(), 0);
-    QVERIFY(thirdUpper);
-    target = list->visualItemRect(list->item(2));
-    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.top() + 1),
-                     thirdUpper.get()));
-    QCOMPARE(songIds(playlists, playlistId),
-             QList<qint64>({songs.firstId, songs.secondId,
-                            songs.thirdId, songs.fourthId}));
-    QCOMPARE(playlists.item(view->selectedItemId())->songId, songs.thirdId);
-
-    library->searchBox()->setText(QStringLiteral("First Song"));
-    library->refreshSearch();
-    auto firstLower = itemMimeData(library->resultsList(), 0);
-    QVERIFY(firstLower);
-    target = list->visualItemRect(list->item(1));
-    QVERIFY(sendDrop(list->viewport(), QPoint(target.center().x(), target.bottom() - 1),
-                     firstLower.get()));
-    QCOMPARE(songIds(playlists, playlistId),
-             QList<qint64>({songs.firstId, songs.secondId, songs.firstId,
-                            songs.thirdId, songs.fourthId}));
-    QCOMPARE(playlists.item(view->selectedItemId())->songId, songs.firstId);
-
-    library->searchBox()->setText(QStringLiteral("Second Song"));
-    library->refreshSearch();
-    auto secondEnd = itemMimeData(library->resultsList(), 0);
-    QVERIFY(secondEnd);
-    const int endY = list->visualItemRect(list->item(list->count() - 1)).bottom() + 8;
-    const QPoint emptyPoint(list->viewport()->width() / 2,
-                            qMin(endY, list->viewport()->height() - 2));
-    QVERIFY(!list->indexAt(emptyPoint).isValid());
-    QVERIFY(sendDrop(list->viewport(), emptyPoint, secondEnd.get()));
-    QCOMPARE(songIds(playlists, playlistId),
-             QList<qint64>({songs.firstId, songs.secondId, songs.firstId,
-                            songs.thirdId, songs.fourthId, songs.secondId}));
-    QCOMPARE(playlists.item(view->selectedItemId())->songId, songs.secondId);
+    // A song that is not in the library any more: nothing is added.
+    const QList<qint64> before = itemIds(playlists, playlistId);
+    QMimeData withMissing;
+    withMissing.setData(QStringLiteral("application/x-fks-song-id"),
+                        QByteArray::number(songs.firstId) + ",999999");
+    QVERIFY(!sendDrop(list->viewport(), target.center(), &withMissing));
+    QMimeData malformed;
+    malformed.setData(QStringLiteral("application/x-fks-song-id"),
+                      QByteArray::number(songs.firstId) + ",x");
+    QVERIFY(!sendDrop(list->viewport(), target.center(), &malformed));
+    QCOMPARE(itemIds(playlists, playlistId), before);
+    QCOMPARE(list->count(), before.size());
 }
 
 void TestPlaylistView::internalDropsMoveUpAndDown()

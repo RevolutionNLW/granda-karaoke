@@ -407,22 +407,65 @@ bool PlaylistStore::insertItem(qint64 playlistId, int position, const SongRef& s
 {
     if (!ensureOpen(error) || !begin(error))
         return false;
+    qint64 newId = 0;
+    if (!insertWithin(playlistId, position, song, &newId, error)) {
+        rollback();
+        return false;
+    }
+    if (!commit(error)) {
+        rollback();
+        return false;
+    }
+    if (itemId)
+        *itemId = newId;
+    return true;
+}
+
+bool PlaylistStore::addItems(qint64 playlistId, const QList<SongRef>& songs,
+                             QList<qint64>* itemIds, QString* error)
+{
+    if (songs.isEmpty()) {
+        setError(QStringLiteral("No songs to add"), error);
+        return false;
+    }
+    if (!ensureOpen(error) || !begin(error))
+        return false;
+    QList<qint64> added;
+    for (const SongRef& song : songs) {
+        qint64 newId = 0;
+        if (!insertWithin(playlistId, std::numeric_limits<int>::max(), song, &newId, error)) {
+            rollback();
+            return false;
+        }
+        added.append(newId);
+    }
+    if (!commit(error)) {
+        rollback();
+        return false;
+    }
+    if (itemIds)
+        *itemIds = added;
+    return true;
+}
+
+bool PlaylistStore::insertWithin(qint64 playlistId, int position, const SongRef& song,
+                                 qint64* itemId, QString* error)
+{
     QSqlQuery count(m_database);
     count.prepare(QStringLiteral("SELECT count(*) FROM playlist_items WHERE playlist_id=?"));
     count.addBindValue(playlistId);
     if (!count.exec() || !count.next()) {
-        rollback();
         setError(queryError(count, QStringLiteral("Could not count playlist items")), error);
         return false;
     }
     const int at = qBound(0, position, count.value(0).toInt());
+    count.finish();
     QSqlQuery shift(m_database);
     shift.prepare(QStringLiteral(
         "UPDATE playlist_items SET position=position+1 WHERE playlist_id=? AND position>=?"));
     shift.addBindValue(playlistId);
     shift.addBindValue(at);
     if (!shift.exec()) {
-        rollback();
         setError(queryError(shift, QStringLiteral("Could not make room in playlist")), error);
         return false;
     }
@@ -443,16 +486,9 @@ bool PlaylistStore::insertItem(qint64 playlistId, int position, const SongRef& s
     if (!insert.exec() || !touchPlaylist(playlistId, error)) {
         if (insert.lastError().isValid())
             setError(queryError(insert, QStringLiteral("Could not add playlist item")), error);
-        rollback();
         return false;
     }
-    const qint64 newId = insert.lastInsertId().toLongLong();
-    if (!commit(error)) {
-        rollback();
-        return false;
-    }
-    if (itemId)
-        *itemId = newId;
+    *itemId = insert.lastInsertId().toLongLong();
     return true;
 }
 

@@ -675,6 +675,27 @@ void KaraokePlayer::stop()
     setState(State::Stopped);
 }
 
+void KaraokePlayer::finishEarly()
+{
+    if (!m_pipeline || m_state != State::Playing)
+        return;
+    qCInfo(lcPlayer) << "Ending the song at" << m_positionMs << "ms of" << m_durationMs
+                     << "ms: the rest is silence";
+    finishSong(true);
+}
+
+void KaraokePlayer::finishSong(bool early)
+{
+    gst_element_set_state(m_pipeline, GST_STATE_READY);
+    // Nothing from the song's last moments (its own end) may follow.
+    if (early)
+        discardPendingMessages();
+    reportSkippedTotal();
+    resetToBeginning();
+    resetActiveTempo();
+    setState(State::Finished);
+}
+
 void KaraokePlayer::tick()
 {
     if (!m_pipeline)
@@ -856,11 +877,7 @@ void KaraokePlayer::handleMessage(GstMessage* message)
         if (m_state != State::Playing)
             break;
         qCInfo(lcPlayer) << "End of song at" << m_positionMs << "ms";
-        gst_element_set_state(m_pipeline, GST_STATE_READY);
-        reportSkippedTotal();
-        resetToBeginning();
-        resetActiveTempo();
-        setState(State::Finished);
+        finishSong(false);
         break;
     case GST_MESSAGE_ASYNC_DONE:
         if (GST_MESSAGE_SRC(message) == GST_OBJECT(m_pipeline)

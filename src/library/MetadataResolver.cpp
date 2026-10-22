@@ -5,6 +5,7 @@
 #include "library/Id3Reader.h"
 #include "library/KaraokeLabels.h"
 #include "library/TitleScreenText.h"
+#include "library/WritePriority.h"
 
 #include <QFileInfo>
 #include <QJsonArray>
@@ -1840,9 +1841,10 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
         "best_source_id=(SELECT id FROM sources WHERE song_id=:song1 "
         "ORDER BY playable DESC,CASE kind WHEN 'loose_cdg' THEN 0 WHEN 'loose_mcg' THEN 1 ELSE 2 END,id LIMIT 1),"
         "playable=EXISTS(SELECT 1 FROM sources WHERE song_id=:song2 AND playable=1) WHERE id=:song3"));
-    if (!database.transaction()) {
+    QString beginError;
+    if (!writepriority::beginBackgroundWrite(database, options.cancelled, &beginError)) {
         if (error)
-            *error = QStringLiteral("Could not begin metadata-resolution batch: %1").arg(database.lastError().text());
+            *error = QStringLiteral("Could not begin metadata-resolution batch: %1").arg(beginError);
         return Status::Failed;
     }
     qint64 resolved = 0;
@@ -1914,10 +1916,10 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
                 options.progress(resolved, results.size());
             if (options.shouldStop && options.shouldStop())
                 return Status::Cancelled;
-            if (!database.transaction()) {
+            if (!writepriority::beginBackgroundWrite(database, options.cancelled, &beginError)) {
                 if (error)
                     *error = QStringLiteral("Could not begin metadata-resolution batch: %1")
-                                 .arg(database.lastError().text());
+                                 .arg(beginError);
                 return Status::Failed;
             }
         }
@@ -1929,11 +1931,16 @@ MetadataResolver::Status MetadataResolver::resolve(Catalogue& catalogue, qint64 
     }
     if (options.progress)
         options.progress(resolved, results.size());
-    if (!database.transaction()) {
+    bool stopped = false;
+    if (!writepriority::beginBackgroundWrite(database, options.cancelled, &beginError, &stopped)) {
         if (error)
             *error = QStringLiteral("Could not begin resolver completion transaction: %1")
-                         .arg(database.lastError().text());
+                         .arg(beginError);
         return Status::Failed;
+    }
+    if (stopped) {
+        database.rollback();  // still pending: the next run finishes the work
+        return Status::Cancelled;
     }
     if (!setMeta(database, QStringLiteral("resolver_version"),
                  QString::number(Version), error)

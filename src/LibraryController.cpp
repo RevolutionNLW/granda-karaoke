@@ -1647,6 +1647,12 @@ QHash<qint64, SongKeyInfo> LibraryController::songKeys(const QList<qint64>& song
     return keys;
 }
 
+QString LibraryController::enrichmentCachePath() const
+{
+    return isAvailable() && m_catalogue.enrichmentCacheIsDurable()
+        ? m_catalogue.enrichmentCachePath() : QString();
+}
+
 std::optional<SongKeyInfo> LibraryController::songKeyDetails(qint64 songId) const
 {
     if (!isAvailable() || songId <= 0)

@@ -36,6 +36,10 @@ public:
                  QString* error = nullptr);
     bool insertItem(qint64 playlistId, int position, const SongRef& song,
                     qint64* itemId = nullptr, QString* error = nullptr);
+    // Adds the songs at the end of the playlist, in this order: all of them
+    // or (on any failure) none. itemIds receives the new items in order.
+    bool addItems(qint64 playlistId, const QList<SongRef>& songs,
+                  QList<qint64>* itemIds = nullptr, QString* error = nullptr);
     bool moveItem(qint64 itemId, int newPosition, QString* error = nullptr);
     bool moveItemUp(qint64 itemId, QString* error = nullptr);
     bool moveItemDown(qint64 itemId, QString* error = nullptr);
@@ -60,6 +64,9 @@ private:
     bool commit(QString* error);
     void rollback();
     bool touchPlaylist(qint64 playlistId, QString* error);
+    // insertItem's work, inside a transaction the caller has begun.
+    bool insertWithin(qint64 playlistId, int position, const SongRef& song,
+                      qint64* itemId, QString* error);
     bool stateValue(const QString& key, QString* value, QString* error) const;
     bool setStateValue(const QString& key, const QString& value, QString* error);
     void setError(const QString& message, QString* error) const;

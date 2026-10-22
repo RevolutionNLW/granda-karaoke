@@ -33,6 +33,8 @@ target_include_directories(fks_cdg PUBLIC src)
 # Musical keys and key detection from decoded audio: plain C++ with no Qt or
 # GStreamer dependency, so it can be tested in isolation.
 add_library(fks_music STATIC
+    src/music/AudibleEnd.cpp
+    src/music/AudibleEnd.h
     src/music/KeyDetector.cpp
     src/music/KeyDetector.h
     src/music/MusicalKey.cpp
@@ -110,6 +112,8 @@ target_link_libraries(fks-catalogue PRIVATE fks_ocr)
 add_library(fks_core STATIC
     src/AppPreferences.cpp
     src/AppPreferences.h
+    src/AudibleEnds.cpp
+    src/AudibleEnds.h
     src/AudioOutputs.cpp
     src/BackgroundWork.cpp
     src/BackgroundWork.h
@@ -150,6 +154,8 @@ add_library(fks_core STATIC
     src/MainWindow.h
     src/SettingsDialog.cpp
     src/SettingsDialog.h
+    src/SmartAutoplayEnd.cpp
+    src/SmartAutoplayEnd.h
     src/SelfCheck.cpp
     src/SelfCheck.h
     src/Shutdown.cpp

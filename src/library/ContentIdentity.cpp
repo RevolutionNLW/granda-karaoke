@@ -217,6 +217,33 @@ bool mp3AudioDigest(const QString& path, QByteArray* digest)
     return true;
 }
 
+bool mp3CompleteAudioDigest(const QString& path, QByteArray* digest)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+    const qint64 fileSize = file.size();
+    qint64 start = 0;
+    qint64 end = fileSize;
+    if (fileSize < 0 || !mp3PayloadRange(file, fileSize, start, end) || !file.seek(start))
+        return false;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData(QByteArrayView("fks-mp3-complete-audio-v1\0", 26));
+    addFingerprintHeader(hash, "mp3", end - start);
+    for (qint64 remaining = end - start; remaining > 0;) {
+        const qint64 wanted = std::min(remaining, kIdentityReadChunkBytes * 4);
+        const QByteArray bytes = file.read(wanted);
+        if (bytes.size() != wanted)
+            return false;
+        hash.addData(bytes);
+        remaining -= wanted;
+    }
+    if (file.error() != QFileDevice::NoError)
+        return false;
+    *digest = hash.result();
+    return true;
+}
+
 bool quickFileDigest(const QString& path, QByteArray* digest)
 {
     QFile file(path);

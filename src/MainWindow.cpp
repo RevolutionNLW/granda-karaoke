@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "Logging.h"
+#include "AudibleEnds.h"
 #include "LibraryController.h"
 #include "LibraryResultsModel.h"
 #include "LibraryView.h"
@@ -13,6 +14,7 @@
 #include "playlist/PlaylistStore.h"
 #include "AppPreferences.h"
 #include "SettingsDialog.h"
+#include "SmartAutoplayEnd.h"
 #include "library/SongKeys.h"
 #include "ui/Controls.h"
 #include "ui/Shortcuts.h"
@@ -212,6 +214,11 @@ MainWindow::MainWindow(KaraokePlayer* player, ISongSettingsStore* settingsStore,
     });
     connect(m_player, &KaraokePlayer::settingsChanged, this, &MainWindow::updateControls);
     connect(m_player, &KaraokePlayer::frameChanged, m_lyrics, &LyricsView::setFrame);
+    // Skip trailing silence during Autoplay (Settings > Playback).
+    m_audibleEnds = new AudibleEnds(
+        m_libraryController ? m_libraryController->enrichmentCachePath() : QString(), this);
+    new SmartAutoplayEnd(m_player, m_playlistPlayback, m_playlistStore, m_preferences,
+                         m_audibleEnds, this);
     connect(m_lyrics, &LyricsView::controlsRequested, this, &MainWindow::hideLyrics);
     if (m_library) {
         connect(m_library, &LibraryView::singRequested, this, &MainWindow::singLibrarySong);

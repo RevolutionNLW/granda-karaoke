@@ -12,6 +12,7 @@
 #include <memory>
 
 class AppPreferences;
+class AudibleEnds;
 class LyricsView;
 class QAction;
 class SettingsDialog;
@@ -78,6 +79,8 @@ public:
     LibraryView* libraryView() const { return m_library; }
     PlaylistView* playlistView() const { return m_playlistView; }
     PlaylistPlayback* playlistPlayback() const { return m_playlistPlayback; }
+    // Where songs' music ends, for Smart Autoplay End.
+    AudibleEnds* audibleEnds() const { return m_audibleEnds; }
     // Library maintenance (song-name review and correction). Opened with
     // Ctrl+Shift+M (Cmd+Shift+M on macOS); not part of the singer's screens.
     MetadataReviewDialog* openMetadataReview();
@@ -189,6 +192,7 @@ private:
     LibraryController* m_libraryController;
     PlaylistStore* m_playlistStore;
     PlaylistPlayback* m_playlistPlayback;
+    AudibleEnds* m_audibleEnds = nullptr;
     DisplaySleepBlocker m_displaySleepBlocker;
     bool m_keepScaleWithinScreen = false;
     bool m_fittingScale = false;

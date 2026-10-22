@@ -218,47 +218,55 @@ bool LibraryScanner::resolveAndSync(Catalogue& catalogue, qint64 rootId,
     QStringList roots = m_knownRoots;
     for (const CatalogueRoot& root : catalogue.roots(&syncError))
         roots.append(root.path);
-    // The worker never replaces a damaged store: it just leaves the
-    // catalogue's mirror alone, and the application re-seeds the store.
-    QMutexLocker lock(&MetadataOverrideStore::synchronisation());
-    MetadataOverrideStore store(m_overrideStorePath);
-    QList<MetadataOverride> overrides;
-    bool established = false;
-    if (syncError.isEmpty() && store.open(&syncError, roots, false)) {
-        established = store.isEstablished(&syncError);
-        if (syncError.isEmpty())
-            overrides = store.all(&syncError);
-    }
-    // A store just created (lost, or damaged and set aside) is not the
-    // truth yet, even after the user cleared their last correction.
-    if (syncError.isEmpty() && !established && catalogue.hasTrustedMirror(&syncError))
-        syncError = QStringLiteral("the override store has not been restored yet but the "
-                                   "catalogue holds corrections; keeping them");
-    if (!syncError.isEmpty()) {
-        qWarning().noquote() << "Manual metadata corrections were not synchronised:"
-                             << syncError;
-        return true;
-    }
-    // A correction saved for a song that is now in another (the active)
-    // folder follows it there: its store row is copied to the song's own
-    // identity first, and the old row is removed only once the catalogue
-    // shows the value. A row that cannot be copied stays where it was.
-    const auto copyToSong = [&store](const MovedMetadataOverride& move) {
-        QString copyError;
-        if (store.copyOverride(move, &copyError))
+    // A catalogue busy for longer than SQLite waits is tried again, with the
+    // store's lock let go meanwhile (the user's changes need it).
+    const auto synchronise = [&](QString* attemptError) -> bool {
+        // The worker never replaces a damaged store: it just leaves the
+        // catalogue's mirror alone, and the application re-seeds the store.
+        QMutexLocker lock(&MetadataOverrideStore::synchronisation());
+        MetadataOverrideStore store(m_overrideStorePath);
+        QList<MetadataOverride> overrides;
+        bool established = false;
+        if (syncError.isEmpty() && store.open(&syncError, roots, false)) {
+            established = store.isEstablished(&syncError);
+            if (syncError.isEmpty())
+                overrides = store.all(&syncError);
+        }
+        // A store just created (lost, or damaged and set aside) is not the
+        // truth yet, even after the user cleared their last correction.
+        if (syncError.isEmpty() && !established && catalogue.hasTrustedMirror(&syncError))
+            syncError = QStringLiteral("the override store has not been restored yet but the "
+                                       "catalogue holds corrections; keeping them");
+        if (!syncError.isEmpty()) {
+            qWarning().noquote() << "Manual metadata corrections were not synchronised:"
+                                 << syncError;
             return true;
-        qWarning().noquote() << "A manual metadata correction was not moved to"
-                             << move.rootPath << move.mp3RelPath << ":" << copyError;
-        return false;
+        }
+        // A correction saved for a song that is now in another (the active)
+        // folder follows it there: its store row is copied to the song's own
+        // identity first, and the old row is removed only once the catalogue
+        // shows the value. A row that cannot be copied stays where it was.
+        const auto copyToSong = [&store](const MovedMetadataOverride& move) {
+            QString copyError;
+            if (store.copyOverride(move, &copyError))
+                return true;
+            qWarning().noquote() << "A manual metadata correction was not moved to"
+                                 << move.rootPath << move.mp3RelPath << ":" << copyError;
+            return false;
+        };
+        QList<MetadataOverride> replaced;
+        {
+            const writepriority::BriefWait brief(catalogue.database());
+            if (!catalogue.applyManualOverrides(overrides, attemptError, copyToSong, &replaced))
+                return false;
+        }
+        QString removeError;
+        if (!replaced.isEmpty() && !store.removeOverrides(replaced, &removeError))
+            qWarning().noquote() << "Moved manual metadata corrections were not tidied up:"
+                                 << removeError;
+        return true;
     };
-    QList<MetadataOverride> replaced;
-    if (!catalogue.applyManualOverrides(overrides, error, copyToSong, &replaced))
-        return false;
-    QString removeError;
-    if (!replaced.isEmpty() && !store.removeOverrides(replaced, &removeError))
-        qWarning().noquote() << "Moved manual metadata corrections were not tidied up:"
-                             << removeError;
-    return true;
+    return writepriority::retryWhileBusy(synchronise, [this] { return shouldStop(); }, error);
 }
 
 void LibraryScanner::reconcilePlayHistory(Catalogue& catalogue, QVariantMap& counts)
@@ -513,14 +521,28 @@ bool LibraryScanner::pauseOutsideTransaction(QSqlDatabase& database) const
             return false;
         }
         const bool resume = waitWhilePaused();
-        if (!database.transaction()) {
-            qWarning().noquote() << "Library scan stopped: could not resume its batch:"
-                                 << database.lastError().text();
+        QString error;
+        if (!beginBatch(database, &error)) {
+            qWarning().noquote() << "Library scan stopped: could not resume its batch:" << error;
             return false;
         }
         return resume;
     }
     return !shouldStop();
+}
+
+bool LibraryScanner::beginBatch(QSqlDatabase& database, QString* error) const
+{
+    return writepriority::beginBackgroundWrite(database, [this] { return shouldStop(); }, error);
+}
+
+bool LibraryScanner::commitBatch(QSqlDatabase& database, QString* error) const
+{
+    if (!database.commit()) {
+        *error = database.lastError().text();
+        return false;
+    }
+    return beginBatch(database, error);
 }
 
 bool LibraryScanner::waitWhilePaused() const
@@ -564,13 +586,15 @@ void LibraryScanner::scan(const QString& requestedRoot)
         return;
     }
     Catalogue catalogue(m_databasePath, m_cacheDirectory);
-    if (!catalogue.open(&error, m_knownRoots + QStringList{rootPath})
-        || !catalogue.addRoot(rootPath, nullptr, &error)) {
-        emit failed(error);
-        return;
-    }
     qint64 rootId = 0;
-    if (!catalogue.addRoot(rootPath, &rootId, &error)) {
+    if (!writepriority::retryWhileBusy([&](QString* attemptError) {
+            if (!catalogue.isOpen()
+                && !catalogue.open(attemptError, m_knownRoots + QStringList{rootPath}))
+                return false;
+            const writepriority::BriefWait brief(catalogue.database());
+            return catalogue.addRoot(rootPath, nullptr, attemptError)
+                && catalogue.addRoot(rootPath, &rootId, attemptError);
+        }, [this] { return shouldStop(); }, &error)) {
         emit failed(error);
         return;
     }
@@ -727,7 +751,10 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
     bool complete = true;
     bool rootOffline = false;
     qint64 skippedDirectories = 0;
-    database.transaction();
+    if (!beginBatch(database, error)) {
+        *error = QStringLiteral("Could not begin walk batch: %1").arg(*error);
+        return false;
+    }
     QSqlQuery lookup(database);
     lookup.prepare(QStringLiteral("SELECT id, size, mtime_ms FROM files WHERE root_id=? AND rel_path=?"));
     QSqlQuery upsert(database);
@@ -850,8 +877,8 @@ bool LibraryScanner::walk(Catalogue& catalogue, qint64 rootId, qint64 scanId,
             ++done;
             reportProgress(QStringLiteral("walk"), done, -1, relPath);
             if ((done % 500) == 0) {
-                if (!database.commit() || !database.transaction()) {
-                    *error = QStringLiteral("Could not commit walk batch: %1").arg(database.lastError().text());
+                if (!commitBatch(database, error)) {
+                    *error = QStringLiteral("Could not commit walk batch: %1").arg(*error);
                     return false;
                 }
             }
@@ -915,8 +942,8 @@ bool LibraryScanner::readZipDirectories(Catalogue& catalogue, qint64 rootId,
         zips.append({list.value(0).toLongLong(), list.value(1).toString()});
     list.finish();
     qint64 done = 0;
-    if (!database.transaction()) {
-        *error = QStringLiteral("Could not begin ZIP-directory batch: %1").arg(database.lastError().text());
+    if (!beginBatch(database, error)) {
+        *error = QStringLiteral("Could not begin ZIP-directory batch: %1").arg(*error);
         return false;
     }
     QElapsedTimer batchTimer;
@@ -965,8 +992,8 @@ bool LibraryScanner::readZipDirectories(Catalogue& catalogue, qint64 rootId,
         ++done;
         reportProgress(QStringLiteral("zip_directories"), done, zips.size(), zip.second);
         if ((done % 500) == 0 || batchTimer.elapsed() >= 2000) {
-            if (!database.commit() || !database.transaction()) {
-                *error = QStringLiteral("Could not commit ZIP-directory batch: %1").arg(database.lastError().text());
+            if (!commitBatch(database, error)) {
+                *error = QStringLiteral("Could not commit ZIP-directory batch: %1").arg(*error);
                 return false;
             }
             batchTimer.restart();
@@ -1021,8 +1048,8 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     QSqlQuery update(database);
     update.prepare(QStringLiteral("UPDATE sources SET playable=?,unplayable_reason=?,parsed_json=? WHERE id=?"));
     qint64 loosePairs = 0;
-    if (!database.transaction()) {
-        *error = QStringLiteral("Could not begin loose-pair batch: %1").arg(database.lastError().text());
+    if (!beginBatch(database, error)) {
+        *error = QStringLiteral("Could not begin loose-pair batch: %1").arg(*error);
         return false;
     }
     for (auto it = mp3s.cbegin(); it != mp3s.cend(); ++it) {
@@ -1082,8 +1109,8 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
         }
         ++loosePairs;
         if ((loosePairs % 500) == 0) {
-            if (!database.commit() || !database.transaction()) {
-                *error = QStringLiteral("Could not commit loose-pair batch: %1").arg(database.lastError().text());
+            if (!commitBatch(database, error)) {
+                *error = QStringLiteral("Could not commit loose-pair batch: %1").arg(*error);
                 return false;
             }
         }
@@ -1106,8 +1133,8 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     zipFiles.finish();
     qint64 zipPairs = 0;
     qint64 nested = 0;
-    if (!database.transaction()) {
-        *error = QStringLiteral("Could not begin ZIP-pair batch: %1").arg(database.lastError().text());
+    if (!beginBatch(database, error)) {
+        *error = QStringLiteral("Could not begin ZIP-pair batch: %1").arg(*error);
         return false;
     }
     for (qint64 zipId : zipRows) {
@@ -1199,8 +1226,8 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
             }
             ++zipPairs;
             if ((zipPairs % 500) == 0) {
-                if (!database.commit() || !database.transaction()) {
-                    *error = QStringLiteral("Could not commit ZIP-pair batch: %1").arg(database.lastError().text());
+                if (!commitBatch(database, error)) {
+                    *error = QStringLiteral("Could not commit ZIP-pair batch: %1").arg(*error);
                     return false;
                 }
             }
@@ -1214,7 +1241,10 @@ bool LibraryScanner::pairSources(Catalogue& catalogue, qint64 rootId,
     counts.insert(QStringLiteral("zipPairs"), zipPairs);
     counts.insert(QStringLiteral("nestedZips"), nested);
     reportProgress(QStringLiteral("pairing"), loosePairs + zipPairs, loosePairs + zipPairs, QString(), true);
-    return catalogue.ensureSongRows(rootId, error);
+    return writepriority::retryWhileBusy([&](QString* attemptError) {
+        const writepriority::BriefWait brief(database);
+        return catalogue.ensureSongRows(rootId, attemptError);
+    }, [this] { return shouldStop(); }, error);
 }
 
 bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
@@ -1235,8 +1265,8 @@ bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
     qint64 done = 0;
     QSqlQuery update(database);
     update.prepare(QStringLiteral("UPDATE files SET tags_state='read',raw_tags_json=? WHERE id=?"));
-    if (!database.transaction()) {
-        *error = QStringLiteral("Could not begin tag-enrichment batch: %1").arg(database.lastError().text());
+    if (!beginBatch(database, error)) {
+        *error = QStringLiteral("Could not begin tag-enrichment batch: %1").arg(*error);
         return false;
     }
     QElapsedTimer batchTimer;
@@ -1267,8 +1297,8 @@ bool LibraryScanner::enrichTags(Catalogue& catalogue, qint64 rootId,
         ++done;
         reportProgress(QStringLiteral("tags"), done, files.size(), file.second);
         if ((done % 500) == 0 || batchTimer.elapsed() >= 2000) {
-            if (!database.commit() || !database.transaction()) {
-                *error = QStringLiteral("Could not commit tag-enrichment batch: %1").arg(database.lastError().text());
+            if (!commitBatch(database, error)) {
+                *error = QStringLiteral("Could not commit tag-enrichment batch: %1").arg(*error);
                 return false;
             }
             batchTimer.restart();
@@ -1637,9 +1667,13 @@ bool LibraryScanner::readSidecars(Catalogue& catalogue, qint64 rootId, const QSt
         const QByteArray contents = file.read(kMaximumSidecarBytes + 1);
         file.close();
         const SidecarTrackList parsed = parseTrackListSidecar(contents);
-        if (!database.transaction()) {
-            *error = QStringLiteral("Could not begin track-list update: %1").arg(database.lastError().text());
+        if (!beginBatch(database, error)) {
+            *error = QStringLiteral("Could not begin track-list update: %1").arg(*error);
             return false;
+        }
+        if (shouldStop()) {
+            database.rollback();
+            break;
         }
         QSqlQuery clear(database);
         clear.prepare(QStringLiteral("DELETE FROM sidecar_entries WHERE file_id=?"));

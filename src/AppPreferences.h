@@ -31,6 +31,8 @@ inline const QString DefaultKey = QStringLiteral("playback.defaultKey");
 inline const QString DefaultTempo = QStringLiteral("playback.defaultTempo");
 inline const QString ReturnHomeAtEnd = QStringLiteral("playback.returnHomeAtEnd");
 inline const QString KeepDisplayAwake = QStringLiteral("playback.keepDisplayAwake");
+// Smart Autoplay End (on unless turned off): see SmartAutoplayEnd.h.
+inline const QString SkipTrailingSilence = QStringLiteral("playback.skipTrailingSilence");
 // The chosen sound output's name (empty = the system default), whether it is
 // used again at start-up, and the music volume (0-100).
 inline const QString AudioOutput = QStringLiteral("audio.output");
